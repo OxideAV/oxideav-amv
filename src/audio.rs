@@ -118,6 +118,16 @@ impl Decoder for AmvAudioDecoder {
         self.eof = true;
         Ok(())
     }
+
+    fn reset(&mut self) -> Result<()> {
+        // Each AMV audio chunk reseeds the IMA-ADPCM predictor + step-index
+        // from its own 8-byte header, so there is no cross-packet decoder
+        // state to wipe. Drop the buffered packet and the eof flag so the
+        // next `send_packet` starts clean after a container seek.
+        self.pending = None;
+        self.eof = false;
+        Ok(())
+    }
 }
 
 /// Decode one AMV audio chunk into S16 mono samples.
