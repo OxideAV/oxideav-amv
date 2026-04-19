@@ -30,7 +30,7 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
+use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, Error, Frame, MediaType, Packet,
     Result, SampleFormat, TimeBase,
@@ -58,11 +58,11 @@ pub fn register(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_max_channels(1)
         .with_max_sample_rate(48_000);
-    reg.register_both(
-        CodecId::new(crate::AUDIO_CODEC_ID_STR),
-        caps,
-        make_decoder,
-        make_encoder,
+    reg.register(
+        CodecInfo::new(CodecId::new(crate::AUDIO_CODEC_ID_STR))
+            .capabilities(caps)
+            .decoder(make_decoder)
+            .encoder(make_encoder),
     );
 }
 

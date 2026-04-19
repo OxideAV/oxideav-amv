@@ -37,7 +37,7 @@ pub mod audio;
 pub mod demux;
 pub mod video;
 
-use oxideav_codec::CodecRegistry;
+use oxideav_codec::{CodecInfo, CodecRegistry};
 use oxideav_container::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId};
 
@@ -51,22 +51,22 @@ pub fn register_codecs(reg: &mut CodecRegistry) {
         .with_lossy(true)
         .with_intra_only(true)
         .with_max_size(4096, 4096);
-    reg.register_both(
-        CodecId::new(VIDEO_CODEC_ID_STR),
-        v_caps,
-        video::make_decoder,
-        video::make_encoder,
+    reg.register(
+        CodecInfo::new(CodecId::new(VIDEO_CODEC_ID_STR))
+            .capabilities(v_caps)
+            .decoder(video::make_decoder)
+            .encoder(video::make_encoder),
     );
 
     let a_caps = CodecCapabilities::audio("adpcm_ima_amv_sw")
         .with_lossy(true)
         .with_max_channels(1)
         .with_max_sample_rate(48_000);
-    reg.register_both(
-        CodecId::new(AUDIO_CODEC_ID_STR),
-        a_caps,
-        audio::make_decoder,
-        audio::make_encoder,
+    reg.register(
+        CodecInfo::new(CodecId::new(AUDIO_CODEC_ID_STR))
+            .capabilities(a_caps)
+            .decoder(audio::make_decoder)
+            .encoder(audio::make_encoder),
     );
 }
 
