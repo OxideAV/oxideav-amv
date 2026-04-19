@@ -193,7 +193,11 @@ fn probe_recognises_amv_magic() {
     assert_eq!(name, "amv");
     // Sanity: confirm we can open the resolved demuxer.
     let _demux = reg
-        .open_demuxer(&name, Box::new(Cursor::new(blob)))
+        .open_demuxer(
+            &name,
+            Box::new(Cursor::new(blob)),
+            &oxideav_core::NullCodecResolver,
+        )
         .expect("open_demuxer should succeed");
 }
 
@@ -203,7 +207,11 @@ fn open_and_read_minimal_amv() {
     let mut reg = ContainerRegistry::new();
     oxideav_amv::register_containers(&mut reg);
     let mut demux = reg
-        .open_demuxer("amv", Box::new(Cursor::new(blob)))
+        .open_demuxer(
+            "amv",
+            Box::new(Cursor::new(blob)),
+            &oxideav_core::NullCodecResolver,
+        )
         .expect("open should succeed");
     assert_eq!(demux.format_name(), "amv");
     let streams = demux.streams().to_vec();
@@ -250,7 +258,11 @@ fn ffmpeg_roundtrip_decodes_video_and_audio() {
     oxideav_amv::register(&mut codecs, &mut creg);
 
     let mut demux = creg
-        .open_demuxer("amv", Box::new(Cursor::new(bytes)))
+        .open_demuxer(
+            "amv",
+            Box::new(Cursor::new(bytes)),
+            &oxideav_core::NullCodecResolver,
+        )
         .expect("open ffmpeg AMV file");
     let streams = demux.streams().to_vec();
     assert_eq!(streams.len(), 2);

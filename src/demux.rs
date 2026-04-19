@@ -38,8 +38,8 @@ use std::io::Read;
 use oxideav_container::ContainerRegistry;
 use oxideav_container::{Demuxer, ProbeData, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, MediaType, Packet, PixelFormat, Rational, Result,
-    SampleFormat, StreamInfo, TimeBase,
+    CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, PixelFormat, Rational,
+    Result, SampleFormat, StreamInfo, TimeBase,
 };
 
 pub fn register(reg: &mut ContainerRegistry) {
@@ -59,7 +59,7 @@ fn probe(p: &ProbeData) -> u8 {
     }
 }
 
-fn open(mut input: Box<dyn ReadSeek>) -> Result<Box<dyn Demuxer>> {
+fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box<dyn Demuxer>> {
     let mut blob = Vec::new();
     input.read_to_end(&mut blob)?;
     if blob.len() < 12 {
