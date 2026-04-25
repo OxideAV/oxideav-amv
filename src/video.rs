@@ -21,11 +21,11 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::{Decoder, Encoder};
 use oxideav_core::{
     CodecId, CodecParameters, Error, Frame, MediaType, Packet, PixelFormat, Result, TimeBase,
     VideoFrame,
 };
+use oxideav_core::{Decoder, Encoder};
 
 use oxideav_mjpeg::decoder::make_decoder as make_mjpeg_decoder;
 use oxideav_mjpeg::encoder::encode_jpeg;

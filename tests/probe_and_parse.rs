@@ -12,8 +12,8 @@ use std::io::Cursor;
 use std::path::Path;
 use std::process::Command;
 
-use oxideav_codec::CodecRegistry;
-use oxideav_container::{ContainerRegistry, ProbeData};
+use oxideav_core::CodecRegistry;
+use oxideav_core::{ContainerRegistry, ProbeData};
 use oxideav_core::{Error, Frame, MediaType};
 
 const FFMPEG: &str = "/usr/bin/ffmpeg";

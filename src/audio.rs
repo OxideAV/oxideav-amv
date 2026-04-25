@@ -30,11 +30,11 @@
 
 use std::collections::VecDeque;
 
-use oxideav_codec::{CodecInfo, CodecRegistry, Decoder, Encoder};
 use oxideav_core::{
     AudioFrame, CodecCapabilities, CodecId, CodecParameters, Error, Frame, MediaType, Packet,
     Result, SampleFormat, TimeBase,
 };
+use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     let sample_rate = params.sample_rate.unwrap_or(22_050);

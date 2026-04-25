@@ -9,7 +9,7 @@
 //! Also asserts the encoder output starts with `FF D8` and ends with
 //! `FF D9`, matching the AMV frame-envelope the decoder expects.
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{
     frame::VideoPlane, CodecId, CodecParameters, Frame, PixelFormat, Rational, TimeBase, VideoFrame,
 };

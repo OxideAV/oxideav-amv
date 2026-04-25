@@ -35,12 +35,12 @@
 
 use std::io::Read;
 
-use oxideav_container::ContainerRegistry;
-use oxideav_container::{Demuxer, ProbeData, ReadSeek};
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{
     CodecId, CodecParameters, CodecResolver, Error, MediaType, Packet, PixelFormat, Rational,
     Result, SampleFormat, StreamInfo, TimeBase,
 };
+use oxideav_core::{Demuxer, ProbeData, ReadSeek};
 
 pub fn register(reg: &mut ContainerRegistry) {
     reg.register_demuxer("amv", open);

@@ -6,7 +6,7 @@
 //! bit-exact; we assert on PSNR instead, which for well-behaved sine input
 //! sits comfortably in the 30–45 dB range characteristic of 4-bit ADPCM.
 
-use oxideav_codec::CodecRegistry;
+use oxideav_core::CodecRegistry;
 use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
 
 const SAMPLE_RATE: u32 = 22_050;

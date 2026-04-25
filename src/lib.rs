@@ -37,9 +37,9 @@ pub mod audio;
 pub mod demux;
 pub mod video;
 
-use oxideav_codec::{CodecInfo, CodecRegistry};
-use oxideav_container::ContainerRegistry;
+use oxideav_core::ContainerRegistry;
 use oxideav_core::{CodecCapabilities, CodecId};
+use oxideav_core::{CodecInfo, CodecRegistry};
 
 /// Codec id for AMV video — the modified-MJPEG bitstream.
 pub const VIDEO_CODEC_ID_STR: &str = "amv";
