@@ -309,7 +309,6 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
     Ok(Box::new(AmvAudioEncoder {
         output_params: output,
-        sample_rate,
         time_base: TimeBase::new(1, sample_rate as i64),
         state: ImaState {
             predictor: 0,
@@ -323,7 +322,6 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
 
 struct AmvAudioEncoder {
     output_params: CodecParameters,
-    sample_rate: u32,
     time_base: TimeBase,
     /// Running IMA state, carried across chunks. Each packet's header
     /// records the state as-of-the-start-of-that-chunk so decoders can
