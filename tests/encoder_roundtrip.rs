@@ -7,7 +7,7 @@
 //! sits comfortably in the 30–45 dB range characteristic of 4-bit ADPCM.
 
 use oxideav_core::CodecRegistry;
-use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat, TimeBase};
+use oxideav_core::{AudioFrame, CodecId, CodecParameters, Frame, Packet, SampleFormat};
 
 const SAMPLE_RATE: u32 = 22_050;
 
@@ -27,12 +27,8 @@ fn pcm_to_frame(samples: &[i16]) -> AudioFrame {
         bytes.extend_from_slice(&s.to_le_bytes());
     }
     AudioFrame {
-        format: SampleFormat::S16,
-        channels: 1,
-        sample_rate: SAMPLE_RATE,
         samples: samples.len() as u32,
         pts: Some(0),
-        time_base: TimeBase::new(1, SAMPLE_RATE as i64),
         data: vec![bytes],
     }
 }

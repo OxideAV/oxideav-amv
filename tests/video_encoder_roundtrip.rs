@@ -11,7 +11,7 @@
 
 use oxideav_core::CodecRegistry;
 use oxideav_core::{
-    frame::VideoPlane, CodecId, CodecParameters, Frame, PixelFormat, Rational, TimeBase, VideoFrame,
+    frame::VideoPlane, CodecId, CodecParameters, Frame, PixelFormat, Rational, VideoFrame,
 };
 
 const W: u32 = 64;
@@ -71,11 +71,7 @@ fn make_test_frame() -> VideoFrame {
     }
 
     VideoFrame {
-        format: PixelFormat::Yuv420P,
-        width: W,
-        height: H,
         pts: Some(0),
-        time_base: TimeBase::new(1, 30),
         planes: vec![
             VideoPlane { stride: w, data: y },
             VideoPlane {
@@ -169,9 +165,8 @@ fn amv_video_roundtrip_psnr_above_30db() {
     let Frame::Video(decoded) = dec.receive_frame().expect("decoded frame") else {
         panic!("expected video frame");
     };
-    assert_eq!(decoded.width, W);
-    assert_eq!(decoded.height, H);
-    assert_eq!(decoded.format, PixelFormat::Yuv420P);
+    // Slim VideoFrame no longer carries width/height/format — those live on
+    // the decoder's stream params (already validated by params above).
 
     let psnr_db = psnr_planar(&input, &decoded);
     eprintln!("AMV video roundtrip PSNR = {:.2} dB", psnr_db);

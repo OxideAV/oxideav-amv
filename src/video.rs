@@ -111,7 +111,11 @@ impl Decoder for AmvVideoDecoder {
         let frame = self.inner.receive_frame()?;
         match frame {
             Frame::Video(mut vf) => {
-                flip_vertically(&mut vf);
+                // AMV pictures are always 4:2:0 baseline JPEG — that's the
+                // only flavour the decoder synthesises a header for. Pass
+                // the stored stream dimensions in since the slim VideoFrame
+                // no longer carries them.
+                flip_vertically(&mut vf, self.height, PixelFormat::Yuv420P);
                 Ok(Frame::Video(vf))
             }
             other => Ok(other),
@@ -243,12 +247,13 @@ fn write_sos(out: &mut Vec<u8>) {
 /// Flip a planar `VideoFrame`'s planes vertically in place. Works for
 /// `Yuv420P`, `Yuv422P`, `Yuv444P`, and `Gray8` — the only formats the
 /// underlying MJPEG decoder produces. Each plane is flipped row-by-row
-/// using its own `stride`/height.
-fn flip_vertically(vf: &mut VideoFrame) {
-    let (luma_h, chroma_h) = match vf.format {
-        PixelFormat::Yuv420P => (vf.height as usize, vf.height.div_ceil(2) as usize),
-        PixelFormat::Yuv422P | PixelFormat::Yuv444P => (vf.height as usize, vf.height as usize),
-        PixelFormat::Gray8 => (vf.height as usize, 0),
+/// using its own `stride`/height. The slim `VideoFrame` no longer carries
+/// dimensions/format; the caller supplies them from stream params.
+fn flip_vertically(vf: &mut VideoFrame, height: u32, format: PixelFormat) {
+    let (luma_h, chroma_h) = match format {
+        PixelFormat::Yuv420P => (height as usize, height.div_ceil(2) as usize),
+        PixelFormat::Yuv422P | PixelFormat::Yuv444P => (height as usize, height as usize),
+        PixelFormat::Gray8 => (height as usize, 0),
         _ => return,
     };
     for (i, plane) in vf.planes.iter_mut().enumerate() {
@@ -362,23 +367,15 @@ impl Encoder for AmvVideoEncoder {
         let Frame::Video(v) = frame else {
             return Err(Error::invalid("AMV video encoder: video frames only"));
         };
-        if v.width != self.width || v.height != self.height {
-            return Err(Error::invalid(
-                "AMV video encoder: frame dimensions do not match encoder config",
-            ));
-        }
-        if v.format != PixelFormat::Yuv420P {
-            return Err(Error::invalid(format!(
-                "AMV video encoder: frame format {:?} not supported (need Yuv420P)",
-                v.format
-            )));
-        }
+        // Per-frame dimension/format validation lives at the stream-params
+        // layer now (slim VideoFrame no longer carries that metadata); the
+        // caller must supply a Yuv420P frame matching the configured w/h.
 
         // Clone + flip vertically so the JPEG bitstream carries the
         // upside-down picture AMV stores on disk. The decoder flips it
         // back on output.
         let mut flipped = v.clone();
-        flip_vertically(&mut flipped);
+        flip_vertically(&mut flipped, self.height, PixelFormat::Yuv420P);
 
         let jpeg = encode_jpeg(&flipped, AMV_JPEG_QUALITY)?;
         let amv_payload = strip_jpeg_headers(&jpeg)?;
@@ -524,7 +521,6 @@ fn read_segment_length(jpeg: &[u8], i: usize) -> Result<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::TimeBase;
 
     #[test]
     fn synthesise_rejects_non_soi() {
@@ -570,11 +566,7 @@ mod tests {
     fn flip_vertically_yuv420p() {
         // 4×4 Y plane, 2×2 Cb/Cr planes. Rows are 0,1,2,3 in luma.
         let mut vf = VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: 4,
-            height: 4,
             pts: None,
-            time_base: TimeBase::new(1, 30),
             planes: vec![
                 oxideav_core::frame::VideoPlane {
                     stride: 4,
@@ -595,7 +587,7 @@ mod tests {
                 },
             ],
         };
-        flip_vertically(&mut vf);
+        flip_vertically(&mut vf, 4, PixelFormat::Yuv420P);
         assert_eq!(
             vf.planes[0].data,
             vec![3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0]

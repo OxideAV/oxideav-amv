@@ -291,8 +291,8 @@ fn ffmpeg_roundtrip_decodes_video_and_audio() {
                     vdec.send_packet(&pkt).expect("send video packet");
                     let frame = vdec.receive_frame().expect("receive video frame");
                     if let Frame::Video(vf) = frame {
-                        assert_eq!(vf.width, 64);
-                        assert_eq!(vf.height, 64);
+                        // Slim VideoFrame no longer carries width/height/format —
+                        // those live on stream params and were checked above.
                         assert!(!vf.planes.is_empty());
                         decoded_video_frames += 1;
                     } else {
@@ -302,8 +302,8 @@ fn ffmpeg_roundtrip_decodes_video_and_audio() {
                     adec.send_packet(&pkt).expect("send audio packet");
                     let frame = adec.receive_frame().expect("receive audio frame");
                     if let Frame::Audio(af) = frame {
-                        assert_eq!(af.sample_rate, 22_050);
-                        assert_eq!(af.channels, 1);
+                        // Slim AudioFrame no longer carries sample_rate/channels —
+                        // those live on stream params and were checked above.
                         decoded_audio_frames += 1;
                         total_audio_samples += af.samples as usize;
                     } else {

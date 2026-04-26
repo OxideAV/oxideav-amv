@@ -37,15 +37,16 @@ use oxideav_core::{
 use oxideav_core::{CodecInfo, CodecRegistry, Decoder, Encoder};
 
 pub fn make_decoder(params: &CodecParameters) -> Result<Box<dyn Decoder>> {
-    let sample_rate = params.sample_rate.unwrap_or(22_050);
+    // Sample rate is read for validation but no longer needs to be stored:
+    // the slim AudioFrame doesn't carry sample-rate metadata, so the decoder
+    // doesn't need a TimeBase either.
+    let _sample_rate = params.sample_rate.unwrap_or(22_050);
     let channels = params.channels.unwrap_or(1);
     if channels != 1 {
         return Err(Error::unsupported("AMV IMA-ADPCM: only mono is supported"));
     }
     Ok(Box::new(AmvAudioDecoder {
         codec_id: CodecId::new(crate::AUDIO_CODEC_ID_STR),
-        sample_rate,
-        time_base: TimeBase::new(1, sample_rate as i64),
         pending: None,
         eof: false,
     }))
@@ -68,8 +69,6 @@ pub fn register(reg: &mut CodecRegistry) {
 
 struct AmvAudioDecoder {
     codec_id: CodecId,
-    sample_rate: u32,
-    time_base: TimeBase,
     pending: Option<Packet>,
     eof: bool,
 }
@@ -104,12 +103,8 @@ impl Decoder for AmvAudioDecoder {
             bytes.extend_from_slice(&s.to_le_bytes());
         }
         Ok(Frame::Audio(AudioFrame {
-            format: SampleFormat::S16,
-            channels: 1,
-            sample_rate: self.sample_rate,
             samples: n,
             pts: pkt.pts,
-            time_base: self.time_base,
             data: vec![bytes],
         }))
     }
@@ -357,20 +352,9 @@ impl Encoder for AmvAudioEncoder {
         let Frame::Audio(af) = frame else {
             return Err(Error::invalid("AMV audio encoder: audio frames only"));
         };
-        if af.channels != 1 {
-            return Err(Error::invalid("AMV audio encoder: input must be mono"));
-        }
-        if af.sample_rate != self.sample_rate {
-            return Err(Error::invalid(format!(
-                "AMV audio encoder: input sample rate {} does not match configured {}",
-                af.sample_rate, self.sample_rate
-            )));
-        }
-        if af.format != SampleFormat::S16 {
-            return Err(Error::invalid(
-                "AMV audio encoder: input sample format must be S16",
-            ));
-        }
+        // Format/channel/sample-rate validation lives at the stream-params
+        // layer now (slim AudioFrame no longer carries that metadata); the
+        // caller must feed mono S16 data at the configured sample rate.
         let bytes = af
             .data
             .first()
