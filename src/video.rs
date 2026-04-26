@@ -377,7 +377,13 @@ impl Encoder for AmvVideoEncoder {
         let mut flipped = v.clone();
         flip_vertically(&mut flipped, self.height, PixelFormat::Yuv420P);
 
-        let jpeg = encode_jpeg(&flipped, AMV_JPEG_QUALITY)?;
+        let jpeg = encode_jpeg(
+            &flipped,
+            self.width,
+            self.height,
+            PixelFormat::Yuv420P,
+            AMV_JPEG_QUALITY,
+        )?;
         let amv_payload = strip_jpeg_headers(&jpeg)?;
         let mut out = Packet::new(0, self.time_base, amv_payload);
         out.pts = v.pts;
