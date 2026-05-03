@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/OxideAV/oxideav-amv/compare/v0.0.6...v0.0.7) - 2026-05-03
+
+### Other
+
+- replace never-match regex with semver_check = false
+- migrate to centralized OxideAV/.github reusable workflows
+- drop unused AmvAudioEncoder.sample_rate field (slim-frame leftover)
+- update encode_jpeg call to slim-shape signature
+- adopt slim VideoFrame/AudioFrame shape
+- pin release-plz to patch-only bumps
+
 ## [0.0.6](https://github.com/OxideAV/oxideav-amv/compare/v0.0.5...v0.0.6) - 2026-04-25
 
 ### Other
