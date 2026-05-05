@@ -274,11 +274,11 @@ fn ffmpeg_roundtrip_decodes_video_and_audio() {
 
     let mut vdec = ctx
         .codecs
-        .make_decoder(&streams[0].params)
+        .first_decoder(&streams[0].params)
         .expect("make video decoder");
     let mut adec = ctx
         .codecs
-        .make_decoder(&streams[1].params)
+        .first_decoder(&streams[1].params)
         .expect("make audio decoder");
 
     let mut decoded_video_frames = 0usize;

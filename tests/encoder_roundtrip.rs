@@ -64,12 +64,12 @@ fn register_and_run_roundtrip(samples_per_chunk: usize, total_samples: usize) ->
     enc_params.sample_rate = Some(SAMPLE_RATE);
     enc_params.channels = Some(1);
     enc_params.sample_format = Some(SampleFormat::S16);
-    let mut encoder = reg.make_encoder(&enc_params).expect("make encoder");
+    let mut encoder = reg.first_encoder(&enc_params).expect("make encoder");
 
     let mut dec_params = CodecParameters::audio(id);
     dec_params.sample_rate = Some(SAMPLE_RATE);
     dec_params.channels = Some(1);
-    let mut decoder = reg.make_decoder(&dec_params).expect("make decoder");
+    let mut decoder = reg.first_decoder(&dec_params).expect("make decoder");
 
     // Feed the encoder one chunk at a time.
     let mut collected: Vec<i16> = Vec::with_capacity(total_samples);
@@ -163,8 +163,8 @@ fn encode_silent_input_is_near_zero() {
     params.sample_rate = Some(SAMPLE_RATE);
     params.channels = Some(1);
     params.sample_format = Some(SampleFormat::S16);
-    let mut enc = reg.make_encoder(&params).unwrap();
-    let mut dec = reg.make_decoder(&params).unwrap();
+    let mut enc = reg.first_encoder(&params).unwrap();
+    let mut dec = reg.first_decoder(&params).unwrap();
 
     let input = vec![0i16; 512];
     enc.send_frame(&Frame::Audio(pcm_to_frame(&input))).unwrap();

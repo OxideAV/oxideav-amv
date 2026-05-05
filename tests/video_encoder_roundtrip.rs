@@ -131,8 +131,8 @@ fn amv_video_roundtrip_psnr_above_30db() {
     params.pixel_format = Some(PixelFormat::Yuv420P);
     params.frame_rate = Some(Rational::new(30, 1));
 
-    let mut enc = reg.make_encoder(&params).expect("make AMV video encoder");
-    let mut dec = reg.make_decoder(&params).expect("make AMV video decoder");
+    let mut enc = reg.first_encoder(&params).expect("make AMV video encoder");
+    let mut dec = reg.first_decoder(&params).expect("make AMV video decoder");
 
     let input = make_test_frame();
     enc.send_frame(&Frame::Video(input.clone())).unwrap();
@@ -188,6 +188,6 @@ fn amv_video_encoder_rejects_wrong_format() {
     params.height = Some(H);
     params.pixel_format = Some(PixelFormat::Yuv422P);
     // make_encoder should fail with unsupported format.
-    let r = reg.make_encoder(&params);
+    let r = reg.first_encoder(&params);
     assert!(r.is_err(), "encoder must reject non-4:2:0 input");
 }
