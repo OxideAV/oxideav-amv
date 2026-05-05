@@ -12,7 +12,6 @@ use std::io::Cursor;
 use std::path::Path;
 use std::process::Command;
 
-use oxideav_core::CodecRegistry;
 use oxideav_core::{ContainerRegistry, ProbeData};
 use oxideav_core::{Error, Frame, MediaType};
 
@@ -253,11 +252,11 @@ fn ffmpeg_roundtrip_decodes_video_and_audio() {
         return;
     }
     let bytes = std::fs::read(REF_PATH).expect("read ref AMV");
-    let mut creg = ContainerRegistry::new();
-    let mut codecs = CodecRegistry::new();
-    oxideav_amv::register(&mut codecs, &mut creg);
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    oxideav_amv::register(&mut ctx);
 
-    let mut demux = creg
+    let mut demux = ctx
+        .containers
         .open_demuxer(
             "amv",
             Box::new(Cursor::new(bytes)),
@@ -273,10 +272,12 @@ fn ffmpeg_roundtrip_decodes_video_and_audio() {
     assert_eq!(streams[1].params.channels, Some(1));
     assert_eq!(streams[1].params.sample_rate, Some(22_050));
 
-    let mut vdec = codecs
+    let mut vdec = ctx
+        .codecs
         .make_decoder(&streams[0].params)
         .expect("make video decoder");
-    let mut adec = codecs
+    let mut adec = ctx
+        .codecs
         .make_decoder(&streams[1].params)
         .expect("make audio decoder");
 

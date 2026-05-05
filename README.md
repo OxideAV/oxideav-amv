@@ -27,13 +27,12 @@ Open the file as a container, pull packets, dispatch to the matching
 decoder:
 
 ```rust
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
-use oxideav_core::{Frame, MediaType};
+use oxideav_core::{Frame, MediaType, RuntimeContext};
 
-let mut codecs = CodecRegistry::new();
-let mut containers = ContainerRegistry::new();
-oxideav_amv::register(&mut codecs, &mut containers);
+let mut ctx = RuntimeContext::new();
+oxideav_amv::register(&mut ctx);
+let codecs = &ctx.codecs;
+let containers = &ctx.containers;
 
 let input: Box<dyn oxideav_container::ReadSeek> = Box::new(
     std::io::Cursor::new(std::fs::read("clip.amv")?),
