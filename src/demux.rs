@@ -124,11 +124,14 @@ fn open(mut input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result<Box
 
     Ok(Box::new(AmvDemuxer {
         blob,
+        movi_start,
         cursor: movi_start,
         streams,
         v_pts: 0,
         a_pts: 0,
         eof: false,
+        seek_index: Vec::new(),
+        index_complete: false,
     }))
 }
 
@@ -260,13 +263,44 @@ fn parse_amvh(blob: &[u8]) -> Result<AmvHeader> {
     Ok(h)
 }
 
+/// One entry per video chunk discovered when (lazily) indexing the file.
+///
+/// We record the byte offset of the `00dc` chunk header along with the
+/// per-stream PTS counters as they stood _just before_ that chunk was
+/// emitted — i.e. seeking to this entry and resuming the walk reproduces
+/// the same `(v_pts, a_pts)` the demuxer would have at this point in a
+/// linear read. Audio chunks are not separately recorded: they live
+/// strictly between consecutive video entries and are recovered by
+/// resuming the walk after a seek.
+#[derive(Clone, Copy, Debug)]
+struct VideoIndexEntry {
+    /// Byte offset of the `00dc` chunk header within `blob`.
+    offset: usize,
+    /// Video stream PTS for the frame at `offset` (frame counter).
+    v_pts: i64,
+    /// Cumulative audio PTS (samples) emitted before `offset` was reached.
+    a_pts: i64,
+}
+
 struct AmvDemuxer {
     blob: Vec<u8>,
+    /// First byte inside the `movi` LIST body.
+    movi_start: usize,
     cursor: usize,
     streams: Vec<StreamInfo>,
     v_pts: i64,
     a_pts: i64,
     eof: bool,
+    /// Lazy index of every `00dc` chunk in the file. Built incrementally
+    /// the first time `seek_to` is called (or extended on subsequent
+    /// seeks past the previously-scanned region). AMV has no built-in
+    /// chunk index akin to AVI's `idx1`, so this is the canonical seek
+    /// table — every entry is a keyframe (AMV video is intra-only).
+    seek_index: Vec<VideoIndexEntry>,
+    /// True once the index walk has reached the end of `movi` (a trailer
+    /// marker, EOF, or a bogus oversized chunk). After this, the index
+    /// is final and `last entry` corresponds to the final video frame.
+    index_complete: bool,
 }
 
 impl Demuxer for AmvDemuxer {
@@ -356,4 +390,205 @@ impl Demuxer for AmvDemuxer {
         // from the longest stream.
         None
     }
+
+    /// Seek to the keyframe at or before `pts` in `stream_index`'s time
+    /// base. AMV video is intra-only, so every video chunk is a
+    /// keyframe; AMV audio is IMA-ADPCM with self-contained per-chunk
+    /// state (initial predictor + step-index in the 8-byte header), so
+    /// audio packets are likewise independently decodable. The seek
+    /// always lands on a video chunk boundary — pulling audio after
+    /// the seek will return the first `01wb` chunk that appears between
+    /// the landed video chunk and the next, which is the AMV-correct
+    /// pairing.
+    fn seek_to(&mut self, stream_index: u32, pts: i64) -> Result<i64> {
+        if (stream_index as usize) >= self.streams.len() {
+            return Err(Error::invalid(format!(
+                "AMV: stream index {stream_index} out of range"
+            )));
+        }
+        // Make sure we've indexed enough of the file to either find a
+        // hit or rule one out. For pts ≤ 0 the answer is always the
+        // first entry (or movi_start itself if there are no video
+        // chunks) so we still need at least one index pass to know the
+        // first entry's pts.
+        self.ensure_index_covers(stream_index, pts);
+
+        if self.seek_index.is_empty() {
+            // No video chunks in the file at all. Reset to the start
+            // of `movi` and report pts=0 in the requested time base.
+            self.cursor = self.movi_start;
+            self.v_pts = 0;
+            self.a_pts = 0;
+            self.eof = false;
+            return Ok(0);
+        }
+
+        // Pick the index entry to land on, depending on which stream
+        // the caller is seeking in. We always physically land on a
+        // video chunk; only the comparison key changes.
+        let landed_idx: usize = match stream_index {
+            0 => {
+                // Video stream: index by v_pts (== frame counter).
+                if pts <= self.seek_index[0].v_pts {
+                    0
+                } else {
+                    // Largest entry with v_pts <= pts.
+                    match self.seek_index.binary_search_by(|e| e.v_pts.cmp(&pts)) {
+                        Ok(i) => i,
+                        Err(i) => {
+                            // `i` is the insertion point; the entry
+                            // before it is the largest <= pts.
+                            i.saturating_sub(1).min(self.seek_index.len() - 1)
+                        }
+                    }
+                }
+            }
+            1 => {
+                // Audio stream: index by a_pts (== cumulative samples
+                // already emitted _before_ the indexed video chunk).
+                // Find the largest video entry whose a_pts <= pts —
+                // that's the V chunk we should land on so the next
+                // `next_packet()` re-emits the matching A chunk.
+                if pts <= self.seek_index[0].a_pts {
+                    0
+                } else {
+                    match self.seek_index.binary_search_by(|e| e.a_pts.cmp(&pts)) {
+                        Ok(i) => i,
+                        Err(i) => i.saturating_sub(1).min(self.seek_index.len() - 1),
+                    }
+                }
+            }
+            _ => unreachable!("stream_index bounds already checked"),
+        };
+
+        let entry = self.seek_index[landed_idx];
+        self.cursor = entry.offset;
+        self.v_pts = entry.v_pts;
+        self.a_pts = entry.a_pts;
+        self.eof = false;
+
+        // Report the landed pts _in the caller's stream time base_.
+        Ok(match stream_index {
+            0 => entry.v_pts,
+            1 => entry.a_pts,
+            _ => unreachable!(),
+        })
+    }
+}
+
+impl AmvDemuxer {
+    /// Extend the lazy seek index until either (a) the requested
+    /// `pts` is provably bracketed (the latest indexed entry has the
+    /// stream's pts strictly greater than `pts`), or (b) we've reached
+    /// the end of `movi` and the index is complete.
+    ///
+    /// `stream_index` selects which pts axis to compare against:
+    /// stream 0 → `v_pts` (frame counter), stream 1 → `a_pts`
+    /// (cumulative sample count). Index construction itself records
+    /// both axes regardless; only the "have we scanned far enough"
+    /// stopping condition uses the selected axis.
+    fn ensure_index_covers(&mut self, stream_index: u32, pts: i64) {
+        if self.index_complete {
+            return;
+        }
+        // Walk byte-for-byte starting from where the index left off
+        // (resume cursor = end of last indexed chunk's payload, or
+        // movi_start if the index is empty).
+        let mut walk = match self.seek_index.last().copied() {
+            Some(last) => {
+                // Re-derive the cursor by reading the chunk size at
+                // last.offset and skipping past its payload. The
+                // alternative (storing payload_end per entry) doubles
+                // memory traffic for no real saving.
+                let size_at = chunk_payload_size(&self.blob, last.offset).unwrap_or(0);
+                last.offset + 8 + size_at
+            }
+            None => self.movi_start,
+        };
+        // Replay the v_pts / a_pts counters as they were _just after_
+        // the last indexed chunk's payload was emitted (= just before
+        // the next chunk). When the index is empty, both are zero
+        // (the demuxer starts both counters at zero, mirroring open()).
+        let (mut v_pts, mut a_pts) = match self.seek_index.last().copied() {
+            // The last indexed entry's a_pts is the audio cumulative
+            // _before_ that video chunk, so we must add the audio
+            // emitted between it and the next video chunk during the
+            // walk. Easier to reset both from the entry: v_pts after
+            // emitting that video chunk is last.v_pts + 1, but any
+            // audio chunks between it and the next video are unindexed
+            // — we'll re-count them as we walk.
+            Some(last) => (last.v_pts + 1, last.a_pts),
+            None => (0, 0),
+        };
+
+        loop {
+            if walk + 8 > self.blob.len() {
+                self.index_complete = true;
+                return;
+            }
+            let tag = &self.blob[walk..walk + 4];
+            if tag == b"AMV_" || tag == b"END_" {
+                self.index_complete = true;
+                return;
+            }
+            let size =
+                u32::from_le_bytes(self.blob[walk + 4..walk + 8].try_into().unwrap()) as usize;
+            if size > self.blob.len().saturating_sub(walk + 8) {
+                // Same defensive bail-out as next_packet() — the
+                // index ends here.
+                self.index_complete = true;
+                return;
+            }
+            let payload_start = walk + 8;
+            let payload_end = payload_start + size;
+            match tag {
+                b"00dc" => {
+                    self.seek_index.push(VideoIndexEntry {
+                        offset: walk,
+                        v_pts,
+                        a_pts,
+                    });
+                    v_pts += 1;
+                    walk = payload_end;
+                    // Early-exit: did we just bracket the caller's pts?
+                    let bracket_pts = match stream_index {
+                        0 => v_pts, // next frame's pts
+                        1 => a_pts, // audio not advanced by 00dc
+                        _ => unreachable!(),
+                    };
+                    if bracket_pts > pts {
+                        return;
+                    }
+                }
+                b"01wb" => {
+                    let n_samples = if size >= 8 {
+                        ((size - 8) * 2) as i64
+                    } else {
+                        0
+                    };
+                    a_pts += n_samples;
+                    walk = payload_end;
+                    // For an audio-stream seek, bail as soon as the
+                    // _cumulative_ a_pts overshoots: the next 00dc
+                    // we'd index already starts past the target.
+                    if stream_index == 1 && a_pts > pts {
+                        return;
+                    }
+                }
+                _ => {
+                    walk = payload_end;
+                }
+            }
+        }
+    }
+}
+
+/// Read the LE32 payload size out of an 8-byte AMV chunk header at
+/// `offset`. Returns `None` when the header runs past EOF — caller
+/// treats that as "stop indexing here".
+fn chunk_payload_size(blob: &[u8], offset: usize) -> Option<usize> {
+    if offset + 8 > blob.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes(blob[offset + 4..offset + 8].try_into().unwrap()) as usize)
 }

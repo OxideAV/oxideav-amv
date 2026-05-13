@@ -101,7 +101,12 @@ let a_pkt = aenc.receive_packet()?;
   `RIFF....AMV ` magic. Tolerant to the zero-size top-level
   LIST/RIFF chunks that real AMV files ship with; walks by tag.
   Stream 0 is always video, stream 1 is always audio (AMV enforces
-  strict V-A interleaving).
+  strict V-A interleaving). The demuxer also supports `seek_to`:
+  AMV ships no `idx1`-style chunk table, so the demuxer builds a
+  lazy index of every `00dc` chunk's byte offset on first seek and
+  binary-searches it. Every video frame is a keyframe (AMV video is
+  intra-only) so the landing pts equals the requested pts on the
+  video stream; audio overshoots clamp to the last indexed entry.
 
 ## Limitations
 

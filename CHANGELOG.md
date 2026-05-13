@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- demuxer: `seek_to(stream, pts)` — AMV has no built-in chunk index, so
+  the demuxer builds a lazy table of every `00dc` chunk's byte offset +
+  per-stream PTS counters on first seek and binary-searches it. AMV
+  video is intra-only (every frame is a keyframe) and AMV audio is
+  self-contained IMA-ADPCM (per-chunk predictor + step-index header),
+  so the seek lands exactly on the requested frame on the video stream
+  and at the matching V-A pair on the audio stream. Overshooting clamps
+  to the final indexed entry rather than erroring.
+
 ## [0.0.8](https://github.com/OxideAV/oxideav-amv/compare/v0.0.7...v0.0.8) - 2026-05-06
 
 ### Other
