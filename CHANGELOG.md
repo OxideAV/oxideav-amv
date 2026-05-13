@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-amv/compare/v0.0.8...v0.0.9) - 2026-05-13
+
+### Other
+
+- add lazy-index seek_to
+
 ### Added
 - demuxer: `seek_to(stream, pts)` — AMV has no built-in chunk index, so
   the demuxer builds a lazy table of every `00dc` chunk's byte offset +
