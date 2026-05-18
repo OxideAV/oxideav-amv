@@ -1,0 +1,18 @@
+[package]
+name = "oxideav-amv"
+version = "0.0.8"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+repository = "https://github.com/OxideAV/oxideav-amv"
+authors = ["Mark Karpeles"]
+description = "Pure-Rust AMV (Chinese MP3/MP4-player Motion-JPEG + IMA-ADPCM) decoder + IMA-ADPCM encoder"
+
+readme = "README.md"
+homepage = "https://github.com/OxideAV/oxideav-amv"
+keywords = ["multimedia", "video", "amv", "codec", "pure-rust"]
+categories = ["multimedia::encoding", "multimedia::video"]
+
+[dependencies]
+oxideav-core = "0.1"
+oxideav-mjpeg = "0.1"
