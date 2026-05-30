@@ -6,13 +6,12 @@ rust-version = "1.80"
 license = "MIT"
 repository = "https://github.com/OxideAV/oxideav-amv"
 authors = ["Mark Karpeles"]
-description = "Pure-Rust AMV (Chinese MP3/MP4-player Motion-JPEG + IMA-ADPCM) decoder + IMA-ADPCM encoder"
+description = "Pure-Rust AMV (Actions Media Video) container demuxer for cheap Chinese portable-media-player .amv files"
 
 readme = "README.md"
 homepage = "https://github.com/OxideAV/oxideav-amv"
-keywords = ["multimedia", "video", "amv", "codec", "pure-rust"]
-categories = ["multimedia::encoding", "multimedia::video"]
+keywords = ["multimedia", "video", "amv", "container", "demuxer"]
+categories = ["multimedia::encoding", "multimedia"]
 
 [dependencies]
 oxideav-core = "0.1"
-oxideav-mjpeg = "0.1"
