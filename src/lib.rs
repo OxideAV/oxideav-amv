@@ -25,6 +25,17 @@
 //! stream as `adpcm_amv`; actual frame / sample decoding lives in
 //! sibling codec crates and is invoked downstream of the demuxer.
 //!
+//! ## What this crate writes
+//!
+//! [`AmvMuxer`] is the inverse of [`AmvDemuxer`]: given the same
+//! `[video, audio]` `StreamInfo` pair, it emits a byte-faithful AMV
+//! file with the §1 zeroed RIFF / LIST sizes, the §2 packed-byte
+//! `amvh` duration (patched from observed frame count in
+//! `write_trailer`), the §3 all-zero stream-header bodies plus the
+//! 20-byte audio `WAVEFORMATEX`, the §4 no-byte-padding chunk walk,
+//! and the §4c `AMV_END_` ASCII trailer. Mux → demux round-trips
+//! exactly.
+//!
 //! ## Provenance
 //!
 //! Every byte-format fact in this crate is derived from
@@ -57,9 +68,11 @@
 #![warn(missing_docs)]
 
 mod demuxer;
+mod muxer;
 mod parse;
 
 pub use demuxer::{AmvDemuxer, AmvDemuxerError};
+pub use muxer::AmvMuxer;
 pub use parse::{
     AmvDuration, AmvHeader, AmvWaveFormat, ChunkHeader, ChunkKind, AMVH_BODY_LEN, AMV_END_TRAILER,
     AMV_FORM_TYPE, AUDIO_CHUNK_TAG, VIDEO_CHUNK_TAG,
@@ -123,9 +136,13 @@ fn open_demuxer(input: Box<dyn ReadSeek>, _codecs: &dyn CodecResolver) -> Result
     Ok(Box::new(demuxer))
 }
 
-/// Register the AMV container into a [`ContainerRegistry`].
+/// Register the AMV container into a [`ContainerRegistry`]. Installs
+/// both the demuxer (read side) and the muxer (write side); the writer
+/// is byte-faithful to `docs/container/amv/amv-container-trace.md`
+/// §1..§4 so mux→demux round-trips cleanly.
 pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_demuxer(CONTAINER_NAME, open_demuxer);
+    reg.register_muxer(CONTAINER_NAME, muxer::open_muxer);
     reg.register_extension("amv", CONTAINER_NAME);
     reg.register_probe(CONTAINER_NAME, probe);
 }
@@ -178,6 +195,16 @@ mod register_tests {
         assert!(
             ctx.containers.demuxer_names().any(|n| n == CONTAINER_NAME),
             "amv demuxer should be installed"
+        );
+    }
+
+    #[test]
+    fn register_installs_amv_muxer() {
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        assert!(
+            ctx.containers.muxer_names().any(|n| n == CONTAINER_NAME),
+            "amv muxer should be installed"
         );
     }
 

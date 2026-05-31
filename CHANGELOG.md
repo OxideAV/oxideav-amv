@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `AmvMuxer` — byte-faithful inverse of `AmvDemuxer`. Writes a complete
+  AMV container from a `[video, audio]` `StreamInfo` pair: the §1 zeroed
+  RIFF / LIST sizes, the populated §2 `amvh` body (packed-byte duration
+  patched in `write_trailer` from the observed video-frame count), the
+  §3 all-zero stream-header bodies plus the 20-byte audio `WAVEFORMATEX`,
+  the §4 no-byte-padding chunk walk (`00dc` / `01wb` tagged by
+  `Packet::stream_index`), and the §4c `AMV_END_` ASCII trailer. The
+  muxer is registered under name `amv` alongside the demuxer.
+- Round-trip test suite — mux 3 (video, audio) pairs through `AmvMuxer`,
+  parse the result through `AmvDemuxer`, recover byte-identical payloads;
+  separately, mux 1116 frames at 12 fps and confirm the patched duration
+  decodes to the §2 worked-example `1:33`. A second test pins the real
+  boxed `AmvMuxer` output against the test-only `build_via_no_box_muxer`
+  helper so both code paths emit identical bytes.
+
 - Clean-room AMV container demuxer rebuilt against
   `docs/container/amv/amv-container-trace.md`, the workspace-staged
   byte-level reverse-engineering trace (no external library source

@@ -16,12 +16,22 @@ in the workspace for the full byte-by-byte layout.
 
 ## Status
 
-Container-only demuxer. Parses the prelude (`amvh` resolution / fps / duration,
-audio `WAVEFORMATEX`) and walks the `movi` payload, emitting one
-`oxideav_core::Packet` per `00dc` (video) / `01wb` (audio) leaf chunk; the
-walk terminates cleanly at the trailing `AMV_END_` ASCII literal. Validated
-end-to-end against the staged `comedian.amv` fixture (128 × 96, 12 fps, 1:33
-duration, 1116 + 1116 paired chunks).
+Container demuxer **and** muxer. Reads the prelude (`amvh` resolution / fps
+/ duration, audio `WAVEFORMATEX`) and walks the `movi` payload, emitting
+one `oxideav_core::Packet` per `00dc` (video) / `01wb` (audio) leaf chunk;
+the walk terminates cleanly at the trailing `AMV_END_` ASCII literal.
+Validated end-to-end against the staged `comedian.amv` fixture (128 × 96,
+12 fps, 1:33 duration, 1116 + 1116 paired chunks).
+
+The new `AmvMuxer` is the inverse: given a `[video, audio]` `StreamInfo`
+pair (width/height/fps on the video side, sample-rate/channels on the
+audio side), it writes a byte-faithful AMV file with the §1 zeroed RIFF
+/ LIST sizes, the populated §2 `amvh` body (packed-byte duration patched
+in `write_trailer` from the observed frame count), the §3 all-zero
+stream-header bodies plus the 20-byte audio `WAVEFORMATEX`, the §4
+no-byte-padding chunk walk, and the §4c `AMV_END_` ASCII trailer. The
+test suite includes a mux → demux round-trip that recovers byte-identical
+payloads and the expected `1:33` duration when fed 1116 frames at 12 fps.
 
 Frame and sample **decoding** are out of scope — the video stream is declared
 as the `mjpeg` codec id (the actual JPEG payload requires the player's stripped
@@ -45,9 +55,11 @@ println!("{}×{} @ {} fps", demuxer.header().width, demuxer.header().height,
 println!("audio: {} Hz", demuxer.audio_format().samples_per_sec);
 ```
 
-When wired into a `RuntimeContext` via `oxideav_amv::register`, the demuxer
-becomes available alongside the other registered containers — `amv` is the
-container name, with FORM-type-based probing and the `.amv` extension hint.
+When wired into a `RuntimeContext` via `oxideav_amv::register`, both the
+demuxer and the muxer become available alongside the other registered
+containers — `amv` is the container name on both sides, with FORM-type-based
+probing and the `.amv` extension hint for the read path, and
+`ContainerRegistry::open_muxer("amv", …)` for the write path.
 
 The crate also exposes its byte-level parsers as a standalone library
 (`AmvHeader`, `AmvDuration`, `AmvWaveFormat`, `ChunkHeader`, `ChunkKind`,
