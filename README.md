@@ -34,15 +34,27 @@ test suite includes a mux → demux round-trip that recovers byte-identical
 payloads and the expected `1:33` duration when fed 1116 frames at 12 fps.
 
 Seeking is supported via `Demuxer::seek_to(stream_index, pts)`. AMV has
-no `idx1` index (trace §1 quirk #2), so the implementation rewinds to
-`movi_start` when the target PTS is behind the current cursor and walks
-forward chunk-by-chunk otherwise; chunk bodies are skipped via `Seek`
-so video JPEGs are never allocated on the seek path. Every video frame
-is intra (§4a) so video lands exactly at the requested PTS; audio lands
-at the first chunk whose cumulative §4b decoded-sample-count reaches or
-exceeds the request. Validated against `comedian.amv` by draining to
-EOF, rewinding to frame 500, and confirming the recovered payload
-still starts with `FF D8` (JPEG SOI).
+no `idx1` index (trace §1 quirk #2), so the default implementation
+rewinds to `movi_start` when the target PTS is behind the current cursor
+and walks forward chunk-by-chunk otherwise; chunk bodies are skipped via
+`Seek` so video JPEGs are never allocated on the seek path. Every video
+frame is intra (§4a) so video lands exactly at the requested PTS; audio
+lands at the first chunk whose cumulative §4b decoded-sample-count
+reaches or exceeds the request. Validated against `comedian.amv` by
+draining to EOF, rewinding to frame 500, and confirming the recovered
+payload still starts with `FF D8` (JPEG SOI).
+
+Callers that expect repeated random-access seeks can build an in-memory
+chunk index up-front via `AmvDemuxer::build_chunk_index()`. The build
+walks the `movi` payload once (the same Seek-skip-bodies path the seek
+hot loop uses) and records every chunk's file offset plus the per-stream
+pre-emit PTS into a `Vec<ChunkIndexEntry>`. Once populated, `seek_to`
+short-circuits the disk-walking loop and lands directly on the matching
+entry — no more re-reading every chunk header per seek. The index is
+exposed read-only through `AmvDemuxer::chunk_index()` so external tools
+can iterate the chunk table directly. The build is idempotent and
+preserves the walker's current cursor / PTS counters so it can be
+invoked mid-walk without disturbing in-flight playback.
 
 Frame and sample **decoding** are out of scope — the video stream is declared
 as the `mjpeg` codec id (the actual JPEG payload requires the player's stripped

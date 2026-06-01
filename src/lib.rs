@@ -71,7 +71,7 @@ mod demuxer;
 mod muxer;
 mod parse;
 
-pub use demuxer::{AmvDemuxer, AmvDemuxerError};
+pub use demuxer::{AmvDemuxer, AmvDemuxerError, ChunkIndexEntry};
 pub use muxer::AmvMuxer;
 pub use parse::{
     AmvDuration, AmvHeader, AmvWaveFormat, ChunkHeader, ChunkKind, AMVH_BODY_LEN, AMV_END_TRAILER,

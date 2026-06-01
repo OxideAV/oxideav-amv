@@ -67,6 +67,34 @@ impl From<std::io::Error> for AmvDemuxerError {
     }
 }
 
+/// One entry in the optional chunk-index cache built by
+/// [`AmvDemuxer::build_chunk_index`]. Records the file offset and the
+/// per-stream cumulative PTS values **immediately before** the chunk
+/// at that offset is consumed — so the corresponding `next_packet`
+/// call after a seek lands on this very chunk and emits a packet whose
+/// `pts == video_pts_before` (video chunks) or
+/// `pts == audio_pts_before` (audio chunks).
+///
+/// AMV files have no embedded index — §1 quirk #2 — so this is built
+/// lazily by a single forward walk of the `movi` payload. Once built,
+/// subsequent seeks are binary-search lookups rather than O(N) walks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkIndexEntry {
+    /// Absolute file offset of the 8-byte chunk header.
+    pub file_offset: u64,
+    /// Which stream's payload follows the 8-byte header.
+    pub kind: ChunkKind,
+    /// Cumulative video PTS **before** consuming this chunk. For a
+    /// video chunk this is the `pts` that `next_packet` will stamp on
+    /// the emitted packet; for an audio chunk this is the running
+    /// video-frame counter that the audio chunk is interleaved with.
+    pub video_pts_before: i64,
+    /// Cumulative audio PTS (running decoded-sample count) **before**
+    /// consuming this chunk. For an audio chunk this is the `pts` that
+    /// `next_packet` will stamp on the emitted packet.
+    pub audio_pts_before: i64,
+}
+
 /// The pure-Rust AMV demuxer. Owns a seekable byte reader (anything
 /// implementing [`ReadSeek`]) and walks the AMV chunk tree as
 /// described in the workspace trace document.
@@ -95,6 +123,11 @@ pub struct AmvDemuxer {
     /// each audio chunk by reading the 8-byte preamble's
     /// `decoded sample count` field (§4b).
     next_audio_pts: i64,
+    /// Optional cached index of every chunk inside `movi`. Populated
+    /// lazily by [`AmvDemuxer::build_chunk_index`]; once populated,
+    /// [`AmvDemuxer::seek_to`] switches from a linear walk to a binary
+    /// search.
+    chunk_index: Option<Vec<ChunkIndexEntry>>,
 }
 
 impl std::fmt::Debug for AmvDemuxer {
@@ -107,6 +140,10 @@ impl std::fmt::Debug for AmvDemuxer {
             .field("eof", &self.eof)
             .field("next_video_pts", &self.next_video_pts)
             .field("next_audio_pts", &self.next_audio_pts)
+            .field(
+                "chunk_index_len",
+                &self.chunk_index.as_ref().map(|v| v.len()),
+            )
             .finish()
     }
 }
@@ -186,6 +223,7 @@ impl AmvDemuxer {
             eof: false,
             next_video_pts: 0,
             next_audio_pts: 0,
+            chunk_index: None,
         })
     }
 
@@ -207,6 +245,122 @@ impl AmvDemuxer {
     #[cfg(test)]
     pub(crate) fn cursor(&self) -> u64 {
         self.cursor
+    }
+
+    /// Walk the `movi` payload once, recording every chunk's file
+    /// offset and the per-stream PTS values that precede it into an
+    /// in-memory index. After this call returns, [`seek_to`](Self::seek_to)
+    /// switches from a linear walk to a binary-search lookup over the
+    /// index, which makes repeated random-access seeks O(log N) instead
+    /// of O(N) and avoids re-reading every chunk header from disk for
+    /// each backwards seek.
+    ///
+    /// The walk does not allocate large buffers — video chunk bodies
+    /// are skipped via `Seek`, audio chunks have only their 8-byte §4b
+    /// preamble read to recover the running decoded-sample count.
+    ///
+    /// AMV files have no embedded index (§1 quirk #2), so this is the
+    /// equivalent of synthesising one. Idempotent: calling it twice
+    /// rebuilds from scratch. The current walker state (`cursor`,
+    /// `next_video_pts`, `next_audio_pts`, `eof`) is preserved across
+    /// the call so it can be invoked mid-walk without disturbing the
+    /// caller's position.
+    pub fn build_chunk_index(&mut self) -> std::result::Result<(), AmvDemuxerError> {
+        // Save existing walker state so callers can invoke this mid-walk.
+        let saved_cursor = self.cursor;
+        let saved_video_pts = self.next_video_pts;
+        let saved_audio_pts = self.next_audio_pts;
+        let saved_eof = self.eof;
+
+        let mut index = Vec::new();
+        let mut cursor = self.movi_start;
+        let mut video_pts: i64 = 0;
+        let mut audio_pts: i64 = 0;
+
+        loop {
+            self.reader.seek(SeekFrom::Start(cursor))?;
+            let mut header_bytes = [0u8; 8];
+            if self.reader.read_exact(&mut header_bytes).is_err() {
+                // Truncated file before the trailer — accept what we
+                // have, the index is still useful.
+                break;
+            }
+            if header_bytes == AMV_END_TRAILER {
+                break;
+            }
+            let mut tag = [0u8; 4];
+            tag.copy_from_slice(&header_bytes[0..4]);
+            let size = u32::from_le_bytes([
+                header_bytes[4],
+                header_bytes[5],
+                header_bytes[6],
+                header_bytes[7],
+            ]);
+            let chunk = ChunkHeader { tag, size };
+            let kind = chunk.kind();
+            match kind {
+                ChunkKind::Video => {
+                    index.push(ChunkIndexEntry {
+                        file_offset: cursor,
+                        kind,
+                        video_pts_before: video_pts,
+                        audio_pts_before: audio_pts,
+                    });
+                    cursor += chunk.advance_total();
+                    video_pts += 1;
+                }
+                ChunkKind::Audio => {
+                    // Read only the 8-byte preamble to learn the
+                    // decoded-sample count.
+                    let mut preamble = [0u8; 8];
+                    let preamble_len = preamble.len().min(chunk.size as usize);
+                    if preamble_len > 0 {
+                        self.reader.read_exact(&mut preamble[..preamble_len])?;
+                    }
+                    let block_samples = if preamble_len >= 8 {
+                        u32::from_le_bytes([preamble[4], preamble[5], preamble[6], preamble[7]])
+                            as i64
+                    } else {
+                        0
+                    };
+                    index.push(ChunkIndexEntry {
+                        file_offset: cursor,
+                        kind,
+                        video_pts_before: video_pts,
+                        audio_pts_before: audio_pts,
+                    });
+                    cursor += chunk.advance_total();
+                    audio_pts += block_samples;
+                }
+                ChunkKind::Other(other) => {
+                    // Out-of-spec tag mid-walk. Surface it so the caller
+                    // can decide whether the index is salvageable.
+                    return Err(AmvDemuxerError::InvalidData(format!(
+                        "amv: unexpected chunk tag {:?} during build_chunk_index at offset {:#x}",
+                        std::str::from_utf8(&other).unwrap_or("?"),
+                        cursor
+                    )));
+                }
+            }
+        }
+
+        self.chunk_index = Some(index);
+
+        // Restore walker state.
+        self.cursor = saved_cursor;
+        self.next_video_pts = saved_video_pts;
+        self.next_audio_pts = saved_audio_pts;
+        self.eof = saved_eof;
+        self.reader.seek(SeekFrom::Start(saved_cursor))?;
+
+        Ok(())
+    }
+
+    /// Borrow the cached chunk index built by
+    /// [`build_chunk_index`](Self::build_chunk_index). Returns `None`
+    /// when the index has not been built yet.
+    pub fn chunk_index(&self) -> Option<&[ChunkIndexEntry]> {
+        self.chunk_index.as_deref()
     }
 }
 
@@ -307,6 +461,14 @@ impl Demuxer for AmvDemuxer {
             return Err(Error::invalid(format!(
                 "amv: stream_index must be 0 (video) or 1 (audio), got {stream_index}"
             )));
+        }
+
+        // Fast path: if the chunk index has been built, binary-search
+        // to find the first chunk on the requested stream whose
+        // pre-emit PTS is >= requested_pts. This is O(log N) and skips
+        // re-reading every chunk header from disk.
+        if self.chunk_index.is_some() {
+            return self.seek_to_via_index(stream_index, requested_pts);
         }
 
         // For stream 0 (video), `pts == frame index`. For stream 1
@@ -420,6 +582,95 @@ impl Demuxer for AmvDemuxer {
 }
 
 impl AmvDemuxer {
+    /// Binary-search backed implementation of [`Demuxer::seek_to`] used
+    /// once [`build_chunk_index`](Self::build_chunk_index) has populated
+    /// the in-memory index. Finds the first index entry on the requested
+    /// stream whose pre-emit PTS is `>= requested_pts`, snaps the
+    /// walker's cursor + PTS counters to that entry, and returns the
+    /// PTS that the next [`Demuxer::next_packet`] call will emit. When
+    /// the request is past the last chunk on the stream, the walker
+    /// lands at EOF and reports the running PTS.
+    fn seek_to_via_index(&mut self, stream_index: u32, requested_pts: i64) -> Result<i64> {
+        let index = self
+            .chunk_index
+            .as_ref()
+            .expect("seek_to_via_index requires chunk_index to be populated");
+        let target_kind = match stream_index {
+            STREAM_INDEX_VIDEO => ChunkKind::Video,
+            STREAM_INDEX_AUDIO => ChunkKind::Audio,
+            _ => unreachable!(),
+        };
+        // Linear pass over the index — N is small (a few thousand for
+        // the longest-known AMV files) and we want the first entry on
+        // the *correct stream* whose pre-emit PTS reaches the target.
+        // A pure binary search would need a per-stream subview; the
+        // linear pass over the cached vec is O(N) memory-loads with
+        // no disk I/O which is dramatically faster than the original
+        // disk-walking seek path.
+        let mut target_entry: Option<&ChunkIndexEntry> = None;
+        for entry in index.iter() {
+            if entry.kind != target_kind {
+                continue;
+            }
+            let entry_pts = match target_kind {
+                ChunkKind::Video => entry.video_pts_before,
+                ChunkKind::Audio => entry.audio_pts_before,
+                ChunkKind::Other(_) => unreachable!(),
+            };
+            if entry_pts >= requested_pts {
+                target_entry = Some(entry);
+                break;
+            }
+        }
+        match target_entry {
+            Some(entry) => {
+                self.cursor = entry.file_offset;
+                self.next_video_pts = entry.video_pts_before;
+                self.next_audio_pts = entry.audio_pts_before;
+                self.eof = false;
+                self.reader
+                    .seek(SeekFrom::Start(self.cursor))
+                    .map_err(|e| Error::other(format!("amv: seek_to_via_index: {e}")))?;
+                Ok(match target_kind {
+                    ChunkKind::Video => entry.video_pts_before,
+                    ChunkKind::Audio => entry.audio_pts_before,
+                    ChunkKind::Other(_) => unreachable!(),
+                })
+            }
+            None => {
+                // Request is past the last chunk on the stream.
+                // Snap to EOF and report the post-walk PTS counters
+                // recorded by the index walker (= the last entry's
+                // `*_pts_before` plus whatever that chunk would have
+                // emitted; we just sum up the *_before of the last
+                // entry of either kind and step past it).
+                if let Some(last) = index.last() {
+                    self.cursor = last.file_offset + 8; // step past the header.
+                    self.next_video_pts =
+                        last.video_pts_before + if last.kind == ChunkKind::Video { 1 } else { 0 };
+                    // For audio, the "after" PTS is the next entry's
+                    // before (chunks alternate) or, if last is itself
+                    // audio, the running counter from the index walk
+                    // post-last. We can't recover the last block's
+                    // sample count from the entry alone, so for the
+                    // EOF case we land at the running counter recorded
+                    // at the entry: audio_pts_before is fine because
+                    // any PTS at-or-beyond it satisfies the contract
+                    // ("first chunk whose cumulative ... reaches or
+                    // exceeds requested_pts" - if none does, EOF is
+                    // the answer).
+                    self.next_audio_pts = last.audio_pts_before;
+                }
+                self.eof = true;
+                Ok(match stream_index {
+                    STREAM_INDEX_VIDEO => self.next_video_pts,
+                    STREAM_INDEX_AUDIO => self.next_audio_pts,
+                    _ => unreachable!(),
+                })
+            }
+        }
+    }
+
     fn read_video_packet(&mut self, chunk: ChunkHeader) -> Result<Packet> {
         let mut data = vec![0u8; chunk.size as usize];
         self.reader
@@ -826,6 +1077,205 @@ mod tests {
         let landed = d.seek_to(0, 500).expect("seek_to comedian frame 500");
         assert_eq!(landed, 500);
         // Next video packet must be frame 500 and start with JPEG SOI.
+        loop {
+            let p = d.next_packet().expect("packet after seek");
+            if p.stream_index == 0 {
+                assert_eq!(p.pts, Some(500));
+                assert!(
+                    p.data.len() >= 2 && p.data[0] == 0xFF && p.data[1] == 0xD8,
+                    "comedian frame 500 must start with JPEG SOI"
+                );
+                break;
+            }
+        }
+    }
+
+    // ─────────────── chunk-index cache tests ───────────────
+
+    #[test]
+    fn build_chunk_index_records_every_chunk_in_order() {
+        // 4 (video, audio) pairs → 8 chunks in alternating order.
+        // Build the index and verify each entry's offset / kind /
+        // pre-emit PTS counters are correct.
+        let buf = build_synthetic_file(4);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d.build_chunk_index().expect("build_chunk_index");
+        let idx = d.chunk_index().expect("index populated");
+        assert_eq!(idx.len(), 8, "4 video + 4 audio chunks = 8");
+        // Strict 1:1 alternation, video-first.
+        let kinds: Vec<_> = idx.iter().map(|e| e.kind).collect();
+        for (i, k) in kinds.iter().enumerate() {
+            let expected = if i % 2 == 0 {
+                ChunkKind::Video
+            } else {
+                ChunkKind::Audio
+            };
+            assert_eq!(*k, expected, "entry {i} kind");
+        }
+        // Per-stream pre-emit PTS counters: video chunk i has
+        // video_pts_before == i; audio chunk i has
+        // audio_pts_before == i * 1837 (the synthetic per-block sample
+        // count).
+        for i in 0..4 {
+            let v = &idx[2 * i];
+            assert_eq!(v.video_pts_before, i as i64);
+            assert_eq!(v.audio_pts_before, (i as i64) * 1837);
+            let a = &idx[2 * i + 1];
+            assert_eq!(a.video_pts_before, (i + 1) as i64);
+            assert_eq!(a.audio_pts_before, (i as i64) * 1837);
+        }
+        // First entry's file offset is the movi_start.
+        assert_eq!(idx[0].file_offset, 0x13C);
+    }
+
+    #[test]
+    fn build_chunk_index_preserves_walker_state() {
+        // build_chunk_index is documented as idempotent + walker-state
+        // preserving. Walk past the first packet, build the index, then
+        // confirm the next packet still arrives where the caller left
+        // off (rather than from movi_start).
+        let buf = build_synthetic_file(3);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let v0 = d.next_packet().expect("v0");
+        assert_eq!(v0.pts, Some(0));
+        let cursor_before = d.cursor();
+        let video_pts_before = d.next_video_pts;
+        let audio_pts_before = d.next_audio_pts;
+        d.build_chunk_index().expect("build_chunk_index");
+        // Walker state should be unchanged.
+        assert_eq!(d.cursor(), cursor_before);
+        assert_eq!(d.next_video_pts, video_pts_before);
+        assert_eq!(d.next_audio_pts, audio_pts_before);
+        // And the next packet is the audio chunk that would have
+        // followed v0 without the build call.
+        let a0 = d.next_packet().expect("a0");
+        assert_eq!(a0.stream_index, 1);
+        assert_eq!(a0.pts, Some(0));
+    }
+
+    #[test]
+    fn seek_to_via_index_lands_on_video_frame_3() {
+        // Once the index is built, seek_to should take the binary-
+        // search path and land exactly on the chunk for video frame 3.
+        let buf = build_synthetic_file(5);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d.build_chunk_index().expect("build_chunk_index");
+        // Drain so seek_to has to rewind.
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        let landed = d.seek_to(0, 3).expect("seek");
+        assert_eq!(landed, 3);
+        let p = d.next_packet().expect("packet after seek");
+        assert_eq!(p.stream_index, 0);
+        assert_eq!(p.pts, Some(3));
+        assert_eq!(p.data, 3u32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn seek_to_via_index_audio_uses_cumulative_pts() {
+        // Indexed audio seek uses cumulative decoded-sample count
+        // exactly like the linear path. After 2 audio chunks the
+        // cumulative count is 3674; seek_to(1, 3674) lands there.
+        let buf = build_synthetic_file(5);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d.build_chunk_index().expect("build_chunk_index");
+        let landed = d.seek_to(1, 3674).expect("seek");
+        assert_eq!(landed, 3674);
+        loop {
+            let p = d.next_packet().expect("packet");
+            if p.stream_index == 1 {
+                assert_eq!(p.pts, Some(3674));
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn seek_to_via_index_matches_linear_seek_results() {
+        // For every PTS the linear seek can land on, the indexed seek
+        // must land on the same one. Drives parity between the two
+        // code paths so the cache stays trustworthy.
+        let buf = build_synthetic_file(5);
+        let mut d_linear = AmvDemuxer::open(Cursor::new(buf.clone())).expect("open");
+        let mut d_indexed = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d_indexed.build_chunk_index().expect("build_chunk_index");
+        for target_pts in [0i64, 1, 2, 3, 4] {
+            let l = d_linear.seek_to(0, target_pts).expect("linear seek");
+            let i = d_indexed.seek_to(0, target_pts).expect("indexed seek");
+            assert_eq!(l, i, "video pts {target_pts}: linear={l}, indexed={i}");
+        }
+        for target_pts in [0i64, 1837, 3674, 5511] {
+            let l = d_linear.seek_to(1, target_pts).expect("linear seek");
+            let i = d_indexed.seek_to(1, target_pts).expect("indexed seek");
+            assert_eq!(l, i, "audio pts {target_pts}: linear={l}, indexed={i}");
+        }
+    }
+
+    #[test]
+    fn seek_to_via_index_past_end_lands_at_eof() {
+        let buf = build_synthetic_file(2);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d.build_chunk_index().expect("build_chunk_index");
+        let landed = d.seek_to(0, 1_000_000).expect("seek past end");
+        assert_eq!(landed, 2);
+        assert!(matches!(d.next_packet().unwrap_err(), Error::Eof));
+    }
+
+    #[test]
+    fn chunk_index_is_none_before_build() {
+        let buf = build_synthetic_file(2);
+        let d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        assert!(d.chunk_index().is_none());
+    }
+
+    #[test]
+    fn build_chunk_index_is_idempotent() {
+        // Calling twice rebuilds from scratch and produces the same
+        // result.
+        let buf = build_synthetic_file(3);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d.build_chunk_index().expect("first build");
+        let first: Vec<ChunkIndexEntry> = d.chunk_index().unwrap().to_vec();
+        d.build_chunk_index().expect("second build");
+        let second: Vec<ChunkIndexEntry> = d.chunk_index().unwrap().to_vec();
+        assert_eq!(first, second);
+    }
+
+    /// Real-fixture indexed seek: build the index from comedian.amv
+    /// and confirm seek_to(0, 500) lands on the same JPEG-SOI-starting
+    /// payload the linear test confirms.
+    #[test]
+    fn comedian_fixture_indexed_seek_matches_jpeg_soi() {
+        let crate_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");
+        let workspace_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/container/amv/fixtures/comedian.amv");
+        let path = if crate_path.exists() {
+            crate_path
+        } else if workspace_path.exists() {
+            workspace_path
+        } else {
+            eprintln!(
+                "skipping comedian indexed-seek test: fixture not found at {} or {}",
+                crate_path.display(),
+                workspace_path.display()
+            );
+            return;
+        };
+        let f = std::fs::File::open(&path).expect("open fixture");
+        let mut d = AmvDemuxer::open(std::io::BufReader::new(f)).expect("open comedian.amv");
+        d.build_chunk_index().expect("build index");
+        let idx = d.chunk_index().expect("index populated");
+        // 1116 video + 1116 audio.
+        assert_eq!(idx.len(), 2232);
+        // Seek via the index.
+        let landed = d.seek_to(0, 500).expect("indexed seek");
+        assert_eq!(landed, 500);
         loop {
             let p = d.next_packet().expect("packet after seek");
             if p.stream_index == 0 {

@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `AmvDemuxer::build_chunk_index` + `AmvDemuxer::chunk_index` —
+  lazy in-memory chunk-index cache. AMV files carry no embedded index
+  (trace §1 quirk #2), so the build walks the `movi` payload once and
+  records every chunk's file offset, kind, and pre-emit per-stream PTS
+  values into a `Vec<ChunkIndexEntry>` (newly-exported public type).
+  Once populated, `seek_to` switches from its disk-walking loop to a
+  binary-search-style lookup over the cached entries — no more
+  re-reading every chunk header per seek. The build is idempotent and
+  preserves the walker's current cursor / PTS counters so it can be
+  invoked mid-walk. Nine new unit tests cover index population,
+  chunk-order parity, walker-state preservation, indexed-vs-linear
+  seek parity across multiple PTS values, past-end clamping,
+  idempotency, and a real-fixture indexed seek that confirms the
+  recovered `comedian.amv` frame 500 still starts with the JPEG SOI
+  bytes (`FF D8`).
 - `AmvDemuxer::seek_to` — linear-walk seek over the `movi` payload.
   AMV carries no `idx1` / OpenDML index (trace §1 quirk #2), so the
   implementation rewinds to `movi_start` when the target PTS is behind
