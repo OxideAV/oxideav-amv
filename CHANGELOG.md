@@ -8,6 +8,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `AmvDemuxer::seek_to` — linear-walk seek over the `movi` payload.
+  AMV carries no `idx1` / OpenDML index (trace §1 quirk #2), so the
+  implementation rewinds to `movi_start` when the target PTS is behind
+  the current cursor and walks forward otherwise. Chunk bodies are
+  skipped via `Seek` so video JPEGs are never allocated on the seek
+  path; the 8-byte §4b audio preamble is read inline to keep the
+  running decoded-sample-count up to date. Every video chunk is intra
+  (§4a) so the stream-0 landing is exact; stream-1 lands at the first
+  chunk whose cumulative sample count reaches or exceeds the request.
+  Six unit tests cover backwards-rewind, forward-walk, audio
+  cumulative-PTS, past-end clamping, PTS-zero rewind, and argument
+  validation; one real-fixture test (`comedian_fixture_seek_to_video_frame_500`)
+  drains to EOF, rewinds to video frame 500, and confirms the recovered
+  payload still starts with `FF D8` (JPEG SOI per §4a).
 - `AmvMuxer` — byte-faithful inverse of `AmvDemuxer`. Writes a complete
   AMV container from a `[video, audio]` `StreamInfo` pair: the §1 zeroed
   RIFF / LIST sizes, the populated §2 `amvh` body (packed-byte duration

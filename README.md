@@ -33,6 +33,17 @@ no-byte-padding chunk walk, and the §4c `AMV_END_` ASCII trailer. The
 test suite includes a mux → demux round-trip that recovers byte-identical
 payloads and the expected `1:33` duration when fed 1116 frames at 12 fps.
 
+Seeking is supported via `Demuxer::seek_to(stream_index, pts)`. AMV has
+no `idx1` index (trace §1 quirk #2), so the implementation rewinds to
+`movi_start` when the target PTS is behind the current cursor and walks
+forward chunk-by-chunk otherwise; chunk bodies are skipped via `Seek`
+so video JPEGs are never allocated on the seek path. Every video frame
+is intra (§4a) so video lands exactly at the requested PTS; audio lands
+at the first chunk whose cumulative §4b decoded-sample-count reaches or
+exceeds the request. Validated against `comedian.amv` by draining to
+EOF, rewinding to frame 500, and confirming the recovered payload
+still starts with `FF D8` (JPEG SOI).
+
 Frame and sample **decoding** are out of scope — the video stream is declared
 as the `mjpeg` codec id (the actual JPEG payload requires the player's stripped
 quant / Huffman tables to be spliced back in, which a downstream codec

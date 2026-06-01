@@ -75,6 +75,12 @@ pub struct AmvDemuxer {
     streams: [StreamInfo; 2],
     header: AmvHeader,
     audio_format: AmvWaveFormat,
+    /// File offset of the first leaf chunk inside `movi` — the byte
+    /// **after** the `movi` FOURCC. Recorded so `seek_to` can rewind
+    /// to the start of the payload when the target PTS is behind the
+    /// current cursor (AMV carries no index — §1 quirk #2 — so a
+    /// backwards seek is a linear walk from `movi_start`).
+    movi_start: u64,
     /// Cursor pointing at the **next chunk header** inside the `movi`
     /// payload. Advances by `8 + size` after every packet.
     cursor: u64,
@@ -96,6 +102,7 @@ impl std::fmt::Debug for AmvDemuxer {
         f.debug_struct("AmvDemuxer")
             .field("header", &self.header)
             .field("audio_format", &self.audio_format)
+            .field("movi_start", &self.movi_start)
             .field("cursor", &self.cursor)
             .field("eof", &self.eof)
             .field("next_video_pts", &self.next_video_pts)
@@ -174,6 +181,7 @@ impl AmvDemuxer {
             streams: [video_stream, audio_stream],
             header,
             audio_format,
+            movi_start,
             cursor: movi_start,
             eof: false,
             next_video_pts: 0,
@@ -266,6 +274,148 @@ impl Demuxer for AmvDemuxer {
 
     fn duration_micros(&self) -> Option<i64> {
         Some(self.header.duration_micros())
+    }
+
+    /// Seek to (or before) the requested presentation timestamp on the
+    /// given stream.
+    ///
+    /// AMV carries no index — §1 quirk #2 ("there is no `idx1` index and
+    /// no OpenDML `indx`/`ix##` meta-index") — so this is a **linear
+    /// walk** over the `movi` payload. Header bytes are read but chunk
+    /// bodies are skipped via [`Seek`] so the seek does not allocate
+    /// large buffers for the JPEG video payloads on the way past.
+    ///
+    /// Every video chunk is a keyframe (`§4a` "intra-only"), so the
+    /// stream-0 seek lands exactly at the chunk whose
+    /// `pts == requested_pts` (or the last chunk if the request is
+    /// beyond the end). The audio stream's PTS counter is the running
+    /// decoded-sample count from §4b preambles, so a stream-1 seek
+    /// lands at the chunk whose cumulative sample count first reaches
+    /// or exceeds `requested_pts`.
+    ///
+    /// On success, the returned value is the PTS of the chunk the
+    /// next [`next_packet`](Self::next_packet) call will emit on the
+    /// requested stream. Returns [`Error::invalid`] when
+    /// `requested_pts` is negative or `stream_index` is out of range.
+    fn seek_to(&mut self, stream_index: u32, requested_pts: i64) -> Result<i64> {
+        if requested_pts < 0 {
+            return Err(Error::invalid(format!(
+                "amv: requested_pts must be non-negative, got {requested_pts}"
+            )));
+        }
+        if stream_index != STREAM_INDEX_VIDEO && stream_index != STREAM_INDEX_AUDIO {
+            return Err(Error::invalid(format!(
+                "amv: stream_index must be 0 (video) or 1 (audio), got {stream_index}"
+            )));
+        }
+
+        // For stream 0 (video), `pts == frame index`. For stream 1
+        // (audio), `pts == cumulative decoded-sample count`. A request
+        // at or before the current running PTS rewinds to the start of
+        // `movi` and walks forward; a request ahead of the current PTS
+        // walks forward from the existing cursor.
+        let current_pts = match stream_index {
+            STREAM_INDEX_VIDEO => self.next_video_pts,
+            STREAM_INDEX_AUDIO => self.next_audio_pts,
+            _ => unreachable!(),
+        };
+        if requested_pts < current_pts {
+            self.cursor = self.movi_start;
+            self.eof = false;
+            self.next_video_pts = 0;
+            self.next_audio_pts = 0;
+        }
+
+        // Linear walk: read 8-byte chunk headers, advance past bodies
+        // via Seek, track per-stream PTS, stop just before a chunk on
+        // the requested stream whose next emitted PTS would equal or
+        // exceed `requested_pts`. The chunk header peeked at this stop
+        // point is not consumed — `next_packet` re-reads it via the
+        // same `self.cursor` seek path.
+        loop {
+            self.reader
+                .seek(SeekFrom::Start(self.cursor))
+                .map_err(|e| Error::other(format!("amv: seek_to chunk header: {e}")))?;
+            let mut header_bytes = [0u8; 8];
+            if self.reader.read_exact(&mut header_bytes).is_err() {
+                // Truncated file before we found the target — land on
+                // EOF.
+                self.eof = true;
+                return Ok(match stream_index {
+                    STREAM_INDEX_VIDEO => self.next_video_pts,
+                    STREAM_INDEX_AUDIO => self.next_audio_pts,
+                    _ => unreachable!(),
+                });
+            }
+            if header_bytes == AMV_END_TRAILER {
+                self.eof = true;
+                return Ok(match stream_index {
+                    STREAM_INDEX_VIDEO => self.next_video_pts,
+                    STREAM_INDEX_AUDIO => self.next_audio_pts,
+                    _ => unreachable!(),
+                });
+            }
+            let mut tag = [0u8; 4];
+            tag.copy_from_slice(&header_bytes[0..4]);
+            let size = u32::from_le_bytes([
+                header_bytes[4],
+                header_bytes[5],
+                header_bytes[6],
+                header_bytes[7],
+            ]);
+            let chunk = ChunkHeader { tag, size };
+            match chunk.kind() {
+                ChunkKind::Video => {
+                    if stream_index == STREAM_INDEX_VIDEO && self.next_video_pts >= requested_pts {
+                        // Cursor still points at this chunk header —
+                        // `next_packet` will emit it on the next call.
+                        return Ok(self.next_video_pts);
+                    }
+                    // Skip the body — exactly `size` bytes, no padding
+                    // (§4 no-padding rule).
+                    self.cursor += chunk.advance_total();
+                    self.next_video_pts += 1;
+                }
+                ChunkKind::Audio => {
+                    // Read only the 8-byte §4b preamble to update the
+                    // cumulative sample count; skip the rest of the
+                    // body via Seek so we don't pull MB-sized audio
+                    // bodies (none exist in AMV, but the principle
+                    // holds for the seek hot path).
+                    let mut preamble = [0u8; 8];
+                    let preamble_len = preamble.len().min(chunk.size as usize);
+                    if preamble_len > 0 {
+                        self.reader
+                            .read_exact(&mut preamble[..preamble_len])
+                            .map_err(|e| {
+                                Error::other(format!("amv: seek_to audio preamble short read: {e}"))
+                            })?;
+                    }
+                    let block_samples = if preamble_len >= 8 {
+                        u32::from_le_bytes([preamble[4], preamble[5], preamble[6], preamble[7]])
+                            as i64
+                    } else {
+                        0
+                    };
+                    if stream_index == STREAM_INDEX_AUDIO && self.next_audio_pts >= requested_pts {
+                        // We've already nibbled at the body; rewind the
+                        // reader to the start of this chunk header so
+                        // `next_packet` re-reads it cleanly. The cursor
+                        // is the source of truth.
+                        return Ok(self.next_audio_pts);
+                    }
+                    self.cursor += chunk.advance_total();
+                    self.next_audio_pts += block_samples;
+                }
+                ChunkKind::Other(other) => {
+                    return Err(Error::invalid(format!(
+                        "amv: unexpected chunk tag {:?} during seek_to at offset {:#x}",
+                        std::str::from_utf8(&other).unwrap_or("?"),
+                        self.cursor
+                    )));
+                }
+            }
+        }
     }
 }
 
@@ -441,6 +591,116 @@ mod tests {
     }
 
     #[test]
+    fn seek_to_video_rewinds_to_start_then_walks_forward() {
+        // Build 5 (video, audio) pairs, then seek_to the video frame
+        // at PTS = 3. Expect: cursor lands on the chunk header for
+        // frame 3, and the next packet emitted on stream 0 carries
+        // pts == 3 and the recorded payload bytes.
+        let buf = build_synthetic_file(5);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        // First, advance past all packets to land at EOF (so
+        // current_pts > requested_pts and seek_to must rewind).
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        let landed = d.seek_to(0, 3).expect("seek_to(0, 3)");
+        assert_eq!(landed, 3);
+        let p = d.next_packet().expect("packet after seek");
+        assert_eq!(p.stream_index, 0);
+        assert_eq!(p.pts, Some(3));
+        assert_eq!(p.data, 3u32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn seek_to_video_forward_does_not_rewind() {
+        // Build 5 pairs, advance through the first video frame, then
+        // seek forward to video PTS = 4. Verify the next stream-0
+        // packet carries pts == 4 — the seek walks forward from the
+        // current cursor without rewinding.
+        let buf = build_synthetic_file(5);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let _v0 = d.next_packet().expect("v0");
+        let _a0 = d.next_packet().expect("a0");
+        let landed = d.seek_to(0, 4).expect("seek forward");
+        assert_eq!(landed, 4);
+        let p = d.next_packet().expect("v4");
+        assert_eq!(p.stream_index, 0);
+        assert_eq!(p.pts, Some(4));
+        assert_eq!(p.data, 4u32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn seek_to_audio_uses_cumulative_sample_count() {
+        // §4b: audio PTS = running decoded-sample count from each
+        // chunk's 8-byte preamble. Synthetic file writes 1837 samples
+        // per chunk, so after 2 audio chunks the running PTS is 3674.
+        // A seek to PTS = 3674 must land on chunk index 2 (0-based).
+        let buf = build_synthetic_file(5);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let landed = d.seek_to(1, 3674).expect("seek_to audio 3674");
+        assert_eq!(landed, 3674);
+        // The next packet on the audio stream should carry pts == 3674
+        // and the audio body. (We may emit video chunks in between
+        // because they share the same `movi` walk.)
+        loop {
+            let p = d.next_packet().expect("packet");
+            if p.stream_index == 1 {
+                assert_eq!(p.pts, Some(3674));
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn seek_to_past_end_lands_at_eof() {
+        // A seek beyond the last frame returns the running PTS and
+        // sets the demuxer to EOF.
+        let buf = build_synthetic_file(2);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let landed = d.seek_to(0, 1_000_000).expect("seek past end");
+        // 2 video frames walked → PTS counter is 2.
+        assert_eq!(landed, 2);
+        assert!(matches!(d.next_packet().unwrap_err(), Error::Eof));
+    }
+
+    #[test]
+    fn seek_to_zero_resets_to_start_of_movi() {
+        // After walking some packets, seek_to(stream, 0) must rewind to
+        // movi_start and the next emitted packet's PTS must be 0.
+        let buf = build_synthetic_file(3);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let _v0 = d.next_packet().expect("v0");
+        let _a0 = d.next_packet().expect("a0");
+        let _v1 = d.next_packet().expect("v1");
+        let landed = d.seek_to(0, 0).expect("seek to 0");
+        assert_eq!(landed, 0);
+        let v = d.next_packet().expect("v0 after seek");
+        assert_eq!(v.stream_index, 0);
+        assert_eq!(v.pts, Some(0));
+        assert_eq!(v.data, 0u32.to_le_bytes().to_vec());
+    }
+
+    #[test]
+    fn seek_to_rejects_invalid_stream_or_negative_pts() {
+        let buf = build_synthetic_file(2);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        // Negative PTS.
+        assert!(matches!(
+            d.seek_to(0, -1).unwrap_err(),
+            Error::InvalidData(_)
+        ));
+        // Out-of-range stream index.
+        assert!(matches!(
+            d.seek_to(99, 0).unwrap_err(),
+            Error::InvalidData(_)
+        ));
+    }
+
+    #[test]
     fn open_rejects_truncated_prelude() {
         let buf = vec![0u8; 16];
         let err = AmvDemuxer::open(Cursor::new(buf)).unwrap_err();
@@ -527,5 +787,55 @@ mod tests {
         // §4 worked example: first video chunk is 1633 bytes (size
         // 0x661).
         assert_eq!(first_video_size, Some(1633));
+    }
+
+    /// Real-fixture seek_to test: walk to EOF, then seek back to video
+    /// frame 500 on `comedian.amv`. Verify the next video packet has
+    /// `pts == 500` and the payload still starts with the JPEG SOI
+    /// marker (`FF D8`) — the trace doc §4a records every video chunk
+    /// as a self-contained `FF D8 … FF D9` JPEG.
+    #[test]
+    fn comedian_fixture_seek_to_video_frame_500() {
+        let crate_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");
+        let workspace_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/container/amv/fixtures/comedian.amv");
+        let path = if crate_path.exists() {
+            crate_path
+        } else if workspace_path.exists() {
+            workspace_path
+        } else {
+            eprintln!(
+                "skipping comedian seek_to test: fixture not found at {} or {}",
+                crate_path.display(),
+                workspace_path.display()
+            );
+            return;
+        };
+        let f = std::fs::File::open(&path).expect("open fixture");
+        let mut d = AmvDemuxer::open(std::io::BufReader::new(f)).expect("open comedian.amv");
+        // Drain forward first so seek_to has to rewind.
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        // Seek back to video frame 500.
+        let landed = d.seek_to(0, 500).expect("seek_to comedian frame 500");
+        assert_eq!(landed, 500);
+        // Next video packet must be frame 500 and start with JPEG SOI.
+        loop {
+            let p = d.next_packet().expect("packet after seek");
+            if p.stream_index == 0 {
+                assert_eq!(p.pts, Some(500));
+                assert!(
+                    p.data.len() >= 2 && p.data[0] == 0xFF && p.data[1] == 0xD8,
+                    "comedian frame 500 must start with JPEG SOI"
+                );
+                break;
+            }
+        }
     }
 }
