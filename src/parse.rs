@@ -231,6 +231,35 @@ impl AmvDuration {
             hours: bytes[2],
         }
     }
+
+    /// Inverse of [`Self::from_packed`]: pack the
+    /// `[seconds, minutes, hours, 0]` byte layout back into the raw
+    /// little-endian `u32` written at `amvh +0x34` (§2).
+    ///
+    /// The fourth byte is always written as `0` per the trace doc — the
+    /// two observed device profiles both leave it zero (`21 01 00 00`
+    /// for the 12 fps profile, `02 03 00 00` for the 16 fps profile),
+    /// and the trace records the field as `[seconds, minutes, hours, 0]`.
+    ///
+    /// Useful for tooling that wants to recompute or patch the duration
+    /// field independently of the muxer's `write_trailer` path — for
+    /// example, when re-stamping a recovered truncated file's header
+    /// after the chunk count has been determined.
+    pub fn to_packed(&self) -> u32 {
+        u32::from_le_bytes([self.seconds, self.minutes, self.hours, 0])
+    }
+
+    /// Total duration expressed in whole seconds. Saturates at
+    /// [`u32::MAX`] to keep the conversion infallible — the field is
+    /// 8-bit-per-component so the maximum representable duration is
+    /// `255 h 255 min 255 s = 933 555 s`, which fits comfortably.
+    ///
+    /// Provided as a convenience for tooling that wants the same
+    /// derivation [`AmvHeader::duration_micros`] performs without going
+    /// through the µs detour.
+    pub fn total_seconds(&self) -> u32 {
+        self.hours as u32 * 3600 + self.minutes as u32 * 60 + self.seconds as u32
+    }
 }
 
 /// Decoded view of the audio `WAVEFORMATEX` (§3b). All multi-byte
@@ -420,6 +449,137 @@ impl ChunkHeader {
     pub fn kind(&self) -> ChunkKind {
         ChunkKind::classify(self.tag)
     }
+}
+
+/// JPEG Start-of-Image marker — the two bytes every `00dc` video chunk
+/// payload begins with (§4a "self-contained JPEG bracketed by SOI…EOI").
+pub const JPEG_SOI: [u8; 2] = [0xFF, 0xD8];
+
+/// JPEG End-of-Image marker — the two bytes every `00dc` video chunk
+/// payload ends with (§4a). The trace records both observed device
+/// profiles' first frames hold SOI at offset 0 and EOI at `size - 2`.
+pub const JPEG_EOI: [u8; 2] = [0xFF, 0xD9];
+
+/// Minimum size of an `01wb` audio chunk payload — the 8-byte §4b
+/// preamble alone, with no compressed body. Real chunks are always
+/// larger (the comedian profile's blocks are 927 bytes) but this
+/// minimum is the smallest payload that satisfies the §4b structural
+/// invariant.
+pub const AMV_AUDIO_PREAMBLE_LEN: usize = 8;
+
+/// Decoded view of the 8-byte preamble that prefixes every `01wb`
+/// audio chunk payload (§4b). Both fields are little-endian `u32`s.
+///
+/// The trace doc records two observations about this preamble in the
+/// `comedian.amv` fixture's first audio block:
+///
+/// * `state == 0` in the very first block (consistent with "presumably
+///   the initial predictor / step index in the first dword"); later
+///   blocks carry non-zero state and the trace records no further
+///   constants beyond "the per-block state" so the byte parser surfaces
+///   the value verbatim.
+/// * `decoded_sample_count` matches `nSamplesPerSec ÷ fps` per block
+///   (`22_050 ÷ 12 ≈ 1837` mono samples in the comedian first block).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AmvAudioPreamble {
+    /// First u32 at preamble +0x00. Per-block state — initial predictor
+    /// / step index for the nibble decoder. Surfaced verbatim because
+    /// the trace records only one observation (the first block's `0`)
+    /// and explicitly notes the field's content varies block-to-block.
+    pub state: u32,
+    /// Second u32 at preamble +0x04. Number of decoded mono samples the
+    /// following compressed body unpacks into. Drives the per-packet
+    /// `pts` / `duration` accounting in the demuxer.
+    pub decoded_sample_count: u32,
+}
+
+impl AmvAudioPreamble {
+    /// Parse the 8-byte preamble from the start of an `01wb` payload.
+    /// Returns [`AmvDemuxerError::InvalidData`] if the slice is shorter
+    /// than [`AMV_AUDIO_PREAMBLE_LEN`].
+    pub fn parse(body: &[u8]) -> Result<Self, AmvDemuxerError> {
+        if body.len() < AMV_AUDIO_PREAMBLE_LEN {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "01wb payload preamble needs {AMV_AUDIO_PREAMBLE_LEN} bytes, got {}",
+                body.len()
+            )));
+        }
+        Ok(Self {
+            state: read_u32_le(body, 0x00),
+            decoded_sample_count: read_u32_le(body, 0x04),
+        })
+    }
+
+    /// Strict sentinel validation of the parsed §4b preamble. Confirms
+    /// the one cross-checkable invariant the trace records:
+    ///
+    /// * `decoded_sample_count > 0` — every observed audio block in the
+    ///   two staged fixtures carries a positive sample count (the
+    ///   comedian first block holds `1837 = 22_050 ÷ 12`). A zero count
+    ///   would imply an empty block, which neither device profile
+    ///   produces.
+    ///
+    /// The `state` field is intentionally **not** validated: the trace
+    /// records only the first-block observation (`0`) and explicitly
+    /// flags the field as per-block varying state, so strict callers
+    /// cannot gate on it.
+    pub fn validate_sentinels(&self) -> Result<(), AmvDemuxerError> {
+        if self.decoded_sample_count == 0 {
+            return Err(AmvDemuxerError::InvalidData(
+                "01wb +0x04 decoded_sample_count must be > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Strict byte-shape validation of a `00dc` video-chunk payload against
+/// the §4a invariants the trace records.
+///
+/// Per §4a every video chunk is a self-contained JPEG bracketed by
+/// `FF D8` (SOI) at offset `0` and `FF D9` (EOI) at offset `size - 2`,
+/// with no internal JPEG marker segments between them — the player
+/// re-injects the stripped quant / Huffman tables before invoking its
+/// hardcoded decoder, so the on-disk bitstream carries only the SOI /
+/// EOI bracket plus entropy-coded data in between.
+///
+/// This helper checks the two byte-position invariants directly:
+///
+/// * `body[0..2] == FF D8` (SOI at chunk start).
+/// * `body[size - 2..size] == FF D9` (EOI at chunk end).
+///
+/// Returns [`AmvDemuxerError::InvalidData`] when either invariant
+/// fails, naming the offending byte position in the message. A
+/// payload shorter than 4 bytes (no room for both markers) is also
+/// rejected.
+///
+/// Useful for tooling that wants to confirm a recovered / extracted
+/// video chunk has the §4a wire shape before handing it to a JPEG
+/// decoder preprocessor. The demuxer's hot path does not invoke this
+/// check (it forwards the raw bytes to downstream codec wiring per the
+/// container's no-decode contract).
+pub fn validate_video_payload_shape(body: &[u8]) -> Result<(), AmvDemuxerError> {
+    if body.len() < 4 {
+        return Err(AmvDemuxerError::InvalidData(format!(
+            "00dc payload must be at least 4 bytes (SOI + EOI), got {}",
+            body.len()
+        )));
+    }
+    if body[0..2] != JPEG_SOI {
+        return Err(AmvDemuxerError::InvalidData(format!(
+            "00dc payload must begin with SOI (FF D8) at offset 0, got {:02X} {:02X}",
+            body[0], body[1]
+        )));
+    }
+    let end = body.len() - 2;
+    if body[end..end + 2] != JPEG_EOI {
+        return Err(AmvDemuxerError::InvalidData(format!(
+            "00dc payload must end with EOI (FF D9) at offset {end}, got {:02X} {:02X}",
+            body[end],
+            body[end + 1]
+        )));
+    }
+    Ok(())
 }
 
 // ────────────────────────── prelude walker ──────────────────────────
@@ -1194,6 +1354,200 @@ pub(crate) mod tests {
         assert_eq!(permissive.header.reserved_30 & 0xFF, 0x99);
         let strict = AmvPrelude::parse_strict(&buf);
         assert!(strict.is_err());
+    }
+
+    /// §2 comedian profile: 0x21 = 33 s, 0x01 = 1 min, 0 hours →
+    /// 0x0000_0121 round-trips through [`AmvDuration::to_packed`].
+    #[test]
+    fn duration_to_packed_round_trips_comedian() {
+        let d = AmvDuration::from_packed(0x0000_0121);
+        assert_eq!(d.to_packed(), 0x0000_0121);
+    }
+
+    /// §2 noel profile: 0x02 = 2 s, 0x03 = 3 min, 0 hours →
+    /// 0x0000_0302 round-trips.
+    #[test]
+    fn duration_to_packed_round_trips_noel() {
+        let d = AmvDuration::from_packed(0x0000_0302);
+        assert_eq!(d.to_packed(), 0x0000_0302);
+    }
+
+    /// `to_packed` always writes the +0x37 reserved byte as 0 per §2.
+    #[test]
+    fn duration_to_packed_writes_reserved_byte_zero() {
+        let d = AmvDuration {
+            seconds: 1,
+            minutes: 2,
+            hours: 3,
+        };
+        let bytes = d.to_packed().to_le_bytes();
+        assert_eq!(bytes[3], 0);
+    }
+
+    /// total_seconds matches the comedian §2 worked example (1:33 = 93 s).
+    #[test]
+    fn duration_total_seconds_matches_comedian() {
+        let d = AmvDuration::from_packed(0x0000_0121);
+        assert_eq!(d.total_seconds(), 60 + 33);
+    }
+
+    /// total_seconds matches the noel §2 worked example (3:02 = 182 s).
+    #[test]
+    fn duration_total_seconds_matches_noel() {
+        let d = AmvDuration::from_packed(0x0000_0302);
+        assert_eq!(d.total_seconds(), 3 * 60 + 2);
+    }
+
+    // ── §4a video payload shape validator ──────────────────────────
+
+    /// §4a: the first video chunk of the comedian fixture (1633 bytes)
+    /// starts with `FF D8` and ends with `FF D9`. Build the same shape
+    /// synthetically and confirm the validator accepts it.
+    #[test]
+    fn video_payload_shape_accepts_soi_eoi_bracket() {
+        let mut body = vec![0u8; 1633];
+        body[0..2].copy_from_slice(&JPEG_SOI);
+        body[1631..1633].copy_from_slice(&JPEG_EOI);
+        validate_video_payload_shape(&body).expect("SOI..EOI bracket accepted");
+    }
+
+    /// §4a minimum payload: 4 bytes = SOI + EOI, no body in between
+    /// (degenerate but byte-shape-valid).
+    #[test]
+    fn video_payload_shape_accepts_minimum_4_byte_payload() {
+        let body = [0xFF, 0xD8, 0xFF, 0xD9];
+        validate_video_payload_shape(&body).expect("4-byte SOI+EOI accepted");
+    }
+
+    /// Payload shorter than 4 bytes cannot carry both markers — reject.
+    #[test]
+    fn video_payload_shape_rejects_three_byte_payload() {
+        let body = [0xFF, 0xD8, 0xFF];
+        let err = validate_video_payload_shape(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("at least 4 bytes")),
+            other => panic!("expected InvalidData(short), got {other:?}"),
+        }
+    }
+
+    /// Wrong start marker (corrupted first byte) rejected with offset 0.
+    #[test]
+    fn video_payload_shape_rejects_wrong_soi() {
+        let mut body = vec![0xAB, 0xCD];
+        body.extend_from_slice(&JPEG_EOI);
+        let err = validate_video_payload_shape(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("SOI"));
+                assert!(msg.contains("offset 0"));
+            }
+            other => panic!("expected InvalidData(SOI), got {other:?}"),
+        }
+    }
+
+    /// Wrong end marker rejected, with the end offset reported.
+    #[test]
+    fn video_payload_shape_rejects_wrong_eoi() {
+        let mut body = vec![0u8; 16];
+        body[0..2].copy_from_slice(&JPEG_SOI);
+        // Leave the last two bytes as 00 00 — should reject.
+        let err = validate_video_payload_shape(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("EOI"));
+                assert!(msg.contains("14"));
+            }
+            other => panic!("expected InvalidData(EOI), got {other:?}"),
+        }
+    }
+
+    // ── §4b audio preamble parser + validator ──────────────────────
+
+    /// §4b comedian first-block observation: state=0, samples=1837.
+    #[test]
+    fn audio_preamble_parse_comedian_first_block() {
+        let mut body = vec![0u8; AMV_AUDIO_PREAMBLE_LEN];
+        body[0..4].copy_from_slice(&0u32.to_le_bytes());
+        body[4..8].copy_from_slice(&1837u32.to_le_bytes());
+        let p = AmvAudioPreamble::parse(&body).unwrap();
+        assert_eq!(p.state, 0);
+        assert_eq!(p.decoded_sample_count, 1837);
+    }
+
+    /// §4b non-zero state — the trace records the state field varies
+    /// block-to-block; the parser surfaces the value verbatim.
+    #[test]
+    fn audio_preamble_parse_surfaces_nonzero_state() {
+        let mut body = vec![0u8; AMV_AUDIO_PREAMBLE_LEN];
+        body[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        body[4..8].copy_from_slice(&1837u32.to_le_bytes());
+        let p = AmvAudioPreamble::parse(&body).unwrap();
+        assert_eq!(p.state, 0xDEAD_BEEF);
+        assert_eq!(p.decoded_sample_count, 1837);
+    }
+
+    /// Slice shorter than 8 bytes cannot carry the preamble.
+    #[test]
+    fn audio_preamble_parse_rejects_short_slice() {
+        let body = vec![0u8; 7];
+        let err = AmvAudioPreamble::parse(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("8 bytes")),
+            other => panic!("expected InvalidData(short), got {other:?}"),
+        }
+    }
+
+    /// `validate_sentinels` accepts the comedian first-block shape.
+    #[test]
+    fn audio_preamble_validate_accepts_comedian_first_block() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        p.validate_sentinels()
+            .expect("comedian first-block preamble accepted");
+    }
+
+    /// `validate_sentinels` accepts the noel first-block shape
+    /// (22 050 ÷ 16 ≈ 1378).
+    #[test]
+    fn audio_preamble_validate_accepts_noel_first_block() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1378,
+        };
+        p.validate_sentinels()
+            .expect("noel first-block preamble accepted");
+    }
+
+    /// `validate_sentinels` rejects a zero decoded sample count — no
+    /// observed device profile emits an empty audio block.
+    #[test]
+    fn audio_preamble_validate_rejects_zero_sample_count() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 0,
+        };
+        let err = p.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("+0x04"));
+                assert!(msg.contains("decoded_sample_count"));
+            }
+            other => panic!("expected InvalidData(samples), got {other:?}"),
+        }
+    }
+
+    /// `validate_sentinels` does NOT gate on the state field (which the
+    /// trace records as per-block-varying). A non-zero state passes.
+    #[test]
+    fn audio_preamble_validate_accepts_arbitrary_state() {
+        let p = AmvAudioPreamble {
+            state: 0xCAFEBABE,
+            decoded_sample_count: 1837,
+        };
+        p.validate_sentinels()
+            .expect("non-zero state must not gate sentinel validation");
     }
 
     /// Helper: assemble a minimal but byte-correct AMV prelude (from

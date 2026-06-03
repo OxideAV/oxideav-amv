@@ -1768,4 +1768,71 @@ mod tests {
         assert_eq!(d.audio_format().bits_per_sample, 16);
         assert_eq!(d.audio_format().cb_size, 0);
     }
+
+    /// Real-fixture cross-check: walk the staged comedian.amv to EOF
+    /// and run the §4a video-payload shape validator on **every** video
+    /// chunk plus the §4b audio-preamble sentinel on every audio chunk.
+    ///
+    /// All 1116 video frames are expected to start with `FF D8` (SOI)
+    /// and end with `FF D9` (EOI) per the trace doc's "self-contained
+    /// JPEG bracketed by SOI..EOI" observation, and all 1116 audio
+    /// blocks are expected to carry a positive `decoded_sample_count`.
+    /// Any failure surfaces the offending chunk index with the validator
+    /// error so a regression points directly at the contaminated chunk.
+    #[test]
+    fn comedian_fixture_all_chunks_pass_payload_shape_sentinels() {
+        use crate::parse::{validate_video_payload_shape, AmvAudioPreamble};
+
+        let crate_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");
+        let workspace_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/container/amv/fixtures/comedian.amv");
+        let path = if crate_path.exists() {
+            crate_path
+        } else if workspace_path.exists() {
+            workspace_path
+        } else {
+            eprintln!("skipping comedian payload-shape sentinel test: fixture not staged");
+            return;
+        };
+        let f = std::fs::File::open(&path).expect("open fixture");
+        let mut d = AmvDemuxer::open(std::io::BufReader::new(f)).expect("open comedian.amv");
+
+        let mut video_chunks_validated = 0u32;
+        let mut audio_chunks_validated = 0u32;
+        loop {
+            match d.next_packet() {
+                Ok(p) if p.stream_index == 0 => {
+                    validate_video_payload_shape(&p.data).unwrap_or_else(|e| {
+                        panic!(
+                            "video chunk #{video_chunks_validated} failed §4a shape check: {e:?}"
+                        )
+                    });
+                    video_chunks_validated += 1;
+                }
+                Ok(p) if p.stream_index == 1 => {
+                    let preamble = AmvAudioPreamble::parse(&p.data).unwrap_or_else(|e| {
+                        panic!("audio chunk #{audio_chunks_validated} preamble parse: {e:?}")
+                    });
+                    preamble.validate_sentinels().unwrap_or_else(|e| {
+                        panic!(
+                            "audio chunk #{audio_chunks_validated} failed §4b sentinel check: {e:?}"
+                        )
+                    });
+                    audio_chunks_validated += 1;
+                }
+                Ok(_) => panic!("unexpected stream index"),
+                Err(Error::Eof) => break,
+                Err(other) => panic!("walk error: {other:?}"),
+            }
+        }
+        assert_eq!(
+            video_chunks_validated, 1116,
+            "expected to validate 1116 video chunks"
+        );
+        assert_eq!(
+            audio_chunks_validated, 1116,
+            "expected to validate 1116 audio chunks"
+        );
+    }
 }

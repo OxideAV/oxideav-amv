@@ -8,6 +8,41 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4a video-payload + §4b audio-preamble byte-shape sentinel validators
+  — new `validate_video_payload_shape` free function plus
+  `AmvAudioPreamble` byte-parser type with its own
+  `validate_sentinels` helper. The video helper confirms the §4a
+  invariants the trace records: the payload begins with `FF D8`
+  (`JPEG_SOI`) at offset 0 and ends with `FF D9` (`JPEG_EOI`) at
+  offset `size − 2`, naming the offending byte position when either
+  invariant fails. The audio helper parses the 8-byte preamble into
+  `(state, decoded_sample_count)` and gates strict validation on
+  `decoded_sample_count > 0` — the one §4b cross-checkable
+  invariant — while surfacing the `state` field verbatim because the
+  trace records that value as per-block-varying and does not pin a
+  constant. Public constants `JPEG_SOI`, `JPEG_EOI`, and
+  `AMV_AUDIO_PREAMBLE_LEN` accompany the helpers so external tooling
+  can reference the same byte tokens. Twelve new tests cover the
+  comedian-shape SOI/EOI bracket, the 4-byte degenerate accept, the
+  short-payload reject, the wrong-SOI / wrong-EOI rejections naming
+  the byte position, the comedian first-block preamble shape, the
+  noel first-block preamble shape, the zero-sample-count reject, and
+  the "state field is not gated" invariant. A real-fixture
+  `comedian_fixture_all_chunks_pass_payload_shape_sentinels` test
+  walks the staged `comedian.amv` end-to-end and asserts every one
+  of the 1116 video chunks passes the §4a SOI/EOI bracket check and
+  every one of the 1116 audio chunks passes the §4b preamble check.
+- `AmvDuration::to_packed` + `AmvDuration::total_seconds` — inverse
+  round-trip helpers on the parsed `amvh +0x34` duration view.
+  `to_packed` re-encodes the `[seconds, minutes, hours, 0]` little-
+  endian layout the trace doc §2 records (the fourth byte is always
+  written as `0` per the two observed device profiles), and
+  `total_seconds` returns the duration as a whole-second `u32`
+  (saturating-safe because the 8-bit-per-component packed layout
+  caps the maximum duration well inside `u32::MAX`). Five new tests
+  cover the comedian `0x0000_0121` and noel `0x0000_0302` round-trips,
+  the always-zero +0x37 byte invariant, and the two `total_seconds`
+  worked examples (1:33 = 93 s; 3:02 = 182 s).
 - §3b audio `WAVEFORMATEX` device-profile sentinel validation — new
   `AmvWaveFormat::validate_sentinels` byte-parser helper plus
   integration into `AmvPrelude::parse_strict` /

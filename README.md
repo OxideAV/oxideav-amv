@@ -90,6 +90,36 @@ entrypoint stays permissive so the existing demuxer-open path still
 accepts any byte-shaped prelude that satisfies the §1-§4 FOURCC
 layout — strictness is opt-in.
 
+Per-chunk payload-shape validation is also available without going
+through the demuxer. `validate_video_payload_shape` confirms a `00dc`
+chunk body satisfies the §4a "self-contained JPEG bracketed by
+SOI..EOI" invariants — `FF D8` at offset 0, `FF D9` at offset
+`size − 2` — and reports the offending byte position when either
+check fails. `AmvAudioPreamble::parse` decodes the 8-byte §4b
+preamble into a `(state, decoded_sample_count)` view, and
+`AmvAudioPreamble::validate_sentinels` gates strict validation on
+`decoded_sample_count > 0` (the one trace-recorded §4b invariant the
+two observed device profiles both satisfy); the `state` field is
+surfaced verbatim because the trace records that field as per-block
+varying state. The companion exports `JPEG_SOI`, `JPEG_EOI`, and
+`AMV_AUDIO_PREAMBLE_LEN` make the same byte tokens available to
+external tooling that wants to reference them directly. The staged
+`comedian.amv` device file's 1116 video chunks all pass the §4a
+bracket check and its 1116 audio chunks all pass the §4b preamble
+check (verified end-to-end by the test suite).
+
+For tooling that wants to recompute the `amvh +0x34` packed-byte
+duration independently of the muxer's `write_trailer` patch path —
+for example, when re-stamping a recovered truncated file's header
+after the chunk count has been determined — `AmvDuration::to_packed`
+is the inverse of `AmvDuration::from_packed` and round-trips the
+`[seconds, minutes, hours, 0]` layout exactly. The fourth byte is
+always written as `0` per the trace doc's two observed device
+profiles. `AmvDuration::total_seconds` returns the same duration as
+a whole-second `u32` for callers that want the trace's worked-example
+arithmetic (comedian 1:33 = 93 s, noel 3:02 = 182 s) without the µs
+detour.
+
 Frame and sample **decoding** are out of scope — the video stream is declared
 as the `mjpeg` codec id (the actual JPEG payload requires the player's stripped
 quant / Huffman tables to be spliced back in, which a downstream codec
@@ -119,9 +149,11 @@ probing and the `.amv` extension hint for the read path, and
 `ContainerRegistry::open_muxer("amv", …)` for the write path.
 
 The crate also exposes its byte-level parsers as a standalone library
-(`AmvHeader`, `AmvDuration`, `AmvWaveFormat`, `ChunkHeader`, `ChunkKind`,
-plus the chunk-tag / trailer constants) for tooling that wants to inspect
-AMV files without the framework dependency at the demuxer level.
+(`AmvHeader`, `AmvDuration`, `AmvWaveFormat`, `AmvAudioPreamble`,
+`ChunkHeader`, `ChunkKind`, plus the chunk-tag / trailer / JPEG-marker
+constants and the `validate_video_payload_shape` free function) for
+tooling that wants to inspect AMV files without the framework
+dependency at the demuxer level.
 
 ## Provenance
 

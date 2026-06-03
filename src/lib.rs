@@ -74,8 +74,9 @@ mod parse;
 pub use demuxer::{AmvDemuxer, AmvDemuxerError, ChunkIndexEntry};
 pub use muxer::AmvMuxer;
 pub use parse::{
-    AmvDuration, AmvHeader, AmvWaveFormat, ChunkHeader, ChunkKind, AMVH_BODY_LEN, AMV_END_TRAILER,
-    AMV_FORM_TYPE, AUDIO_CHUNK_TAG, VIDEO_CHUNK_TAG,
+    validate_video_payload_shape, AmvAudioPreamble, AmvDuration, AmvHeader, AmvWaveFormat,
+    ChunkHeader, ChunkKind, AMVH_BODY_LEN, AMV_AUDIO_PREAMBLE_LEN, AMV_END_TRAILER, AMV_FORM_TYPE,
+    AUDIO_CHUNK_TAG, JPEG_EOI, JPEG_SOI, VIDEO_CHUNK_TAG,
 };
 
 use oxideav_core::{
