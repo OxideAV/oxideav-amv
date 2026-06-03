@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §3b audio `WAVEFORMATEX` device-profile sentinel validation — new
+  `AmvWaveFormat::validate_sentinels` byte-parser helper plus
+  integration into `AmvPrelude::parse_strict` /
+  `AmvDemuxer::open_strict` so strict mode cross-checks the six fixed
+  values the trace doc's §3b table records for the audio `strf` body:
+  `wFormatTag == 1` (declared PCM at `+0x00`), `nChannels == 1`
+  (mono at `+0x02`), `nAvgBytesPerSec == nSamplesPerSec * 2` (the
+  decoded-PCM rate derivation at `+0x08`, matching the observed
+  `44_100 == 22_050 * 2`), `nBlockAlign == 2` (16-bit block-align at
+  `+0x0C`), `wBitsPerSample == 16` (decoded-PCM width at `+0x0E`), and
+  `cbSize == 0` (WAVEFORMATEX extension marker at `+0x10`).
+  `nSamplesPerSec` itself stays unvalidated — the trace records only
+  the one observation (22 050 Hz) and does not document whether other
+  Actions / ALi-chip device profiles also vary the audio sample rate.
+  Eleven new tests cover acceptance of the comedian profile, a
+  hypothetical 44 100 Hz cross-rate (validating the rate-free design),
+  six per-constant rejections naming each `+0xNN` offset, two
+  prelude-level integration rejections (non-PCM `wFormatTag` and
+  inconsistent `nAvgBytesPerSec`), a demuxer-level
+  `open_strict_rejects_wrong_audio_block_align` permissive-versus-strict
+  divergence assertion, and an extended real-fixture cross-check
+  confirming the staged `comedian.amv` device file satisfies every
+  §3b invariant in addition to the previously-validated §2 / §3 set.
 - §2 + §3 strict-mode sentinel validation — new `AmvDemuxer::open_strict`
   entrypoint plus `AmvHeader::validate_sentinels` byte-parser helper
   that cross-checks the trace doc's §2 (`amvh` body sentinel constants)

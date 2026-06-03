@@ -282,6 +282,78 @@ impl AmvWaveFormat {
             },
         })
     }
+
+    /// Strict sentinel validation of the parsed §3b audio
+    /// `WAVEFORMATEX` body, applying the cross-checks that the
+    /// permissive [`Self::parse`] path skips. Per trace §3b the device
+    /// profile fixes six relationships:
+    ///
+    /// * `wFormatTag == 1` (the `+0x00` declared-PCM tag — the payload
+    ///   is actually ADPCM-style but the header advertises 0x0001).
+    /// * `nChannels == 1` (the `+0x02` mono channel count — observed
+    ///   identically in both fixtures).
+    /// * `nAvgBytesPerSec == nSamplesPerSec * 2` (the `+0x08`
+    ///   derivation from `+0x04`, describing the **decoded** 16-bit PCM
+    ///   rate; observed `44_100 == 22_050 * 2`).
+    /// * `nBlockAlign == 2` (the `+0x0C` two-byte block alignment of
+    ///   the declared 16-bit PCM stream).
+    /// * `wBitsPerSample == 16` (the `+0x0E` decoded-sample-width — the
+    ///   on-disk payload is `~4` bits/sample but the header declares
+    ///   the decoded-PCM width).
+    /// * `cbSize == 0` (the `+0x10` `WAVEFORMATEX` extension-size
+    ///   marker; observed zero in both fixtures since the device emits
+    ///   no `WAVEFORMATEXTENSIBLE` tail).
+    ///
+    /// `samples_per_sec` itself is left unvalidated — the trace records
+    /// only the one observation (`22_050`) and does not document
+    /// whether other Actions / ALi-chip device profiles also vary the
+    /// audio sample rate, so strict callers do not gate on it.
+    ///
+    /// The permissive [`Self::parse`] path stays untouched so the
+    /// existing demuxer-open path continues to accept any byte-shaped
+    /// 18+ byte audio `strf` body; this method is the opt-in
+    /// cross-check for callers that want device-profile strictness.
+    pub fn validate_sentinels(&self) -> Result<(), AmvDemuxerError> {
+        if self.format_tag != 1 {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "audio strf +0x00 wFormatTag must be 1 (declared PCM), got {}",
+                self.format_tag
+            )));
+        }
+        if self.channels != 1 {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "audio strf +0x02 nChannels must be 1 (mono), got {}",
+                self.channels
+            )));
+        }
+        let expected_avg = self.samples_per_sec.saturating_mul(2);
+        if self.avg_bytes_per_sec != expected_avg {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "audio strf +0x08 nAvgBytesPerSec={} does not match \
+                 nSamplesPerSec * 2 = {}",
+                self.avg_bytes_per_sec, expected_avg
+            )));
+        }
+        if self.block_align != 2 {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "audio strf +0x0C nBlockAlign must be 2, got {}",
+                self.block_align
+            )));
+        }
+        if self.bits_per_sample != 16 {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "audio strf +0x0E wBitsPerSample must be 16, got {}",
+                self.bits_per_sample
+            )));
+        }
+        if self.cb_size != 0 {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "audio strf +0x10 cbSize must be 0, got {}",
+                self.cb_size
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Identifies which leaf-chunk tag was seen.
@@ -375,14 +447,17 @@ impl AmvPrelude {
     ///   `amvh` body so a corrupted `dwMicroSecPerFrame` / `flag_one` /
     ///   `reserved_30` is rejected immediately rather than silently fed
     ///   downstream.
-    /// * Verifies the four §3 stream-header bodies the trace records as
+    /// * Verifies the three §3 stream-header bodies the trace records as
     ///   "entirely zero" really are entirely zero in the input slice —
     ///   the 56-byte video `strh` body, the 36-byte video `strf` body,
-    ///   the 48-byte audio `strh` body, **and** the 14 leading bytes of
-    ///   the audio `strf` `WAVEFORMATEX` reserved tail (the `cbSize`
-    ///   trailing word + pad that always reads zero in observed
-    ///   fixtures). Any non-zero byte in those regions surfaces an
-    ///   [`AmvDemuxerError::InvalidData`] naming the offending offset.
+    ///   and the 48-byte audio `strh` body. Any non-zero byte in those
+    ///   regions surfaces an [`AmvDemuxerError::InvalidData`] naming the
+    ///   offending offset.
+    /// * Re-runs [`AmvWaveFormat::validate_sentinels`] against the
+    ///   parsed audio `strf` `WAVEFORMATEX` body so the six §3b
+    ///   device-profile constants — `wFormatTag == 1`, `nChannels == 1`,
+    ///   `nAvgBytesPerSec == nSamplesPerSec * 2`, `nBlockAlign == 2`,
+    ///   `wBitsPerSample == 16`, `cbSize == 0` — are cross-checked.
     ///
     /// The permissive [`Self::parse`] path stays untouched so the
     /// existing demuxer-open path continues to accept any byte-shaped
@@ -420,6 +495,14 @@ impl AmvPrelude {
             STRH_AUDIO_BODY_LEN as usize,
             "audio strh body",
         )?;
+
+        // §3b audio strf WAVEFORMATEX device-profile sentinels — six
+        // fixed-value relationships the device hard-codes in the
+        // 20-byte body (`wFormatTag`/`nChannels`/`nAvgBytesPerSec ==
+        // nSamplesPerSec * 2` / `nBlockAlign` / `wBitsPerSample` /
+        // `cbSize`). Run on the already-parsed view so this is a pure
+        // semantic cross-check; the byte-shape check happened upstream.
+        prelude.audio_format.validate_sentinels()?;
 
         Ok(prelude)
     }
@@ -883,6 +966,217 @@ pub(crate) mod tests {
         match err {
             AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("+0x2C")),
             other => panic!("expected InvalidData(flag_one), got {other:?}"),
+        }
+    }
+
+    /// §3b trace doc row: comedian / noel device profile fixes
+    /// `wFormatTag=1`, `nChannels=1`, `nAvgBytesPerSec=nSamplesPerSec*2`,
+    /// `nBlockAlign=2`, `wBitsPerSample=16`, `cbSize=0`.
+    /// `AmvWaveFormat::validate_sentinels` should accept this tuple.
+    #[test]
+    fn waveformat_validate_sentinels_accepts_comedian_profile() {
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 44_100,
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        fmt.validate_sentinels()
+            .expect("comedian audio strf sentinels accepted");
+    }
+
+    /// Cross-rate coverage — strict mode must still accept any
+    /// `samples_per_sec` value as long as `avg_bytes_per_sec` is its
+    /// `* 2` derivation. Use a hypothetical 44_100 Hz device profile to
+    /// verify the rate itself is not gated.
+    #[test]
+    fn waveformat_validate_sentinels_accepts_arbitrary_samples_per_sec() {
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec: 44_100,
+            avg_bytes_per_sec: 88_200,
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        fmt.validate_sentinels()
+            .expect("44k1 profile sentinels accepted");
+    }
+
+    #[test]
+    fn waveformat_validate_sentinels_rejects_non_pcm_format_tag() {
+        let fmt = AmvWaveFormat {
+            format_tag: 2,
+            channels: 1,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 44_100,
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        let err = fmt.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("+0x00") && msg.contains("wFormatTag"));
+            }
+            other => panic!("expected InvalidData(wFormatTag), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn waveformat_validate_sentinels_rejects_stereo_channels() {
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 2,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 44_100,
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        let err = fmt.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("+0x02") && msg.contains("nChannels"));
+            }
+            other => panic!("expected InvalidData(nChannels), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn waveformat_validate_sentinels_rejects_inconsistent_avg_bytes_per_sec() {
+        // `samples_per_sec * 2` = 44 100; an attacker writing 22 050
+        // (= samples_per_sec * 1, the on-disk nibble-rate misread) is
+        // the canonical "header was tampered with" shape.
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 22_050,
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        let err = fmt.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("+0x08") && msg.contains("nAvgBytesPerSec"));
+            }
+            other => panic!("expected InvalidData(nAvgBytesPerSec), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn waveformat_validate_sentinels_rejects_wrong_block_align() {
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 44_100,
+            block_align: 4,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        let err = fmt.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("+0x0C") && msg.contains("nBlockAlign"));
+            }
+            other => panic!("expected InvalidData(nBlockAlign), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn waveformat_validate_sentinels_rejects_wrong_bits_per_sample() {
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 44_100,
+            block_align: 2,
+            bits_per_sample: 8,
+            cb_size: 0,
+        };
+        let err = fmt.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("+0x0E") && msg.contains("wBitsPerSample"));
+            }
+            other => panic!("expected InvalidData(wBitsPerSample), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn waveformat_validate_sentinels_rejects_non_zero_cb_size() {
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 44_100,
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 22,
+        };
+        let err = fmt.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("+0x10") && msg.contains("cbSize"));
+            }
+            other => panic!("expected InvalidData(cbSize), got {other:?}"),
+        }
+    }
+
+    /// Integration: strict prelude parse must reject when the audio
+    /// strf WAVEFORMATEX violates a §3b sentinel — here, `wFormatTag`
+    /// is flipped from 1 (PCM) to 0x55 (MP3, a value real AVI files
+    /// can carry but no device-profile AMV emits).
+    #[test]
+    fn prelude_parse_strict_rejects_non_pcm_format_tag() {
+        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        // The audio strf body sits 20 bytes after the audio strl LIST.
+        // Following the synthetic prelude layout exactly:
+        //  STRL_VIDEO_OFFSET +  12               = video strh leaf
+        //                    +  20 + 56 (strh)   = video strf leaf
+        //                    +   8 + 36 (strf)   = end of video strl  (audio strl LIST starts)
+        //                    +  12               = audio strh leaf
+        //                    +  20 + 48 (strh)   = audio strf leaf
+        //                    +   8               = audio strf body (= file offset of wFormatTag)
+        let v = STRL_VIDEO_OFFSET as usize;
+        let a_strl = v + 20 + STRH_VIDEO_BODY_LEN as usize + 8 + STRF_VIDEO_BODY_LEN as usize;
+        let a_strf_body = a_strl + 20 + STRH_AUDIO_BODY_LEN as usize + 8;
+        buf[a_strf_body] = 0x55;
+        buf[a_strf_body + 1] = 0x00;
+        let err = AmvPrelude::parse_strict(&buf).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("wFormatTag"));
+            }
+            other => panic!("expected InvalidData(wFormatTag), got {other:?}"),
+        }
+    }
+
+    /// Integration: strict prelude parse rejects when
+    /// `nAvgBytesPerSec` is *not* `samples_per_sec * 2`. Build a
+    /// 22_050-Hz prelude then patch `+0x08` to `samples_per_sec`
+    /// directly (the on-disk nibble-byte-rate misread).
+    #[test]
+    fn prelude_parse_strict_rejects_inconsistent_avg_bytes_per_sec() {
+        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        let v = STRL_VIDEO_OFFSET as usize;
+        let a_strl = v + 20 + STRH_VIDEO_BODY_LEN as usize + 8 + STRF_VIDEO_BODY_LEN as usize;
+        let a_strf_body = a_strl + 20 + STRH_AUDIO_BODY_LEN as usize + 8;
+        // Patch +0x08 from 44_100 to 22_050.
+        buf[a_strf_body + 0x08..a_strf_body + 0x0C].copy_from_slice(&22_050u32.to_le_bytes());
+        let err = AmvPrelude::parse_strict(&buf).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("nAvgBytesPerSec"));
+            }
+            other => panic!("expected InvalidData(nAvgBytesPerSec), got {other:?}"),
         }
     }
 

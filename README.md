@@ -73,15 +73,22 @@ Tooling that wants to filter "real device-profile AMV files" from
 garbled inputs up-front can use `AmvDemuxer::open_strict`. The strict
 variant runs the trace doc's §2 + §3 sentinel checks before any `movi`
 work: `dwMicroSecPerFrame == 1_000_000 / fps`, `flag_one == 1` at the
-`+0x2C` constant, `reserved_30 == 0` at `+0x30`, and each of the four
-§3 stream-header bodies (video `strh`, video `strf`, audio `strh`) is
-entirely zero per the trace observation that the device writes no
-`fccHandler`/`BITMAPINFOHEADER` / `auds` metadata. The same checks are
-exposed at the byte-parser level via `AmvHeader::validate_sentinels()`
-for callers that want to validate a parsed header in isolation. The
-default `AmvDemuxer::open` entrypoint stays permissive so the existing
-demuxer-open path still accepts any byte-shaped prelude that satisfies
-the §1-§4 FOURCC layout — strictness is opt-in.
+`+0x2C` constant, `reserved_30 == 0` at `+0x30`, each of the three §3
+all-zero stream-header bodies (video `strh`, video `strf`, audio
+`strh`) is entirely zero per the trace observation that the device
+writes no `fccHandler`/`BITMAPINFOHEADER` / `auds` metadata, **and**
+the six §3b audio `WAVEFORMATEX` device-profile constants
+(`wFormatTag == 1`, `nChannels == 1`,
+`nAvgBytesPerSec == nSamplesPerSec * 2`, `nBlockAlign == 2`,
+`wBitsPerSample == 16`, `cbSize == 0`) — leaving the
+`nSamplesPerSec` rate itself free since the trace only records the
+one observed value (22 050 Hz). The same checks are exposed at the
+byte-parser level via `AmvHeader::validate_sentinels()` and the new
+`AmvWaveFormat::validate_sentinels()` for callers that want to
+validate a parsed header in isolation. The default `AmvDemuxer::open`
+entrypoint stays permissive so the existing demuxer-open path still
+accepts any byte-shaped prelude that satisfies the §1-§4 FOURCC
+layout — strictness is opt-in.
 
 Frame and sample **decoding** are out of scope — the video stream is declared
 as the `mjpeg` codec id (the actual JPEG payload requires the player's stripped

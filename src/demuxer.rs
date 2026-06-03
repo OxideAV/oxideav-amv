@@ -1697,6 +1697,38 @@ mod tests {
         let _d = AmvDemuxer::open(Cursor::new(buf)).expect("permissive accepts non-zero strh");
     }
 
+    /// Strict-mode rejects a synthetic prelude whose audio `strf`
+    /// WAVEFORMATEX violates a §3b sentinel — here `nBlockAlign` is
+    /// flipped from 2 to 4. The permissive entrypoint must keep
+    /// accepting it because the permissive path never gates on the
+    /// audio strf body values.
+    #[test]
+    fn open_strict_rejects_wrong_audio_block_align() {
+        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        // The audio strf body sits at file 0x11C in every synthetic
+        // prelude:
+        //   0x00 RIFF/0/'AMV '
+        //   0x0C LIST/0/'hdrl'
+        //   0x18 'amvh' + size 0x38 → body 0x20..0x58
+        //   0x58 LIST/0/'strl' (video)
+        //   0x64 'strh' + size 0x38 → body 0x6C..0xA4
+        //   0xA4 'strf' + size 0x24 → body 0xAC..0xD0
+        //   0xD0 LIST/0/'strl' (audio)
+        //   0xDC 'strh' + size 0x30 → body 0xE4..0x114
+        //   0x114 'strf' + size 0x14 → body 0x11C..0x130
+        // `nBlockAlign` is at body +0x0C → file 0x128.
+        let block_align_off = 0x11Cusize + 0x0C;
+        buf[block_align_off..block_align_off + 2].copy_from_slice(&4u16.to_le_bytes());
+        buf.extend_from_slice(&AMV_END_TRAILER);
+        let err = AmvDemuxer::open_strict(Cursor::new(buf.clone())).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("nBlockAlign")),
+            other => panic!("expected InvalidData(nBlockAlign), got {other:?}"),
+        }
+        let _d = AmvDemuxer::open(Cursor::new(buf))
+            .expect("permissive accepts non-canonical nBlockAlign");
+    }
+
     /// Real-fixture cross-check: the staged `comedian.amv` device file
     /// passes the strict §2/§3 sentinel check. This is the load-bearing
     /// "real bytes from a real device satisfy our trace-derived
@@ -1727,5 +1759,13 @@ mod tests {
         assert_eq!(d.header().flag_one, 1);
         assert_eq!(d.header().reserved_30, 0);
         assert_eq!(d.audio_format().samples_per_sec, 22_050);
+        // §3b WAVEFORMATEX device-profile constants — the new sentinel
+        // suite gates on these directly inside open_strict.
+        assert_eq!(d.audio_format().format_tag, 1);
+        assert_eq!(d.audio_format().channels, 1);
+        assert_eq!(d.audio_format().avg_bytes_per_sec, 44_100);
+        assert_eq!(d.audio_format().block_align, 2);
+        assert_eq!(d.audio_format().bits_per_sample, 16);
+        assert_eq!(d.audio_format().cb_size, 0);
     }
 }
