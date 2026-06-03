@@ -128,6 +128,13 @@ pub struct AmvDemuxer {
     /// [`AmvDemuxer::seek_to`] switches from a linear walk to a binary
     /// search.
     chunk_index: Option<Vec<ChunkIndexEntry>>,
+    /// Whether the walker drained the stream via a graceful truncation
+    /// recovery (set on a short-read at any chunk boundary that was not
+    /// the [`AMV_END_TRAILER`] literal). See
+    /// [`AmvDemuxer::is_truncated`]. Distinguishes
+    /// "device-power-cut before trailer landed" from "saw `AMV_END_`
+    /// cleanly".
+    truncated: bool,
 }
 
 impl std::fmt::Debug for AmvDemuxer {
@@ -144,6 +151,7 @@ impl std::fmt::Debug for AmvDemuxer {
                 "chunk_index_len",
                 &self.chunk_index.as_ref().map(|v| v.len()),
             )
+            .field("truncated", &self.truncated)
             .finish()
     }
 }
@@ -224,6 +232,7 @@ impl AmvDemuxer {
             next_video_pts: 0,
             next_audio_pts: 0,
             chunk_index: None,
+            truncated: false,
         })
     }
 
@@ -311,11 +320,23 @@ impl AmvDemuxer {
                 }
                 ChunkKind::Audio => {
                     // Read only the 8-byte preamble to learn the
-                    // decoded-sample count.
+                    // decoded-sample count. A short read here means
+                    // the file was truncated mid-preamble — surface
+                    // the same graceful-EOF semantics the
+                    // `next_packet` walker uses by recording the
+                    // entry without a sample-count contribution and
+                    // breaking the walk.
                     let mut preamble = [0u8; 8];
                     let preamble_len = preamble.len().min(chunk.size as usize);
-                    if preamble_len > 0 {
-                        self.reader.read_exact(&mut preamble[..preamble_len])?;
+                    if preamble_len > 0
+                        && self
+                            .reader
+                            .read_exact(&mut preamble[..preamble_len])
+                            .is_err()
+                    {
+                        // Drop the partially-readable chunk; the
+                        // index covers everything that did land.
+                        break;
                     }
                     let block_samples = if preamble_len >= 8 {
                         u32::from_le_bytes([preamble[4], preamble[5], preamble[6], preamble[7]])
@@ -362,6 +383,25 @@ impl AmvDemuxer {
     pub fn chunk_index(&self) -> Option<&[ChunkIndexEntry]> {
         self.chunk_index.as_deref()
     }
+
+    /// Whether the walker drained the `movi` payload by hitting a
+    /// truncation (a short read at a chunk boundary, or a short read
+    /// inside a chunk body) instead of by observing the §4c
+    /// [`AMV_END_TRAILER`] literal.
+    ///
+    /// Cheap portable-player devices that AMV originated on are prone
+    /// to power-cut mid-write — battery dies, the user yanks the
+    /// memory card — leaving a file whose last few bytes are missing
+    /// the trailer (and possibly the last chunk's body). The walker
+    /// tolerates these cases by returning [`Error::Eof`] for the
+    /// truncating call, and this flag lets callers tell apart "I
+    /// drained 1116 of 1116 frames cleanly" from "I drained 1043 of
+    /// 1116 frames, the rest were lost when the device died".
+    ///
+    /// Always `false` before EOF is reached.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 impl Demuxer for AmvDemuxer {
@@ -384,13 +424,16 @@ impl Demuxer for AmvDemuxer {
             .seek(SeekFrom::Start(self.cursor))
             .map_err(|e| Error::other(format!("amv: seek to chunk header: {e}")))?;
         let mut header_bytes = [0u8; 8];
-        if let Err(e) = self.reader.read_exact(&mut header_bytes) {
+        if self.reader.read_exact(&mut header_bytes).is_err() {
             // A short read at this point means the file ended before
-            // the trailer landed. Treat as EOF rather than corrupt.
+            // the trailer landed. AMV files routinely arrive truncated
+            // from power-cut portable players — treat the truncation
+            // as a graceful EOF and flag it so callers can distinguish
+            // "saw trailer" from "stream cut off" via
+            // [`AmvDemuxer::is_truncated`].
             self.eof = true;
-            return Err(Error::other(format!(
-                "amv: short read at chunk header: {e}"
-            )));
+            self.truncated = true;
+            return Err(Error::Eof);
         }
         // First check the trailer literal — its 8 bytes match no
         // valid chunk-header layout (the would-be size field is
@@ -673,9 +716,16 @@ impl AmvDemuxer {
 
     fn read_video_packet(&mut self, chunk: ChunkHeader) -> Result<Packet> {
         let mut data = vec![0u8; chunk.size as usize];
-        self.reader
-            .read_exact(&mut data)
-            .map_err(|e| Error::other(format!("amv: video chunk body short read: {e}")))?;
+        if self.reader.read_exact(&mut data).is_err() {
+            // The 8-byte chunk header parsed cleanly but the body
+            // didn't fit in the file — the device cut off mid-frame.
+            // Drop the partial frame and surface a graceful EOF; the
+            // truncation flag lets callers tell apart "drained
+            // through `AMV_END_`" from "device died mid-write".
+            self.eof = true;
+            self.truncated = true;
+            return Err(Error::Eof);
+        }
         // Advance cursor by exactly 8 + size — NO padding (§4
         // "no-padding rule").
         self.cursor += chunk.advance_total();
@@ -693,9 +743,15 @@ impl AmvDemuxer {
 
     fn read_audio_packet(&mut self, chunk: ChunkHeader) -> Result<Packet> {
         let mut data = vec![0u8; chunk.size as usize];
-        self.reader
-            .read_exact(&mut data)
-            .map_err(|e| Error::other(format!("amv: audio chunk body short read: {e}")))?;
+        if self.reader.read_exact(&mut data).is_err() {
+            // Mirror the video-side body-truncation recovery: an
+            // 8-byte header parsed cleanly but the body fell off the
+            // end. Drop the partial block and surface a graceful EOF
+            // with the truncation flag set.
+            self.eof = true;
+            self.truncated = true;
+            return Err(Error::Eof);
+        }
         self.cursor += chunk.advance_total();
         // §4b: the first 8 bytes of every `01wb` payload are an
         // 8-byte preamble — `u32` per-block state + `u32` decoded
@@ -1287,5 +1343,250 @@ mod tests {
                 break;
             }
         }
+    }
+
+    // --- §4c trailer-recovery cases ---------------------------------
+    //
+    // The §4c `AMV_END_` ASCII trailer is the canonical bound on a
+    // well-formed file, but field-collected `.amv` files from cheap
+    // portable players routinely arrive truncated — the user yanked
+    // the SD card, the battery died mid-write, the USB transfer was
+    // interrupted. These tests pin the demuxer's graceful-EOF
+    // recovery behaviour: any short read at a chunk boundary or
+    // inside a chunk body sets `is_truncated()` and returns
+    // [`Error::Eof`] for the next call, instead of surfacing a raw
+    // I/O error. The bytes that DID parse are still emitted as
+    // normal packets.
+
+    /// Happy-path baseline: a complete synthetic file ends via the
+    /// `AMV_END_` literal, and `is_truncated()` stays `false`.
+    #[test]
+    fn complete_file_reports_is_truncated_false() {
+        let buf = build_synthetic_file(3);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        assert!(!d.is_truncated(), "fresh demuxer is not truncated");
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert!(
+            !d.is_truncated(),
+            "drained via AMV_END_ — must not be flagged truncated"
+        );
+    }
+
+    /// Truncation pattern #1: the file ends exactly after the last
+    /// complete chunk, with the §4c `AMV_END_` 8-byte trailer
+    /// missing entirely. Real-world: writer crashed in the post-
+    /// payload finalisation step. The walker emits every complete
+    /// packet, then EOFs gracefully with `is_truncated() == true`.
+    #[test]
+    fn truncated_no_trailer_drains_then_graceful_eof() {
+        let mut buf = build_synthetic_file(3);
+        // Strip the 8-byte `AMV_END_` trailer the helper appended.
+        assert_eq!(&buf[buf.len() - 8..], &AMV_END_TRAILER);
+        buf.truncate(buf.len() - 8);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let mut got = 0;
+        loop {
+            match d.next_packet() {
+                Ok(_) => got += 1,
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        // 3 video + 3 audio chunks all complete.
+        assert_eq!(got, 6, "every complete chunk must still be emitted");
+        assert!(
+            d.is_truncated(),
+            "missing AMV_END_ must flag the stream as truncated"
+        );
+        // Subsequent calls keep returning EOF and the flag stays set.
+        assert!(matches!(d.next_packet().unwrap_err(), Error::Eof));
+        assert!(d.is_truncated());
+    }
+
+    /// Truncation pattern #2: the file is cut mid-way through the
+    /// 8-byte chunk header itself (writer crashed having committed
+    /// only 1–7 bytes of the next header). The walker recognises
+    /// the short read at the chunk-header boundary and EOFs
+    /// gracefully.
+    #[test]
+    fn truncated_mid_chunk_header_drains_then_graceful_eof() {
+        // 4 complete pairs (V+A * 4) then a partial chunk-header of
+        // just 3 bytes. We strip the trailer the helper appends
+        // before adding the partial header.
+        let mut buf = build_synthetic_file(4);
+        buf.truncate(buf.len() - 8); // drop AMV_END_
+        buf.extend_from_slice(&VIDEO_CHUNK_TAG[..3]); // partial FOURCC
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let mut got = 0;
+        loop {
+            match d.next_packet() {
+                Ok(_) => got += 1,
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert_eq!(got, 8, "all 4 V+A pairs (8 chunks) must be emitted");
+        assert!(d.is_truncated());
+    }
+
+    /// Truncation pattern #3: the chunk **header** parses cleanly but
+    /// the body falls off the end of the file (writer crashed mid-
+    /// payload — common when a 1633-byte JPEG body was only half-
+    /// flushed). The walker drops the partial frame and EOFs
+    /// gracefully.
+    #[test]
+    fn truncated_mid_video_body_drains_then_graceful_eof() {
+        // 2 complete pairs (V+A * 2), then a video header announcing
+        // 1000 bytes but only 50 bytes follow.
+        let mut buf = build_synthetic_file(2);
+        buf.truncate(buf.len() - 8); // drop AMV_END_
+        buf.extend_from_slice(&VIDEO_CHUNK_TAG);
+        buf.extend_from_slice(&1000u32.to_le_bytes()); // declares 1000 bytes
+        buf.extend_from_slice(&[0xCDu8; 50]); // only 50 actually present
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let mut got = 0;
+        loop {
+            match d.next_packet() {
+                Ok(_) => got += 1,
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert_eq!(got, 4, "only the 2 complete (V+A) pairs are emitted");
+        assert!(d.is_truncated());
+    }
+
+    /// Truncation pattern #4: same as #3 but for the audio side
+    /// (last `01wb` body truncated). Mirrors the video case so both
+    /// `read_*_packet` body-short-read paths are exercised.
+    #[test]
+    fn truncated_mid_audio_body_drains_then_graceful_eof() {
+        let mut buf = build_synthetic_file(2);
+        buf.truncate(buf.len() - 8); // drop AMV_END_
+                                     // Emit one more complete video chunk so the truncated last
+                                     // chunk is an audio chunk (matching the §4 V-then-A
+                                     // alternation pattern).
+        let extra_video_body = 42u32.to_le_bytes().to_vec();
+        buf.extend_from_slice(&VIDEO_CHUNK_TAG);
+        buf.extend_from_slice(&(extra_video_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&extra_video_body);
+        // Audio header announces 200 bytes, only 5 follow.
+        buf.extend_from_slice(&AUDIO_CHUNK_TAG);
+        buf.extend_from_slice(&200u32.to_le_bytes());
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE]);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let mut got = 0;
+        loop {
+            match d.next_packet() {
+                Ok(_) => got += 1,
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        // 2 complete (V,A) pairs + 1 extra complete video chunk = 5.
+        assert_eq!(got, 5);
+        assert!(d.is_truncated());
+    }
+
+    /// Truncation pattern #5: the file is cut after the very last
+    /// payload byte, with **zero** bytes following the final
+    /// complete chunk. The next chunk-header `read_exact` returns
+    /// the no-data short read directly — must EOF gracefully and
+    /// be flagged truncated.
+    #[test]
+    fn truncated_zero_bytes_after_last_chunk_drains_then_graceful_eof() {
+        let mut buf = build_synthetic_file(1);
+        buf.truncate(buf.len() - 8); // drop the AMV_END_ trailer
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let _v = d.next_packet().expect("v0");
+        let _a = d.next_packet().expect("a0");
+        // No more bytes — should be a clean truncated-EOF.
+        assert!(matches!(d.next_packet().unwrap_err(), Error::Eof));
+        assert!(d.is_truncated());
+    }
+
+    /// `is_truncated()` must remain `false` while there are still
+    /// chunks left to emit — the flag only flips on the actual
+    /// truncation-driven EOF, not preemptively at open() time.
+    #[test]
+    fn is_truncated_only_flips_at_truncating_eof() {
+        let mut buf = build_synthetic_file(3);
+        buf.truncate(buf.len() - 8);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        assert!(!d.is_truncated(), "before any next_packet");
+        let _v0 = d.next_packet().expect("v0");
+        assert!(!d.is_truncated(), "mid-walk, before EOF");
+        // Drain the rest.
+        while d.next_packet().is_ok() {}
+        assert!(d.is_truncated(), "after the truncating EOF");
+    }
+
+    /// `build_chunk_index` must apply the same recovery semantics as
+    /// the live walker: a truncated tail breaks the build cleanly
+    /// (no error surface), the index covers every chunk that did
+    /// land, and the walker state is preserved.
+    #[test]
+    fn build_chunk_index_recovers_from_missing_trailer() {
+        let mut buf = build_synthetic_file(4);
+        buf.truncate(buf.len() - 8); // drop AMV_END_
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d.build_chunk_index()
+            .expect("build_chunk_index must tolerate truncation");
+        let idx = d.chunk_index().expect("index populated");
+        // 4 video + 4 audio chunks complete.
+        assert_eq!(idx.len(), 8);
+        // Walker still at start.
+        assert_eq!(d.cursor(), 0x13C);
+        // is_truncated is a walker concept, not an index concept —
+        // the index build itself does not flip it.
+        assert!(!d.is_truncated());
+    }
+
+    /// `build_chunk_index` on a file truncated mid-audio-preamble
+    /// must not error — it stops at the last fully-readable chunk
+    /// instead.
+    #[test]
+    fn build_chunk_index_recovers_from_mid_preamble_truncation() {
+        // 2 complete pairs, one extra complete video chunk, then a
+        // partial audio chunk: 8-byte header announcing 12 bytes,
+        // but only 3 bytes of the 8-byte preamble actually present.
+        let mut buf = build_synthetic_file(2);
+        buf.truncate(buf.len() - 8); // drop AMV_END_
+        let extra_video_body = 42u32.to_le_bytes().to_vec();
+        buf.extend_from_slice(&VIDEO_CHUNK_TAG);
+        buf.extend_from_slice(&(extra_video_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&extra_video_body);
+        buf.extend_from_slice(&AUDIO_CHUNK_TAG);
+        buf.extend_from_slice(&12u32.to_le_bytes());
+        buf.extend_from_slice(&[0x00, 0x00, 0x00]); // 3 of 8 preamble bytes
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d.build_chunk_index()
+            .expect("build_chunk_index must tolerate mid-preamble truncation");
+        let idx = d.chunk_index().expect("index populated");
+        // 2 V + 2 A + 1 extra V = 5 fully indexed chunks. The
+        // partial audio chunk is dropped.
+        assert_eq!(idx.len(), 5);
+    }
+
+    /// After a truncated walk, an indexed seek built post-truncation
+    /// must still land correctly on the chunks that did make it.
+    #[test]
+    fn indexed_seek_after_truncated_build_lands_correctly() {
+        let mut buf = build_synthetic_file(5);
+        buf.truncate(buf.len() - 8); // drop AMV_END_
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d.build_chunk_index().expect("build_chunk_index");
+        let landed = d.seek_to(0, 3).expect("seek to v3");
+        assert_eq!(landed, 3);
+        let p = d.next_packet().expect("packet after seek");
+        assert_eq!(p.stream_index, 0);
+        assert_eq!(p.pts, Some(3));
+        assert_eq!(p.data, 3u32.to_le_bytes().to_vec());
     }
 }

@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4c trailer-recovery — `AmvDemuxer` now drains gracefully when a
+  `.amv` file is truncated short of the `AMV_END_` ASCII trailer
+  (common in field-collected files from cheap portable players that
+  lose power mid-write). Any short read at a chunk-header boundary,
+  inside a chunk header, or inside a chunk body is treated as a
+  graceful EOF — every complete chunk preceding the truncation is
+  still emitted as a normal `Packet`, and the new
+  `AmvDemuxer::is_truncated()` accessor returns `true` so callers
+  can tell apart "drained 1116 / 1116 chunks via the trailer" from
+  "drained 1043 / 1116 chunks then the device died". The flag stays
+  `false` while the walker is still inside the payload and only flips
+  on the truncation-driven EOF, never preemptively. `build_chunk_index`
+  applies the same recovery: a truncated tail (missing trailer, partial
+  chunk header, partial audio preamble) breaks the build cleanly
+  instead of returning an error, and the resulting index covers every
+  chunk that did fully land — so an indexed seek built post-truncation
+  still navigates the surviving payload correctly. Ten new tests cover
+  the complete-file baseline, missing-trailer, mid-chunk-header,
+  mid-video-body, mid-audio-body, zero-bytes-after-last-chunk, the
+  flag-doesn't-flip-mid-walk invariant, two index-build truncation
+  patterns, and post-truncation indexed seek.
 - `AmvDemuxer::build_chunk_index` + `AmvDemuxer::chunk_index` —
   lazy in-memory chunk-index cache. AMV files carry no embedded index
   (trace §1 quirk #2), so the build walks the `movi` payload once and

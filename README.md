@@ -56,6 +56,19 @@ can iterate the chunk table directly. The build is idempotent and
 preserves the walker's current cursor / PTS counters so it can be
 invoked mid-walk without disturbing in-flight playback.
 
+Field-collected `.amv` files from cheap portable players regularly
+arrive truncated — the user pulls the SD card mid-write, the battery
+dies, the transfer is interrupted. The demuxer handles these cases
+gracefully: any short read at a chunk-header boundary, mid-header, or
+mid-payload is treated as EOF, every complete chunk preceding the
+truncation is still emitted as a normal `Packet`, and
+`AmvDemuxer::is_truncated()` returns `true` so callers can tell apart
+"drained 1116 / 1116 chunks via the `AMV_END_` trailer" from "drained
+1043 / 1116 chunks then the device died". `build_chunk_index` applies
+the same recovery, so an index built from a truncated file covers
+every chunk that did land and an indexed seek over it still navigates
+the surviving payload correctly.
+
 Frame and sample **decoding** are out of scope — the video stream is declared
 as the `mjpeg` codec id (the actual JPEG payload requires the player's stripped
 quant / Huffman tables to be spliced back in, which a downstream codec
