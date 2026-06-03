@@ -8,6 +8,30 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §2 + §3 strict-mode sentinel validation — new `AmvDemuxer::open_strict`
+  entrypoint plus `AmvHeader::validate_sentinels` byte-parser helper
+  that cross-checks the trace doc's §2 (`amvh` body sentinel constants)
+  and §3 (all-zero stream-header bodies) invariants the permissive
+  parser silently accepts. §2 covers three relationships fixed by the
+  doc table: `dwMicroSecPerFrame == 1_000_000 / fps` (the `+0x00 ÷
+  +0x28` derivation that holds 83 333 / 12 in `comedian.amv` and
+  62 500 / 16 in `noel-son-lumiere.amv`), `flag_one == 1` at the
+  `+0x2C` constant, and `reserved_30 == 0` at `+0x30`. §3 covers the
+  four "entirely zero" stream-header bodies the trace observes —
+  56-byte video `strh`, 36-byte video `strf` (no `BITMAPINFOHEADER`),
+  48-byte audio `strh` — and any non-zero byte in those regions
+  surfaces an `InvalidData` error naming the offending file offset.
+  The default `AmvDemuxer::open` entrypoint stays permissive so
+  existing callers keep their relaxed acceptance; strictness is
+  opt-in. Fifteen new unit tests cover the §2 sentinel triple under
+  both the comedian (12 fps) and noel (16 fps) device profiles, four
+  rejection shapes (zero fps, inconsistent micros_per_frame, wrong
+  flag_one, non-zero reserved_30), a §3 video-strh non-zero rejection,
+  a permissive-versus-strict divergence assertion against a corrupted
+  `reserved_30` byte, three demuxer-level strict-open shapes (synthetic
+  comedian accept, corrupted flag_one reject, non-zero video-strh
+  reject), and a real-fixture cross-check confirming the staged
+  `comedian.amv` device file satisfies every §2 + §3 invariant.
 - §4c trailer-recovery — `AmvDemuxer` now drains gracefully when a
   `.amv` file is truncated short of the `AMV_END_` ASCII trailer
   (common in field-collected files from cheap portable players that

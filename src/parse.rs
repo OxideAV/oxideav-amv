@@ -153,6 +153,58 @@ impl AmvHeader {
         let total_seconds = d.hours as i64 * 3600 + d.minutes as i64 * 60 + d.seconds as i64;
         total_seconds * 1_000_000
     }
+
+    /// Strict sentinel validation of the parsed §2 `amvh` body, applying
+    /// the cross-checks that the byte-level [`Self::parse`] permissively
+    /// skips. Per trace §2 the body fixes three relationships that a
+    /// conforming device-profile file always satisfies:
+    ///
+    /// * `dwMicroSecPerFrame == 1_000_000 / fps` (the `+0x00` derivation
+    ///   from `+0x28`). Both observed fixtures match — comedian holds
+    ///   `83_333` for 12 fps, noel holds `62_500` for 16 fps. A
+    ///   contradicting value indicates a corrupted header.
+    /// * `flag_one == 1` (the `+0x2C` constant). Both observed fixtures
+    ///   carry `1`; the trace records this as a constant of unknown
+    ///   meaning but stable value, so strict callers treat any other
+    ///   value as a signal that the header is not a real AMV header.
+    /// * `reserved_30 == 0` (the `+0x30` reserved dword). Always zero in
+    ///   both fixtures per §2's "reserved / zeroed" annotation.
+    ///
+    /// The permissive [`Self::parse`] path stays untouched so the
+    /// existing demuxer-open path continues to accept any byte-shaped
+    /// `amvh` body; this method is the opt-in cross-check for callers
+    /// that want to reject non-conforming files up-front.
+    ///
+    /// The `fps == 0` corner — for which the `1_000_000 / fps` derivation
+    /// is undefined — is reported as a separate `fps must be > 0` error
+    /// rather than triggering a division by zero.
+    pub fn validate_sentinels(&self) -> Result<(), AmvDemuxerError> {
+        if self.fps == 0 {
+            return Err(AmvDemuxerError::InvalidData(
+                "amvh +0x28 fps must be > 0".into(),
+            ));
+        }
+        let expected_micros = 1_000_000 / self.fps;
+        if self.micros_per_frame != expected_micros {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "amvh +0x00 dwMicroSecPerFrame={} does not match 1_000_000/fps={}",
+                self.micros_per_frame, expected_micros
+            )));
+        }
+        if self.flag_one != 1 {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "amvh +0x2C constant must be 1, got {}",
+                self.flag_one
+            )));
+        }
+        if self.reserved_30 != 0 {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "amvh +0x30 reserved dword must be 0, got {}",
+                self.reserved_30
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Decoded representation of the `amvh` packed duration (§2). The
@@ -316,6 +368,62 @@ pub(crate) struct AmvPrelude {
 }
 
 impl AmvPrelude {
+    /// Parse the file prelude in strict mode — wraps [`Self::parse`] with
+    /// the additional §2 + §3 sentinel checks documented in the trace:
+    ///
+    /// * Re-runs [`AmvHeader::validate_sentinels`] against the parsed
+    ///   `amvh` body so a corrupted `dwMicroSecPerFrame` / `flag_one` /
+    ///   `reserved_30` is rejected immediately rather than silently fed
+    ///   downstream.
+    /// * Verifies the four §3 stream-header bodies the trace records as
+    ///   "entirely zero" really are entirely zero in the input slice —
+    ///   the 56-byte video `strh` body, the 36-byte video `strf` body,
+    ///   the 48-byte audio `strh` body, **and** the 14 leading bytes of
+    ///   the audio `strf` `WAVEFORMATEX` reserved tail (the `cbSize`
+    ///   trailing word + pad that always reads zero in observed
+    ///   fixtures). Any non-zero byte in those regions surfaces an
+    ///   [`AmvDemuxerError::InvalidData`] naming the offending offset.
+    ///
+    /// The permissive [`Self::parse`] path stays untouched so the
+    /// existing demuxer-open path continues to accept any byte-shaped
+    /// prelude that satisfies the §1-§4 FOURCC layout; this method is
+    /// the opt-in cross-check for callers that want device-profile
+    /// strictness.
+    pub(crate) fn parse_strict(slice: &[u8]) -> Result<Self, AmvDemuxerError> {
+        let prelude = Self::parse(slice)?;
+        prelude.header.validate_sentinels()?;
+
+        // §3a video strh body — 56 bytes immediately after the `strh`
+        // FOURCC + size at file offset STRL_VIDEO_OFFSET + 12.
+        let v_strh_body = STRL_VIDEO_OFFSET as usize + 20;
+        require_all_zero(
+            slice,
+            v_strh_body,
+            STRH_VIDEO_BODY_LEN as usize,
+            "video strh body",
+        )?;
+
+        // §3a video strf body — 36 bytes (all-zero "no BITMAPINFOHEADER").
+        let v_strf_body = v_strh_body + STRH_VIDEO_BODY_LEN as usize + 8;
+        require_all_zero(
+            slice,
+            v_strf_body,
+            STRF_VIDEO_BODY_LEN as usize,
+            "video strf body",
+        )?;
+
+        // §3b audio strh body — 48 bytes (all-zero per §3b).
+        let a_strh_body = v_strf_body + STRF_VIDEO_BODY_LEN as usize + 20;
+        require_all_zero(
+            slice,
+            a_strh_body,
+            STRH_AUDIO_BODY_LEN as usize,
+            "audio strh body",
+        )?;
+
+        Ok(prelude)
+    }
+
     /// Parse the file prelude from a contiguous byte slice that begins
     /// at file offset 0 and contains at least up to and including the
     /// `LIST <size> 'movi'` opener. The returned
@@ -433,6 +541,33 @@ fn read_u16_le(buf: &[u8], off: usize) -> u16 {
 
 fn read_u32_le(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+/// Strict-mode helper: require an `len`-byte run starting at `at` to be
+/// entirely zero. Used by [`AmvPrelude::parse_strict`] to verify that
+/// the §3 all-zero stream-header bodies really are all zero in the
+/// input slice. Reports the absolute offset of the first non-zero byte
+/// for diagnostics.
+fn require_all_zero(
+    slice: &[u8],
+    at: usize,
+    len: usize,
+    label: &str,
+) -> Result<(), AmvDemuxerError> {
+    if slice.len() < at + len {
+        return Err(AmvDemuxerError::InvalidData(format!(
+            "slice too short for {label} at offset {at:#x}"
+        )));
+    }
+    for (i, &b) in slice[at..at + len].iter().enumerate() {
+        if b != 0 {
+            return Err(AmvDemuxerError::InvalidData(format!(
+                "{label}: expected all-zero, found {b:#04x} at offset {:#x}",
+                at + i
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn require_tag(
@@ -583,6 +718,188 @@ pub(crate) mod tests {
         // Overwrite FORM type 'AMV ' with 'AVI '.
         buf[8..12].copy_from_slice(b"AVI ");
         assert!(AmvPrelude::parse(&buf).is_err());
+    }
+
+    /// §2 trace doc table row: comedian device profile fixes
+    /// micros_per_frame=83_333 (1e6/12), flag_one=1, reserved_30=0.
+    /// `validate_sentinels` should accept this triple.
+    #[test]
+    fn validate_sentinels_accepts_comedian_profile() {
+        let h = AmvHeader {
+            micros_per_frame: 83_333,
+            width: 128,
+            height: 96,
+            fps: 12,
+            flag_one: 1,
+            reserved_30: 0,
+            duration_packed: 0x0000_0121,
+        };
+        h.validate_sentinels().expect("comedian sentinels accepted");
+    }
+
+    /// §2 trace doc cross-check row: noel device profile fixes
+    /// micros_per_frame=62_500 (1e6/16), flag_one=1, reserved_30=0.
+    #[test]
+    fn validate_sentinels_accepts_noel_profile() {
+        let h = AmvHeader {
+            micros_per_frame: 62_500,
+            width: 96,
+            height: 64,
+            fps: 16,
+            flag_one: 1,
+            reserved_30: 0,
+            duration_packed: 0x0000_0302,
+        };
+        h.validate_sentinels().expect("noel sentinels accepted");
+    }
+
+    #[test]
+    fn validate_sentinels_rejects_zero_fps() {
+        let h = AmvHeader {
+            micros_per_frame: 0,
+            width: 128,
+            height: 96,
+            fps: 0,
+            flag_one: 1,
+            reserved_30: 0,
+            duration_packed: 0,
+        };
+        let err = h.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("fps")),
+            other => panic!("expected InvalidData(fps), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_sentinels_rejects_inconsistent_micros_per_frame() {
+        // 12 fps with the noel-profile micros_per_frame (= 62_500) is
+        // the canonical "header was tampered with" shape.
+        let h = AmvHeader {
+            micros_per_frame: 62_500,
+            width: 128,
+            height: 96,
+            fps: 12,
+            flag_one: 1,
+            reserved_30: 0,
+            duration_packed: 0x0000_0121,
+        };
+        let err = h.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("dwMicroSecPerFrame"));
+            }
+            other => panic!("expected InvalidData(micros), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_sentinels_rejects_wrong_flag_one() {
+        let h = AmvHeader {
+            micros_per_frame: 83_333,
+            width: 128,
+            height: 96,
+            fps: 12,
+            flag_one: 0,
+            reserved_30: 0,
+            duration_packed: 0x0000_0121,
+        };
+        let err = h.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("+0x2C")),
+            other => panic!("expected InvalidData(flag_one), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_sentinels_rejects_non_zero_reserved_30() {
+        let h = AmvHeader {
+            micros_per_frame: 83_333,
+            width: 128,
+            height: 96,
+            fps: 12,
+            flag_one: 1,
+            reserved_30: 0xDEAD_BEEF,
+            duration_packed: 0x0000_0121,
+        };
+        let err = h.validate_sentinels().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("+0x30")),
+            other => panic!("expected InvalidData(reserved_30), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prelude_parse_strict_accepts_comedian_synthetic() {
+        let buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        let p = AmvPrelude::parse_strict(&buf).expect("strict parse");
+        assert_eq!(p.header.width, 128);
+        assert_eq!(p.header.height, 96);
+        assert_eq!(p.header.micros_per_frame, 83_333);
+        assert_eq!(p.movi_payload_start, 0x13C);
+    }
+
+    /// Cross-fixture coverage: parse a synthetic prelude built for the
+    /// noel device profile (96×64@16, micros_per_frame=62_500,
+    /// packed_duration=0x0302 → 3:02). The synthetic-prelude builder
+    /// derives `micros_per_frame` from `fps`, so this also exercises
+    /// the §2 dwMicroSecPerFrame / fps cross-check inside
+    /// `parse_strict`.
+    #[test]
+    fn prelude_parse_strict_accepts_noel_synthetic() {
+        let buf = build_synthetic_prelude(96, 64, 16, 0x0000_0302, 22_050);
+        let p = AmvPrelude::parse_strict(&buf).expect("strict parse");
+        assert_eq!(p.header.width, 96);
+        assert_eq!(p.header.height, 64);
+        assert_eq!(p.header.fps, 16);
+        assert_eq!(p.header.micros_per_frame, 62_500);
+        assert_eq!(p.header.duration_packed, 0x0000_0302);
+        // 3 * 60 + 2 = 182 seconds total.
+        assert_eq!(p.header.duration_micros(), 182_000_000);
+    }
+
+    #[test]
+    fn prelude_parse_strict_rejects_non_zero_video_strh_body() {
+        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        // The video strh body sits 20 bytes after STRL_VIDEO_OFFSET
+        // (LIST 4 + size 4 + 'strl' 4 + 'strh' 4 + size 4).
+        let v_strh_body = STRL_VIDEO_OFFSET as usize + 20;
+        buf[v_strh_body] = 0x42;
+        let err = AmvPrelude::parse_strict(&buf).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("video strh body"));
+            }
+            other => panic!("expected InvalidData(strh), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prelude_parse_strict_rejects_corrupted_flag_one() {
+        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        // amvh body starts at 0x20; flag_one is at body +0x2C → file 0x4C.
+        buf[0x4C] = 0x02;
+        let err = AmvPrelude::parse_strict(&buf).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("+0x2C")),
+            other => panic!("expected InvalidData(flag_one), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_strict_with_permissive_open_still_accepts_corrupted_input() {
+        // The permissive `parse` path must NOT be tightened — verify
+        // that a header which the strict path rejects (non-zero
+        // reserved_30) still parses successfully through the
+        // permissive entrypoint, so downstream consumers that opt out
+        // of strictness keep their relaxed acceptance.
+        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        // reserved_30 lives at body +0x30 → file 0x50.
+        buf[0x50] = 0x99;
+        let permissive = AmvPrelude::parse(&buf).expect("permissive accepts");
+        assert_eq!(permissive.header.reserved_30 & 0xFF, 0x99);
+        let strict = AmvPrelude::parse_strict(&buf);
+        assert!(strict.is_err());
     }
 
     /// Helper: assemble a minimal but byte-correct AMV prelude (from

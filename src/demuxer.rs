@@ -165,11 +165,48 @@ impl AmvDemuxer {
     where
         R: ReadSeek + 'static,
     {
+        Self::open_with(reader, false)
+    }
+
+    /// Open an AMV stream in **strict mode** — same as [`Self::open`]
+    /// but the prelude pass also runs the §2 + §3 sentinel checks that
+    /// [`crate::AmvHeader::validate_sentinels`] and
+    /// `AmvPrelude::parse_strict` document: `dwMicroSecPerFrame ==
+    /// 1_000_000 / fps`, `flag_one == 1`, `reserved_30 == 0`, and the
+    /// four §3 stream-header bodies are entirely zero per the trace
+    /// observation. Returns [`AmvDemuxerError::InvalidData`] when any
+    /// cross-check fails — useful for tooling that wants to reject
+    /// garbled / non-device-profile inputs up-front rather than emit
+    /// packets from a corrupt header.
+    ///
+    /// The default [`Self::open`] entrypoint stays permissive so the
+    /// existing demuxer-open path keeps accepting any byte-shaped
+    /// prelude that satisfies the §1-§4 FOURCC layout.
+    pub fn open_strict<R>(reader: R) -> std::result::Result<Self, AmvDemuxerError>
+    where
+        R: ReadSeek + 'static,
+    {
+        Self::open_with(reader, true)
+    }
+
+    /// Shared implementation behind [`Self::open`] (permissive) and
+    /// [`Self::open_strict`] (strict §2/§3 sentinel validation). The
+    /// only divergence is which prelude-parser entrypoint is invoked;
+    /// everything downstream is identical so a strict-opened demuxer
+    /// walks the same `movi` payload + trailer logic.
+    fn open_with<R>(reader: R, strict: bool) -> std::result::Result<Self, AmvDemuxerError>
+    where
+        R: ReadSeek + 'static,
+    {
         let mut reader: Box<dyn ReadSeek> = Box::new(reader);
         reader.seek(SeekFrom::Start(0))?;
         let mut prelude = vec![0u8; PRELUDE_MIN_LEN];
         reader.read_exact(&mut prelude)?;
-        let parsed = AmvPrelude::parse(&prelude)?;
+        let parsed = if strict {
+            AmvPrelude::parse_strict(&prelude)?
+        } else {
+            AmvPrelude::parse(&prelude)?
+        };
 
         let header = parsed.header;
         let audio_format = parsed.audio_format;
@@ -1588,5 +1625,107 @@ mod tests {
         assert_eq!(p.stream_index, 0);
         assert_eq!(p.pts, Some(3));
         assert_eq!(p.data, 3u32.to_le_bytes().to_vec());
+    }
+
+    // ─────────── §2/§3 strict-mode entrypoint coverage ───────────
+
+    /// A synthetic comedian-profile file opens cleanly through the new
+    /// strict entrypoint and walks identically to the permissive
+    /// entrypoint — first packet PTS, frame count, EOF marker all
+    /// match.
+    #[test]
+    fn open_strict_accepts_synthetic_comedian_profile() {
+        let buf = build_synthetic_file(2);
+        let mut d = AmvDemuxer::open_strict(Cursor::new(buf)).expect("strict open");
+        assert_eq!(d.header().width, 128);
+        assert_eq!(d.header().height, 96);
+        assert_eq!(d.header().fps, 12);
+        let v0 = d.next_packet().expect("v0");
+        assert_eq!(v0.pts, Some(0));
+        let _a0 = d.next_packet().expect("a0");
+        let v1 = d.next_packet().expect("v1");
+        assert_eq!(v1.pts, Some(1));
+        let _a1 = d.next_packet().expect("a1");
+        assert!(matches!(d.next_packet().unwrap_err(), Error::Eof));
+    }
+
+    /// Strict-mode rejects a corrupted `flag_one` (§2 +0x2C constant)
+    /// that the permissive entrypoint silently accepts. This is the
+    /// only behavioural difference between the two entrypoints — see
+    /// `parse::tests::parse_strict_with_permissive_open_still_accepts_corrupted_input`
+    /// for the permissive companion.
+    #[test]
+    fn open_strict_rejects_corrupted_flag_one() {
+        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        // amvh body sits at file 0x20; flag_one is body +0x2C → file 0x4C.
+        buf[0x4C] = 0x07;
+        // Append a minimal trailer so the permissive path would happily
+        // continue (proving the difference is in the sentinel check,
+        // not in the body walk).
+        buf.extend_from_slice(&AMV_END_TRAILER);
+        let err = AmvDemuxer::open_strict(Cursor::new(buf.clone())).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("+0x2C")),
+            other => panic!("expected InvalidData(flag_one), got {other:?}"),
+        }
+        // The permissive entrypoint must keep accepting it.
+        let _d = AmvDemuxer::open(Cursor::new(buf)).expect("permissive accepts corrupted flag_one");
+    }
+
+    /// Strict-mode rejects a synthetic prelude whose video `strh` body
+    /// is non-zero (§3 records the body as "all zero"). The permissive
+    /// entrypoint accepts it because the permissive path never validates
+    /// strh body content.
+    #[test]
+    fn open_strict_rejects_non_zero_video_strh_body() {
+        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        // First byte of the video strh body — well inside the
+        // STRH_VIDEO_BODY_LEN==0x38 run. Inject any non-zero byte to
+        // trigger the strict-mode rejection.
+        //
+        // Layout (§3a, also `STRL_VIDEO_OFFSET = 0x58`):
+        //   0x58 LIST | 0x5C size=0 | 0x60 'strl' | 0x64 'strh'
+        //   0x68 strh-size (4 bytes) | 0x6C strh-body...
+        let v_strh_body_start_in_prelude = 0x6C;
+        buf[v_strh_body_start_in_prelude] = 0xFE;
+        buf.extend_from_slice(&AMV_END_TRAILER);
+        let err = AmvDemuxer::open_strict(Cursor::new(buf.clone())).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("strh")),
+            other => panic!("expected InvalidData(strh), got {other:?}"),
+        }
+        let _d = AmvDemuxer::open(Cursor::new(buf)).expect("permissive accepts non-zero strh");
+    }
+
+    /// Real-fixture cross-check: the staged `comedian.amv` device file
+    /// passes the strict §2/§3 sentinel check. This is the load-bearing
+    /// "real bytes from a real device satisfy our trace-derived
+    /// invariants" assertion that lets the strict entrypoint be trusted
+    /// as a "this is a real AMV file" filter.
+    #[test]
+    fn comedian_fixture_open_strict_succeeds() {
+        let crate_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");
+        let workspace_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/container/amv/fixtures/comedian.amv");
+        let path = if crate_path.exists() {
+            crate_path
+        } else if workspace_path.exists() {
+            workspace_path
+        } else {
+            eprintln!("skipping comedian strict-open test: fixture not staged");
+            return;
+        };
+        let f = std::fs::File::open(&path).expect("open fixture");
+        let d = AmvDemuxer::open_strict(std::io::BufReader::new(f))
+            .expect("strict open accepts real comedian.amv");
+        // Sanity check the parsed parameters match §2 + §3b.
+        assert_eq!(d.header().width, 128);
+        assert_eq!(d.header().height, 96);
+        assert_eq!(d.header().fps, 12);
+        assert_eq!(d.header().micros_per_frame, 83_333);
+        assert_eq!(d.header().flag_one, 1);
+        assert_eq!(d.header().reserved_30, 0);
+        assert_eq!(d.audio_format().samples_per_sec, 22_050);
     }
 }
