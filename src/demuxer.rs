@@ -1835,4 +1835,56 @@ mod tests {
             "expected to validate 1116 audio chunks"
         );
     }
+
+    /// Real-fixture cross-check for the §4a strict-marker invariant:
+    /// walk the staged `comedian.amv` to EOF and run
+    /// `validate_video_payload_no_internal_markers` on every video
+    /// chunk. Per the trace doc the device-stripped bitstream carries
+    /// **no** internal JPEG marker segments — every one of the 1116
+    /// video frames must pass the strict-marker scan, since the trace
+    /// records the player splices its hardcoded quant / Huffman tables
+    /// back in before decoding and the on-disk bytes between SOI and
+    /// EOI are pure entropy-coded data (with at most `FF 00` byte
+    /// stuffing).
+    #[test]
+    fn comedian_fixture_all_video_chunks_pass_no_internal_markers() {
+        use crate::parse::validate_video_payload_no_internal_markers;
+
+        let crate_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");
+        let workspace_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/container/amv/fixtures/comedian.amv");
+        let path = if crate_path.exists() {
+            crate_path
+        } else if workspace_path.exists() {
+            workspace_path
+        } else {
+            eprintln!("skipping comedian strict-marker sentinel test: fixture not staged");
+            return;
+        };
+        let f = std::fs::File::open(&path).expect("open fixture");
+        let mut d = AmvDemuxer::open(std::io::BufReader::new(f)).expect("open comedian.amv");
+
+        let mut video_chunks_validated = 0u32;
+        loop {
+            match d.next_packet() {
+                Ok(p) if p.stream_index == 0 => {
+                    validate_video_payload_no_internal_markers(&p.data).unwrap_or_else(|e| {
+                        panic!(
+                            "video chunk #{video_chunks_validated} failed §4a \
+                             strict-marker check: {e:?}"
+                        )
+                    });
+                    video_chunks_validated += 1;
+                }
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(other) => panic!("walk error: {other:?}"),
+            }
+        }
+        assert_eq!(
+            video_chunks_validated, 1116,
+            "expected to strict-marker-validate 1116 video chunks"
+        );
+    }
 }

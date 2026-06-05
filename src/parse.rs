@@ -582,6 +582,77 @@ pub fn validate_video_payload_shape(body: &[u8]) -> Result<(), AmvDemuxerError> 
     Ok(())
 }
 
+/// Strict §4a invariant — confirm a `00dc` video chunk body carries
+/// **no internal JPEG marker segments** between SOI and EOI.
+///
+/// The trace records that marker-scanning the first frame found *only
+/// two* markers (SOI at +0 and EOI at `size − 2`): there is no
+/// `APP0`/JFIF (`FF E0`), no `DQT` (`FF DB`), no `SOF0` (`FF C0`), no
+/// `DHT` (`FF C4`) and no `SOS` (`FF DA`) marker segment. The
+/// quantization / Huffman tables, frame geometry and scan parameters
+/// are stripped and hardcoded in the player's decoder — the on-disk
+/// bitstream is bare entropy-coded data wrapped in SOI..EOI.
+///
+/// This helper is the strict counterpart of
+/// [`validate_video_payload_shape`]. After confirming the SOI / EOI
+/// bracket via the shape check, it walks the entropy-coded payload
+/// between offsets `2..(len − 2)` and reports the first byte position
+/// at which an unexpected `FF xx` marker pair appears. The only `FF`
+/// sequences allowed in the entropy section are:
+///
+/// * `FF 00` — JPEG byte stuffing (an `FF` data byte escaped by a
+///   trailing `00`).
+/// * `FF FF` — JPEG fill bytes (`0xFF` is the standard fill / pad
+///   token between markers).
+///
+/// A trailing `FF` immediately preceding the closing `FF D9` EOI is
+/// treated as a (non-stuffed) fill byte and accepted — the EOI itself
+/// is checked by [`validate_video_payload_shape`] and excluded from
+/// the entropy-scan window.
+///
+/// Returns [`AmvDemuxerError::InvalidData`] when an unexpected marker
+/// is found, naming the marker byte (the second byte of the pair) and
+/// the byte position relative to the start of the chunk body.
+///
+/// Strict callers (e.g. tooling that wants to confirm a recovered
+/// video chunk really is the device profile's table-stripped variant)
+/// should invoke [`validate_video_payload_shape`] first and then this
+/// function; the demuxer's hot path invokes neither (it forwards raw
+/// chunk bytes per the container's no-decode contract).
+pub fn validate_video_payload_no_internal_markers(body: &[u8]) -> Result<(), AmvDemuxerError> {
+    if body.len() < 4 {
+        return Err(AmvDemuxerError::InvalidData(format!(
+            "00dc payload must be at least 4 bytes (SOI + EOI), got {}",
+            body.len()
+        )));
+    }
+    // Entropy window: skip the 2-byte SOI at the start and the 2-byte
+    // EOI at the end. The window may be empty for the degenerate
+    // 4-byte payload, in which case there are no bytes to scan.
+    let end_of_entropy = body.len() - 2;
+    let mut i = 2;
+    while i + 1 < end_of_entropy {
+        if body[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let next = body[i + 1];
+        // `FF 00` is byte stuffing (escaped `FF` data byte); `FF FF`
+        // is a fill byte that may legitimately appear between marker
+        // pairs in standard JPEG streams. Both are permitted in the
+        // entropy section.
+        if next == 0x00 || next == 0xFF {
+            i += 2;
+            continue;
+        }
+        return Err(AmvDemuxerError::InvalidData(format!(
+            "00dc payload must carry no internal JPEG markers; \
+             found FF {next:02X} at offset {i}"
+        )));
+    }
+    Ok(())
+}
+
 // ────────────────────────── prelude walker ──────────────────────────
 
 /// Parsed view of the AMV prelude — everything from offset 0 up to the
@@ -1458,6 +1529,167 @@ pub(crate) mod tests {
                 assert!(msg.contains("14"));
             }
             other => panic!("expected InvalidData(EOI), got {other:?}"),
+        }
+    }
+
+    // ── §4a strict-marker validator ─────────────────────────────────
+
+    /// §4a: a bare SOI..EOI bracket with no entropy payload is the
+    /// degenerate empty case — the entropy window is zero bytes wide,
+    /// so the no-internal-marker walker has nothing to scan and
+    /// accepts trivially.
+    #[test]
+    fn no_internal_markers_accepts_empty_entropy_window() {
+        let body = [0xFF, 0xD8, 0xFF, 0xD9];
+        validate_video_payload_no_internal_markers(&body)
+            .expect("4-byte SOI+EOI accepted (no entropy)");
+    }
+
+    /// §4a: the trace's "immediately after SOI the bytes are
+    /// entropy-coded data" — synthesise a SOI..entropy..EOI body
+    /// whose entropy region contains only non-`FF` data bytes. The
+    /// walker accepts it.
+    #[test]
+    fn no_internal_markers_accepts_plain_entropy_bytes() {
+        // From the trace's frame-0 first-bytes example
+        // (`FF D8 E6 49 A6 93 …`): SOI followed by non-FF entropy.
+        let mut body = vec![0xFF, 0xD8, 0xE6, 0x49, 0xA6, 0x93, 0x12, 0x34];
+        body.extend_from_slice(&JPEG_EOI);
+        validate_video_payload_no_internal_markers(&body).expect("non-FF entropy bytes accepted");
+    }
+
+    /// §4a: `FF 00` byte stuffing is permitted — an entropy byte that
+    /// happens to be `0xFF` is escaped by a trailing `0x00`. The
+    /// scanner must skip the pair without flagging it as a marker.
+    #[test]
+    fn no_internal_markers_accepts_byte_stuffed_ff_00() {
+        let mut body = vec![0xFF, 0xD8, 0xAB, 0xFF, 0x00, 0xCD];
+        body.extend_from_slice(&JPEG_EOI);
+        validate_video_payload_no_internal_markers(&body).expect("FF 00 byte stuffing accepted");
+    }
+
+    /// §4a: a `FF FF` fill-byte pair is permitted in the entropy
+    /// window. JPEG allows `0xFF` to repeat as a fill / pad token,
+    /// and the trace does not explicitly forbid it; the scanner
+    /// must skip past the pair without flagging it as a marker.
+    #[test]
+    fn no_internal_markers_accepts_ff_ff_fill() {
+        let mut body = vec![0xFF, 0xD8, 0xAB, 0xFF, 0xFF, 0xCD];
+        body.extend_from_slice(&JPEG_EOI);
+        validate_video_payload_no_internal_markers(&body).expect("FF FF fill bytes accepted");
+    }
+
+    /// §4a: `FF E0` (APP0/JFIF) inside the entropy window MUST be
+    /// rejected — the trace lists APP0 explicitly as a marker that
+    /// the device-stripped bitstream does not carry.
+    #[test]
+    fn no_internal_markers_rejects_app0() {
+        let mut body = vec![0xFF, 0xD8, 0xAB, 0xFF, 0xE0, 0xCD];
+        body.extend_from_slice(&JPEG_EOI);
+        let err = validate_video_payload_no_internal_markers(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("FF E0"), "expected APP0 marker named: {msg}");
+                assert!(
+                    msg.contains("offset 3"),
+                    "expected offset 3 reported: {msg}"
+                );
+            }
+            other => panic!("expected InvalidData(APP0), got {other:?}"),
+        }
+    }
+
+    /// §4a: `FF DB` (DQT — quant-table segment) inside the entropy
+    /// window MUST be rejected. The trace lists DQT explicitly as
+    /// a marker absent from the device-stripped bitstream.
+    #[test]
+    fn no_internal_markers_rejects_dqt() {
+        let mut body = vec![0xFF, 0xD8, 0x00, 0xFF, 0xDB, 0x00];
+        body.extend_from_slice(&JPEG_EOI);
+        let err = validate_video_payload_no_internal_markers(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("FF DB"), "expected DQT marker named: {msg}");
+            }
+            other => panic!("expected InvalidData(DQT), got {other:?}"),
+        }
+    }
+
+    /// §4a: `FF C0` (SOF0 — frame-geometry segment) inside the
+    /// entropy window MUST be rejected.
+    #[test]
+    fn no_internal_markers_rejects_sof0() {
+        let mut body = vec![0xFF, 0xD8, 0x00, 0xFF, 0xC0, 0x00];
+        body.extend_from_slice(&JPEG_EOI);
+        let err = validate_video_payload_no_internal_markers(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("FF C0"), "expected SOF0 marker named: {msg}");
+            }
+            other => panic!("expected InvalidData(SOF0), got {other:?}"),
+        }
+    }
+
+    /// §4a: `FF C4` (DHT — Huffman-table segment) inside the entropy
+    /// window MUST be rejected.
+    #[test]
+    fn no_internal_markers_rejects_dht() {
+        let mut body = vec![0xFF, 0xD8, 0x00, 0xFF, 0xC4, 0x00];
+        body.extend_from_slice(&JPEG_EOI);
+        let err = validate_video_payload_no_internal_markers(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("FF C4"), "expected DHT marker named: {msg}");
+            }
+            other => panic!("expected InvalidData(DHT), got {other:?}"),
+        }
+    }
+
+    /// §4a: `FF DA` (SOS — start-of-scan segment) inside the entropy
+    /// window MUST be rejected.
+    #[test]
+    fn no_internal_markers_rejects_sos() {
+        let mut body = vec![0xFF, 0xD8, 0x00, 0xFF, 0xDA, 0x00];
+        body.extend_from_slice(&JPEG_EOI);
+        let err = validate_video_payload_no_internal_markers(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("FF DA"), "expected SOS marker named: {msg}");
+            }
+            other => panic!("expected InvalidData(SOS), got {other:?}"),
+        }
+    }
+
+    /// §4a: an EOI-style `FF D9` inside the entropy window (i.e. NOT
+    /// the closing bracket) is itself an unexpected marker — the
+    /// trace records exactly one EOI per frame, at `size − 2`.
+    #[test]
+    fn no_internal_markers_rejects_premature_eoi() {
+        let mut body = vec![0xFF, 0xD8, 0xAB, 0xFF, 0xD9, 0xCD];
+        body.extend_from_slice(&JPEG_EOI);
+        let err = validate_video_payload_no_internal_markers(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("FF D9"), "expected premature-EOI named: {msg}");
+                assert!(
+                    msg.contains("offset 3"),
+                    "expected offset 3 reported: {msg}"
+                );
+            }
+            other => panic!("expected InvalidData(premature EOI), got {other:?}"),
+        }
+    }
+
+    /// §4a: a payload shorter than the 4-byte minimum (SOI + EOI) is
+    /// rejected by the strict scanner with the same length error
+    /// shape as the shape validator.
+    #[test]
+    fn no_internal_markers_rejects_short_payload() {
+        let body = [0xFF, 0xD8, 0xFF];
+        let err = validate_video_payload_no_internal_markers(&body).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => assert!(msg.contains("at least 4 bytes")),
+            other => panic!("expected InvalidData(short), got {other:?}"),
         }
     }
 

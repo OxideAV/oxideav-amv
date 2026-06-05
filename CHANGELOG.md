@@ -8,6 +8,29 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4a strict-marker video-payload sentinel — new
+  `validate_video_payload_no_internal_markers` free function (also
+  re-exported at the crate root) that walks the entropy window of a
+  `00dc` chunk body between the SOI and EOI brackets and rejects any
+  `FF xx` marker pair other than the byte-stuffing `FF 00` and the
+  fill-byte `FF FF` variants. Per trace §4a the device-stripped
+  bitstream carries **no** internal JPEG marker segments — no APP0
+  (`FF E0`), no DQT (`FF DB`), no SOF0 (`FF C0`), no DHT (`FF C4`),
+  no SOS (`FF DA`) — because the player splices its hardcoded quant /
+  Huffman tables back in before decoding; the new helper is the
+  strict counterpart of `validate_video_payload_shape` that confirms
+  this invariant explicitly, reporting the offending marker byte and
+  the byte position relative to the start of the chunk body when one
+  is found. Eleven new unit tests cover the empty-entropy-window
+  degenerate accept, the plain-entropy / byte-stuffed / fill-byte
+  accepts, all five named-marker rejects (APP0 / DQT / SOF0 / DHT /
+  SOS) with offset-position reporting, the premature-EOI reject, and
+  the short-payload reject. A real-fixture
+  `comedian_fixture_all_video_chunks_pass_no_internal_markers` test
+  walks the staged `comedian.amv` end-to-end and asserts every one of
+  the 1116 video chunks passes the new strict-marker scan, matching
+  the trace's "first-frame marker scan found only SOI and EOI"
+  observation across every frame in the fixture.
 - §4a video-payload + §4b audio-preamble byte-shape sentinel validators
   — new `validate_video_payload_shape` free function plus
   `AmvAudioPreamble` byte-parser type with its own

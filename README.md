@@ -95,8 +95,16 @@ through the demuxer. `validate_video_payload_shape` confirms a `00dc`
 chunk body satisfies the §4a "self-contained JPEG bracketed by
 SOI..EOI" invariants — `FF D8` at offset 0, `FF D9` at offset
 `size − 2` — and reports the offending byte position when either
-check fails. `AmvAudioPreamble::parse` decodes the 8-byte §4b
-preamble into a `(state, decoded_sample_count)` view, and
+check fails. The companion
+`validate_video_payload_no_internal_markers` enforces the §4a
+strict-marker invariant: the entropy window between SOI and EOI must
+carry **no** internal JPEG marker segments (no APP0 / DQT / SOF0 /
+DHT / SOS), only entropy-coded data with at most `FF 00` byte
+stuffing or `FF FF` fill bytes. Any `FF xx` pair outside those two
+exceptions is reported with the offending marker byte and its byte
+position relative to the chunk-body start. `AmvAudioPreamble::parse`
+decodes the 8-byte §4b preamble into a
+`(state, decoded_sample_count)` view, and
 `AmvAudioPreamble::validate_sentinels` gates strict validation on
 `decoded_sample_count > 0` (the one trace-recorded §4b invariant the
 two observed device profiles both satisfy); the `state` field is
@@ -105,8 +113,9 @@ varying state. The companion exports `JPEG_SOI`, `JPEG_EOI`, and
 `AMV_AUDIO_PREAMBLE_LEN` make the same byte tokens available to
 external tooling that wants to reference them directly. The staged
 `comedian.amv` device file's 1116 video chunks all pass the §4a
-bracket check and its 1116 audio chunks all pass the §4b preamble
-check (verified end-to-end by the test suite).
+bracket check **and** the new §4a strict-marker scan, and its 1116
+audio chunks all pass the §4b preamble check (verified end-to-end by
+the test suite).
 
 For tooling that wants to recompute the `amvh +0x34` packed-byte
 duration independently of the muxer's `write_trailer` patch path —
@@ -151,7 +160,8 @@ probing and the `.amv` extension hint for the read path, and
 The crate also exposes its byte-level parsers as a standalone library
 (`AmvHeader`, `AmvDuration`, `AmvWaveFormat`, `AmvAudioPreamble`,
 `ChunkHeader`, `ChunkKind`, plus the chunk-tag / trailer / JPEG-marker
-constants and the `validate_video_payload_shape` free function) for
+constants and the `validate_video_payload_shape` /
+`validate_video_payload_no_internal_markers` free functions) for
 tooling that wants to inspect AMV files without the framework
 dependency at the demuxer level.
 
