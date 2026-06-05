@@ -129,6 +129,26 @@ a whole-second `u32` for callers that want the trace's worked-example
 arithmetic (comedian 1:33 = 93 s, noel 3:02 = 182 s) without the µs
 detour.
 
+`AmvDuration::from_frame_count(frame_count, fps)` applies the trace §2
+worked example (`frame_count / fps → total_seconds`, then split into
+`[seconds, minutes, hours]`) as a pure function, so the same
+derivation the muxer's `write_trailer` patches in is also available to
+standalone tooling. Components saturate at `u8::MAX` to keep the
+helper infallible, and a zero `fps` short-circuits to the all-zero
+duration rather than dividing by zero. The muxer's `write_trailer`
+now delegates to this helper so the worked-example arithmetic lives
+in exactly one place. `comedian.amv`'s 1116 video chunks at 12 fps
+round-trip exactly to the device-written `0x0000_0121`;
+`noel-son-lumiere.amv`'s 2928 chunks at 16 fps round to `0x0000_0303`
+(3:03) — one second past the device-written `0x0000_0302` (3:02),
+which carries the source clip's original duration. The companion
+`AmvDuration::is_consistent_with_frame_count(frame_count, fps)` is
+the cross-checking validator that compares a parsed header's
+duration against an observed chunk count: it returns `true` on the
+comedian (matching) pair and `false` on the noel (off-by-one) pair,
+exactly the header-vs-chunk-count discrepancy a truncation-recovery
+pass needs to surface.
+
 Frame and sample **decoding** are out of scope — the video stream is declared
 as the `mjpeg` codec id (the actual JPEG payload requires the player's stripped
 quant / Huffman tables to be spliced back in, which a downstream codec

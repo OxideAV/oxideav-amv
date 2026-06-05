@@ -251,15 +251,16 @@ impl Muxer for AmvMuxer {
             .map_err(|e| Error::other(format!("amv: write trailer: {e}")))?;
         // Patch the `amvh` packed duration from the accumulated video
         // frame count (§2 worked example: 1116 frames ÷ 12 fps = 93 s
-        // → 0x21 0x01 0x00 0x00). If `fps` is zero something earlier
-        // would have rejected the open; guard anyway to avoid division
-        // by zero.
+        // → 0x21 0x01 0x00 0x00). Delegated to
+        // [`crate::parse::AmvDuration::from_frame_count`] so the
+        // tooling-facing helper and the muxer's write path apply the
+        // same derivation; the helper guards a zero `fps` internally
+        // but a zero rate would have been rejected at `open` so this
+        // branch only runs once both inputs are non-zero.
         if self.fps > 0 && self.video_frame_count > 0 {
-            let total_seconds = self.video_frame_count / self.fps as u64;
-            let hours = (total_seconds / 3600).min(u8::MAX as u64) as u8;
-            let minutes = ((total_seconds % 3600) / 60) as u8;
-            let seconds = (total_seconds % 60) as u8;
-            let packed = pack_duration(seconds, minutes, hours);
+            let packed =
+                crate::parse::AmvDuration::from_frame_count(self.video_frame_count, self.fps)
+                    .to_packed();
             self.writer
                 .seek(SeekFrom::Start(AMVH_DURATION_FILE_OFFSET))
                 .map_err(|e| Error::other(format!("amv: seek to amvh duration: {e}")))?;
@@ -364,6 +365,13 @@ pub(crate) fn build_prelude_bytes(
 
 /// Pack `(seconds, minutes, hours)` into the little-endian u32 written
 /// at `amvh +0x34` per §2: bytes laid out `[seconds, minutes, hours, 0]`.
+///
+/// Test-only helper retained for the lower-level fixture-builder paths
+/// in `tests`; the production write path delegates to
+/// [`crate::parse::AmvDuration::from_frame_count`] (and that public
+/// helper's `to_packed`) so the worked-example arithmetic lives in
+/// exactly one place.
+#[cfg(test)]
 fn pack_duration(seconds: u8, minutes: u8, hours: u8) -> u32 {
     u32::from_le_bytes([seconds, minutes, hours, 0])
 }

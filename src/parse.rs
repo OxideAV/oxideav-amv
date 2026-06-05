@@ -260,6 +260,70 @@ impl AmvDuration {
     pub fn total_seconds(&self) -> u32 {
         self.hours as u32 * 3600 + self.minutes as u32 * 60 + self.seconds as u32
     }
+
+    /// Derive an `AmvDuration` from an observed video-chunk count and
+    /// the §2 `fps` field, applying the worked example the trace records
+    /// for `comedian.amv`: "1116 frames ÷ 12 fps = 93 s = 1:33".
+    ///
+    /// Implementation: `total_seconds = frame_count / fps`, then break
+    /// that out into `[seconds, minutes, hours]` using whole-minute /
+    /// whole-hour division so the result re-packs (via
+    /// [`Self::to_packed`]) into the same little-endian dword the
+    /// device writes at `amvh +0x34` — `0x0000_0121` for the comedian
+    /// profile, `0x0000_0302` for the noel profile. Components saturate
+    /// at [`u8::MAX`] to keep the function infallible; the field's
+    /// per-component byte width means the maximum representable
+    /// duration is `255 h 59 min 59 s = 921 599 s`, well above the
+    /// two observed fixtures (93 s and 182 s).
+    ///
+    /// Returns the all-zero duration (`seconds = minutes = hours = 0`)
+    /// when `fps == 0` — the trace records `fps > 0` for every device
+    /// profile observed, so a zero rate is rejected at higher layers
+    /// (e.g. [`AmvHeader::validate_sentinels`]); this guard exists only
+    /// so the helper itself stays division-by-zero-safe.
+    ///
+    /// Useful for tooling that wants to recompute the `amvh +0x34`
+    /// packed-byte duration independently of the muxer's
+    /// `write_trailer` patch path — for example, when re-stamping a
+    /// recovered truncated file's header after the surviving chunk
+    /// count has been determined.
+    pub fn from_frame_count(frame_count: u64, fps: u32) -> Self {
+        if fps == 0 {
+            return Self {
+                seconds: 0,
+                minutes: 0,
+                hours: 0,
+            };
+        }
+        let total_seconds = frame_count / fps as u64;
+        let hours = (total_seconds / 3600).min(u8::MAX as u64) as u8;
+        let after_hours = total_seconds.saturating_sub(hours as u64 * 3600);
+        let minutes = (after_hours / 60).min(u8::MAX as u64) as u8;
+        let seconds = (after_hours % 60).min(u8::MAX as u64) as u8;
+        Self {
+            seconds,
+            minutes,
+            hours,
+        }
+    }
+
+    /// Cross-check the parsed `[seconds, minutes, hours]` triple against
+    /// an observed video-chunk count and the §2 `fps` field, using the
+    /// same derivation the trace's worked example applies to the
+    /// comedian fixture: "1116 frames ÷ 12 fps = 93 s = 1:33". Returns
+    /// `true` when `self == AmvDuration::from_frame_count(frame_count,
+    /// fps)` and `false` otherwise.
+    ///
+    /// Provided so tooling that has both a parsed `amvh` header and a
+    /// completed `movi` walk (e.g. after a truncation-recovery pass)
+    /// can confirm the header's packed duration is consistent with the
+    /// chunks that actually landed without re-implementing the
+    /// derivation. Returns `false` when `fps == 0` unless `self` is
+    /// also the all-zero duration, mirroring [`Self::from_frame_count`]'s
+    /// zero-fps guard.
+    pub fn is_consistent_with_frame_count(&self, frame_count: u64, fps: u32) -> bool {
+        *self == Self::from_frame_count(frame_count, fps)
+    }
 }
 
 /// Decoded view of the audio `WAVEFORMATEX` (§3b). All multi-byte
@@ -1467,6 +1531,136 @@ pub(crate) mod tests {
     fn duration_total_seconds_matches_noel() {
         let d = AmvDuration::from_packed(0x0000_0302);
         assert_eq!(d.total_seconds(), 3 * 60 + 2);
+    }
+
+    // ── §2 frame-count derivation helpers ─────────────────────────
+
+    /// §2 worked example: comedian.amv has 1116 video chunks at 12 fps
+    /// → 1116 / 12 = 93 s = 1:33 → `0x0000_0121`. `from_frame_count`
+    /// must reproduce the packed bytes the device wrote at `amvh
+    /// +0x34` from the chunk count alone.
+    #[test]
+    fn duration_from_frame_count_matches_comedian_worked_example() {
+        let d = AmvDuration::from_frame_count(1116, 12);
+        assert_eq!(d.seconds, 0x21);
+        assert_eq!(d.minutes, 0x01);
+        assert_eq!(d.hours, 0x00);
+        assert_eq!(d.to_packed(), 0x0000_0121);
+    }
+
+    /// §2 worked example: noel-son-lumiere.amv has 2928 video chunks at
+    /// 16 fps → 2928 / 16 = 183 s = 3:03. The trace records its packed
+    /// duration as `0x0000_0302` (3:02) because the original 3:02
+    /// source clip was transcoded into 2928 video chunks at 16 fps,
+    /// which lands the integer-divided duration one second past the
+    /// source's stated 3:02. This test pins the *derivation*
+    /// (`from_frame_count`) rather than the parsed header value so the
+    /// helper's arithmetic is locked to the trace's documented
+    /// behaviour — that the muxer applies whole-second flooring of
+    /// `frame_count / fps`. The cross-check test below confirms the
+    /// `is_consistent_with_frame_count` helper rejects the off-by-one.
+    #[test]
+    fn duration_from_frame_count_floors_whole_seconds_for_noel_chunks() {
+        let d = AmvDuration::from_frame_count(2928, 16);
+        // 2928 / 16 = 183 s = 3 min 3 s
+        assert_eq!(d.seconds, 3);
+        assert_eq!(d.minutes, 3);
+        assert_eq!(d.hours, 0);
+    }
+
+    /// `from_frame_count` rolls past one hour into the `hours`
+    /// component. 60 min × 12 fps × 60 s/min = 43200 frames at 12 fps
+    /// = 3600 s = 1 h 0 m 0 s.
+    #[test]
+    fn duration_from_frame_count_rolls_into_hours_component() {
+        let d = AmvDuration::from_frame_count(43_200, 12);
+        assert_eq!(d.seconds, 0);
+        assert_eq!(d.minutes, 0);
+        assert_eq!(d.hours, 1);
+    }
+
+    /// §2 zero-fps guard: `from_frame_count` returns the all-zero
+    /// duration when `fps == 0` instead of dividing by zero. Higher
+    /// layers (`AmvHeader::validate_sentinels`) reject `fps == 0`
+    /// outright; this guard exists only so the helper itself stays
+    /// infallible.
+    #[test]
+    fn duration_from_frame_count_returns_zero_for_zero_fps() {
+        let d = AmvDuration::from_frame_count(1116, 0);
+        assert_eq!(d.seconds, 0);
+        assert_eq!(d.minutes, 0);
+        assert_eq!(d.hours, 0);
+    }
+
+    /// `from_frame_count` saturates at `255 h` when the computed hours
+    /// component overflows a `u8`. 256 h × 3600 s/h × 1 fps = 921 600
+    /// frames; the resulting duration clamps `hours` to 255.
+    #[test]
+    fn duration_from_frame_count_saturates_hours_component() {
+        let d = AmvDuration::from_frame_count(256 * 3600, 1);
+        assert_eq!(d.hours, u8::MAX);
+    }
+
+    /// `is_consistent_with_frame_count` accepts the §2 comedian
+    /// worked-example pair (1116 frames, 12 fps) when the duration was
+    /// parsed from the device-written `0x0000_0121` packed bytes.
+    #[test]
+    fn duration_is_consistent_accepts_comedian_pair() {
+        let d = AmvDuration::from_packed(0x0000_0121);
+        assert!(d.is_consistent_with_frame_count(1116, 12));
+    }
+
+    /// `is_consistent_with_frame_count` rejects the off-by-one mismatch
+    /// the noel-son-lumiere.amv profile exhibits: the parsed header
+    /// reads `0x0000_0302` (3:02, matching the source clip's stated
+    /// duration) but the file carries 2928 chunks at 16 fps which
+    /// integer-divides to 3:03. The helper's job is to surface exactly
+    /// this kind of header-vs-chunk-count discrepancy.
+    #[test]
+    fn duration_is_consistent_rejects_noel_header_vs_chunk_count_mismatch() {
+        let parsed = AmvDuration::from_packed(0x0000_0302);
+        assert!(!parsed.is_consistent_with_frame_count(2928, 16));
+    }
+
+    /// `is_consistent_with_frame_count` rejects the comedian profile
+    /// when the supplied frame count is one short of the recorded
+    /// 1116 — the truncation case the helper is designed to catch.
+    #[test]
+    fn duration_is_consistent_rejects_one_short_of_comedian() {
+        let parsed = AmvDuration::from_packed(0x0000_0121);
+        // 1115 / 12 = 92 s → seconds=32 min=1, mismatching parsed (33,1).
+        assert!(!parsed.is_consistent_with_frame_count(1115, 12));
+    }
+
+    /// `is_consistent_with_frame_count` returns `false` when `fps == 0`
+    /// unless the parsed duration is also the all-zero triple,
+    /// mirroring `from_frame_count`'s zero-fps guard.
+    #[test]
+    fn duration_is_consistent_zero_fps_only_matches_zero_duration() {
+        let zero = AmvDuration::from_packed(0);
+        assert!(zero.is_consistent_with_frame_count(0, 0));
+        assert!(zero.is_consistent_with_frame_count(1116, 0));
+        let nonzero = AmvDuration::from_packed(0x0000_0121);
+        assert!(!nonzero.is_consistent_with_frame_count(1116, 0));
+    }
+
+    /// `from_frame_count` followed by `to_packed` reproduces the
+    /// little-endian dword the device wrote for both fixtures' frame
+    /// counts (comedian 1116 / 12 fps → `0x0000_0121`; noel 2928 / 16
+    /// fps → `0x0000_0303` — note the device's stored `0x0302` is the
+    /// trace-recorded source-clip duration, not the integer-divided
+    /// chunk-count derivation, which is exactly the discrepancy
+    /// `is_consistent_with_frame_count` is designed to surface).
+    #[test]
+    fn duration_from_frame_count_then_to_packed_round_trips() {
+        assert_eq!(
+            AmvDuration::from_frame_count(1116, 12).to_packed(),
+            0x0000_0121
+        );
+        assert_eq!(
+            AmvDuration::from_frame_count(2928, 16).to_packed(),
+            0x0000_0303
+        );
     }
 
     // ── §4a video payload shape validator ──────────────────────────

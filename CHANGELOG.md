@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §2 frame-count → packed-duration helpers — new
+  `AmvDuration::from_frame_count(frame_count, fps)` constructor and
+  companion `AmvDuration::is_consistent_with_frame_count(frame_count,
+  fps)` cross-check, both surfaced on the existing public
+  `AmvDuration` byte parser. `from_frame_count` applies the trace §2
+  worked example as a pure function: `total_seconds = frame_count /
+  fps`, then split into `[seconds, minutes, hours]` with each
+  component saturating at `u8::MAX`. Reproduces `comedian.amv`'s
+  device-written `0x0000_0121` (1116 chunks ÷ 12 fps → 1:33) exactly
+  when round-tripped through `to_packed`. `is_consistent_with_frame_count`
+  returns `true` when the receiver matches what `from_frame_count`
+  would produce for the supplied `(frame_count, fps)` pair, and
+  `false` on a mismatch — surfacing exactly the header-vs-chunk-count
+  discrepancy a truncation-recovery pass needs to catch. Worked
+  example: the comedian profile passes `(1116, 12)` and fails
+  `(1115, 12)`; the noel profile fails `(2928, 16)` because the
+  device-written header records the source clip's 3:02 duration
+  (`0x0000_0302`) but the chunk count would integer-divide to 3:03
+  (`0x0000_0303`). Both helpers guard a zero `fps` so they stay
+  infallible without recreating the higher-level sentinel rejection.
+  Nine new unit tests cover the comedian round-trip, the noel
+  flooring behaviour, the hours-component roll-over, the
+  zero-fps short-circuit, the `u8::MAX` hours saturation, the
+  consistent-comedian accept, the noel-mismatch reject, the
+  one-short-of-comedian reject, the zero-fps-only-matches-zero
+  case, and the `from_frame_count`-then-`to_packed` round-trip for
+  both fixtures' chunk counts. The muxer's `write_trailer`
+  duration-patch path is refactored to delegate to
+  `AmvDuration::from_frame_count`, so the worked-example arithmetic
+  is recorded in exactly one place (the public byte-parser API) and
+  the existing mux → demux round-trip test still patches in the
+  expected `0x0000_0121` for the comedian fixture's 1116 frames at
+  12 fps.
+
 - §4a strict-marker video-payload sentinel — new
   `validate_video_payload_no_internal_markers` free function (also
   re-exported at the crate root) that walks the entropy window of a
