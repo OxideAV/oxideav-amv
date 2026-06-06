@@ -129,6 +129,20 @@ a whole-second `u32` for callers that want the trace's worked-example
 arithmetic (comedian 1:33 = 93 s, noel 3:02 = 182 s) without the µs
 detour.
 
+For tooling that wants to verify a per-block audio sample count is
+consistent with the stream's frame-interval budget, the new
+`AmvWaveFormat::frame_interval_samples(fps) -> u32` typed accessor
+exposes the trace §4b worked-example arithmetic
+(`nSamplesPerSec ÷ fps`, integer truncation) — the comedian profile
+returns `1837` for 12 fps, matching the device-written first-block
+sample count exactly. The companion
+`AmvAudioPreamble::is_consistent_with_frame_interval(samples_per_sec,
+fps)` is the cross-checking validator: it returns `true` when the
+parsed §4b preamble's `decoded_sample_count` equals the integer-division
+budget and `false` otherwise — surfacing exactly the per-block
+sample-count discrepancy a recovered-from-truncation pass needs to
+flag.
+
 `AmvDuration::from_frame_count(frame_count, fps)` applies the trace §2
 worked example (`frame_count / fps → total_seconds`, then split into
 `[seconds, minutes, hours]`) as a pure function, so the same

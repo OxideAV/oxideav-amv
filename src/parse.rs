@@ -447,6 +447,31 @@ impl AmvWaveFormat {
         }
         Ok(())
     }
+
+    /// Per-frame-interval audio sample budget the trace's §4b worked
+    /// example records — `nSamplesPerSec ÷ fps`, integer truncation.
+    ///
+    /// The trace records the §4b first audio block of `comedian.amv`
+    /// carries `decoded_sample_count = 1837` and notes that this matches
+    /// `22 050 Hz ÷ 12 fps ≈ 1837` mono samples — i.e. each `01wb` block
+    /// holds exactly one video-frame-interval worth of audio under the
+    /// §4 strict 1:1 video-first interleave rule. This helper exposes
+    /// that derivation as a pure function so tooling that has already
+    /// parsed the audio `WAVEFORMATEX` (§3b) and the §2 `fps` can
+    /// reproduce the budget without re-implementing the arithmetic, and
+    /// so [`AmvAudioPreamble::is_consistent_with_frame_interval`] can
+    /// share the exact same computation.
+    ///
+    /// Returns `0` when `fps == 0` to keep the helper division-by-zero
+    /// safe; the trace records `fps > 0` for every device profile
+    /// observed, so the zero rate is rejected upstream by
+    /// [`AmvHeader::validate_sentinels`].
+    pub fn frame_interval_samples(&self, fps: u32) -> u32 {
+        if fps == 0 {
+            return 0;
+        }
+        self.samples_per_sec / fps
+    }
 }
 
 /// Identifies which leaf-chunk tag was seen.
@@ -594,6 +619,41 @@ impl AmvAudioPreamble {
             ));
         }
         Ok(())
+    }
+
+    /// Cross-check the parsed preamble's `decoded_sample_count` against
+    /// the §4b worked-example frame-interval sample budget derived from
+    /// the §3b audio `WAVEFORMATEX` `nSamplesPerSec` and the §2 `fps`.
+    ///
+    /// Per the trace's §4b worked example, the comedian device profile's
+    /// first audio block carries `decoded_sample_count = 1837 =
+    /// 22_050 ÷ 12` — each `01wb` block holds exactly one
+    /// video-frame-interval of audio under the §4 strict 1:1 video-first
+    /// interleave rule. This helper returns `true` when the parsed
+    /// `decoded_sample_count` matches that integer-division budget
+    /// exactly (i.e. `samples_per_sec / fps`) and `false` otherwise.
+    ///
+    /// The integer-truncation comparison reflects the trace's exact
+    /// recorded value (`1837`, not `1837.5`); callers that want a
+    /// tolerance for the occasional `+1` block can compare
+    /// `decoded_sample_count.abs_diff(format.frame_interval_samples(fps))`
+    /// against their own threshold instead.
+    ///
+    /// Returns `false` when `fps == 0` (matching the
+    /// [`AmvWaveFormat::frame_interval_samples`] zero-fps guard, which
+    /// short-circuits to `0`) unless the parsed sample count is also
+    /// `0` — which on its own is already rejected by
+    /// [`Self::validate_sentinels`].
+    ///
+    /// Useful for tooling that wants to confirm a per-block sample count
+    /// is consistent with the stream's frame-interval budget without
+    /// re-implementing the §4b derivation — for example, to flag a
+    /// recovered truncated chunk whose preamble was clipped mid-write.
+    pub fn is_consistent_with_frame_interval(&self, samples_per_sec: u32, fps: u32) -> bool {
+        if fps == 0 {
+            return self.decoded_sample_count == 0;
+        }
+        self.decoded_sample_count == samples_per_sec / fps
     }
 }
 
@@ -1974,6 +2034,136 @@ pub(crate) mod tests {
         };
         p.validate_sentinels()
             .expect("non-zero state must not gate sentinel validation");
+    }
+
+    // ── §4b ↔ §3b ↔ §2 frame-interval cross-check helpers ──────────
+
+    /// `AmvWaveFormat::frame_interval_samples` reproduces the trace's
+    /// §4b worked example exactly: 22 050 Hz ÷ 12 fps = 1837 — the
+    /// comedian first audio block's `decoded_sample_count`.
+    #[test]
+    fn waveformat_frame_interval_samples_matches_comedian_worked_example() {
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 44_100,
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        assert_eq!(fmt.frame_interval_samples(12), 1837);
+    }
+
+    /// Cross-rate coverage — 22 050 Hz ÷ 16 fps = 1378 (the noel
+    /// profile's expected per-block budget under the §4 1:1 interleave).
+    #[test]
+    fn waveformat_frame_interval_samples_matches_noel_worked_example() {
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 44_100,
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        assert_eq!(fmt.frame_interval_samples(16), 1378);
+    }
+
+    /// `frame_interval_samples` short-circuits to `0` on `fps == 0`
+    /// rather than dividing by zero.
+    #[test]
+    fn waveformat_frame_interval_samples_returns_zero_when_fps_is_zero() {
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 44_100,
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        assert_eq!(fmt.frame_interval_samples(0), 0);
+    }
+
+    /// `AmvAudioPreamble::is_consistent_with_frame_interval` returns
+    /// `true` on the trace's §4b worked example: comedian's first block
+    /// holds `decoded_sample_count = 1837`, matching `22 050 ÷ 12`.
+    #[test]
+    fn audio_preamble_consistent_with_comedian_frame_interval() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert!(p.is_consistent_with_frame_interval(22_050, 12));
+    }
+
+    /// Cross-rate coverage — the noel profile's expected first-block
+    /// budget is `22 050 ÷ 16 = 1378`.
+    #[test]
+    fn audio_preamble_consistent_with_noel_frame_interval() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1378,
+        };
+        assert!(p.is_consistent_with_frame_interval(22_050, 16));
+    }
+
+    /// A preamble whose `decoded_sample_count` mismatches the frame
+    /// interval budget (here, the noel block claiming the comedian
+    /// budget) reports inconsistent.
+    #[test]
+    fn audio_preamble_consistent_rejects_mismatched_sample_count() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert!(!p.is_consistent_with_frame_interval(22_050, 16));
+    }
+
+    /// `fps == 0` is gated to `false` unless the sample count is also
+    /// `0` (matching the `frame_interval_samples` zero-fps short-circuit).
+    #[test]
+    fn audio_preamble_consistent_handles_zero_fps() {
+        let p_nonzero = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert!(!p_nonzero.is_consistent_with_frame_interval(22_050, 0));
+
+        let p_zero = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 0,
+        };
+        assert!(p_zero.is_consistent_with_frame_interval(22_050, 0));
+    }
+
+    /// End-to-end derivation cross-check: a preamble whose
+    /// `decoded_sample_count` matches `format.frame_interval_samples(fps)`
+    /// must satisfy `is_consistent_with_frame_interval(format.samples_per_sec,
+    /// fps)`. This pins the two helpers' arithmetic against each other.
+    #[test]
+    fn audio_preamble_consistent_matches_waveformat_helper() {
+        let fmt = AmvWaveFormat {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec: 22_050,
+            avg_bytes_per_sec: 44_100,
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 0,
+        };
+        for fps in [12, 16, 24, 30] {
+            let p = AmvAudioPreamble {
+                state: 0,
+                decoded_sample_count: fmt.frame_interval_samples(fps),
+            };
+            assert!(
+                p.is_consistent_with_frame_interval(fmt.samples_per_sec, fps),
+                "fps={fps} must round-trip via frame_interval_samples"
+            );
+        }
     }
 
     /// Helper: assemble a minimal but byte-correct AMV prelude (from

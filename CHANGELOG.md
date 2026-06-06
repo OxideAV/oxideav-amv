@@ -8,6 +8,27 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4b ↔ §3b ↔ §2 frame-interval cross-check helpers — new
+  `AmvWaveFormat::frame_interval_samples(fps) -> u32` typed accessor
+  exposes the trace §4b worked-example sample budget per frame interval
+  (`nSamplesPerSec ÷ fps`, integer truncation), reproducing the trace's
+  recorded `22 050 ÷ 12 = 1837` mono-sample count for the comedian
+  device profile's first audio block (and `22 050 ÷ 16 = 1378` for the
+  noel profile). Companion
+  `AmvAudioPreamble::is_consistent_with_frame_interval(samples_per_sec, fps)`
+  cross-checks a parsed §4b preamble's `decoded_sample_count` against
+  that derivation — `true` when the per-block sample count matches
+  the integer-division budget exactly, `false` otherwise. Useful for
+  tooling that wants to confirm a per-block sample count is consistent
+  with the stream's frame-interval budget without re-implementing the
+  §4b derivation — e.g. flagging a recovered truncated chunk whose
+  preamble was clipped mid-write. Both helpers guard a zero `fps` so
+  they stay infallible: `frame_interval_samples` short-circuits to
+  `0`, and `is_consistent_with_frame_interval` only returns `true` on
+  zero fps when the parsed sample count is also `0`. End-to-end test
+  pins both helpers' arithmetic against each other across four fps
+  values (12 / 16 / 24 / 30).
+
 - §2 frame-count → packed-duration helpers — new
   `AmvDuration::from_frame_count(frame_count, fps)` constructor and
   companion `AmvDuration::is_consistent_with_frame_count(frame_count,
