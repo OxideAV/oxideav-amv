@@ -8,6 +8,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4 strict 1:1 video-first interleave validator — new
+  `validate_movi_interleave` free function (also re-exported at the
+  crate root) that walks a `&[ChunkKind]` sequence and confirms the
+  trace doc's §4 invariants: even-indexed chunks carry `00dc` video
+  frames, odd-indexed chunks carry `01wb` audio blocks, the total
+  count is even, and no chunk falls outside the observed
+  `00dc` / `01wb` tag set. Per trace §4 every observed `.amv` file's
+  `movi` payload follows this rigid 1:1 pairing rule —
+  `comedian.amv` carries `1116 + 1116 = 2232` chunks,
+  `noel-son-lumiere.amv` carries `2928 + 2928 = 5856` chunks, and
+  the byte walk advances `8 + size` per chunk for the entire
+  sequence under the rigid pattern. Failures report the first
+  offending chunk position and the structural rule that was
+  violated (audio-first first chunk, two consecutive videos / two
+  consecutive audios, trailing unpaired video, or an out-of-set
+  tag with the four tag bytes echoed). Useful for tooling that
+  wants to confirm a recovered / extracted chunk sequence follows
+  the device profile's strict pairing rule — for example, to flag
+  a truncated file whose final video chunk has no following audio
+  block, or a corrupted file with an unexpected non-`00dc`/`01wb`
+  tag inside `movi`. Nine new unit tests cover the empty-slice
+  accept, the smallest-valid-pair accept, the three-pair
+  alternation accept, the audio-first reject naming `#0`, the
+  consecutive-videos reject naming `#1`, the consecutive-audios
+  reject naming `#2`, the trailing-unpaired-video reject naming
+  the missing-trailing-audio condition, the `Other(_)` tag reject
+  echoing the four tag bytes, and a worked-example
+  `comedian.amv`-size 2232-chunk accept that mirrors the trace's
+  end-to-end alternation count exactly. The demuxer's hot path
+  does not invoke this check (it forwards chunks as packets per
+  the container's no-decode contract); strictness is opt-in.
+
 - `cargo-fuzz` harness under [`fuzz/`](./fuzz/) with two panic-free
   targets covering the parse + demuxer-open public surface.
   - `parse` exercises every public byte parser (`AmvHeader::parse`,

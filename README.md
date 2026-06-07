@@ -143,6 +143,22 @@ budget and `false` otherwise — surfacing exactly the per-block
 sample-count discrepancy a recovered-from-truncation pass needs to
 flag.
 
+The §4 strict 1:1 video-first interleave invariant — the trace's
+recorded pattern that every observed `.amv` file's `movi` payload is
+a flat stream of `00dc` video frames at even positions paired with
+`01wb` audio blocks at odd positions, with every video paired with
+exactly one audio block — is exposed as a `validate_movi_interleave`
+free function over a `&[ChunkKind]` sequence. Failures name the first
+offending chunk position and the rule that was violated
+(audio-first first chunk, two consecutive videos or audios, trailing
+unpaired video for the missing-audio-block case, or an out-of-set
+tag with the four bytes echoed). Useful for tooling that wants to
+confirm a recovered / extracted chunk sequence follows the device
+profile's rigid pairing rule — for example, to flag a truncated
+file whose final video chunk has no following audio block. The
+2232-chunk pattern (`comedian.amv`'s 1116 + 1116 paired chunks)
+passes end-to-end through the validator.
+
 `AmvDuration::from_frame_count(frame_count, fps)` applies the trace §2
 worked example (`frame_count / fps → total_seconds`, then split into
 `[seconds, minutes, hours]`) as a pure function, so the same
@@ -217,9 +233,10 @@ The crate also exposes its byte-level parsers as a standalone library
 (`AmvHeader`, `AmvDuration`, `AmvWaveFormat`, `AmvAudioPreamble`,
 `ChunkHeader`, `ChunkKind`, plus the chunk-tag / trailer / JPEG-marker
 constants and the `validate_video_payload_shape` /
-`validate_video_payload_no_internal_markers` free functions) for
-tooling that wants to inspect AMV files without the framework
-dependency at the demuxer level.
+`validate_video_payload_no_internal_markers` /
+`validate_movi_interleave` free functions) for tooling that wants to
+inspect AMV files without the framework dependency at the demuxer
+level.
 
 ## Provenance
 

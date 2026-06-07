@@ -777,6 +777,89 @@ pub fn validate_video_payload_no_internal_markers(body: &[u8]) -> Result<(), Amv
     Ok(())
 }
 
+/// Strict §4 interleave invariant — confirm a sequence of observed
+/// [`ChunkKind`]s walked out of the `movi` payload follows the trace's
+/// recorded **strict 1:1 alternation, video-first** rule.
+///
+/// Per trace §4 every observed `.amv` file's `movi` payload is a flat
+/// stream of `00dc` (video) / `01wb` (audio) leaf chunks under a rigid
+/// pairing rule:
+///
+/// * Even-indexed chunks (`0`, `2`, `4`, …) carry `00dc` video frames.
+/// * Odd-indexed chunks (`1`, `3`, `5`, …) carry `01wb` audio blocks.
+/// * Each video frame is paired with exactly one audio block, so the
+///   total chunk count is **even** — `comedian.amv` carries
+///   `1116 + 1116 = 2232` chunks, `noel-son-lumiere.amv` carries
+///   `2928 + 2928 = 5856` chunks.
+///
+/// This helper walks the supplied slice and returns:
+///
+/// * `Ok(())` when the sequence satisfies all three invariants: the
+///   length is even, even positions are [`ChunkKind::Video`], odd
+///   positions are [`ChunkKind::Audio`].
+/// * `Err(AmvDemuxerError::InvalidData)` naming the first offending
+///   chunk position and what was found there when the invariant fails.
+///   A trailing unpaired video chunk (odd-length sequence ending with
+///   `Video`) is reported as a missing audio chunk at the would-be
+///   audio position.
+///
+/// An empty slice returns `Ok(())` — an empty `movi` payload has no
+/// pairs to break.
+///
+/// `ChunkKind::Other(_)` is rejected at the offending position with
+/// the tag bytes reported, since the trace records `00dc` and `01wb`
+/// as the only tags observed inside `movi`.
+///
+/// Useful for tooling that wants to confirm a recovered / extracted
+/// chunk sequence follows the device profile's rigid pairing rule —
+/// for example, to flag a truncated file whose final video chunk has
+/// no following audio block (the trace's worked example shows
+/// `comedian.amv`'s walk ends 8 bytes before EOF on the trailer, with
+/// the final chunk being an `01wb`, so a §4-conforming non-truncated
+/// file must always end on an audio chunk). The demuxer's hot path
+/// does not invoke this check (it forwards chunks as packets per the
+/// container's no-decode contract); strictness is opt-in.
+pub fn validate_movi_interleave(chunks: &[ChunkKind]) -> Result<(), AmvDemuxerError> {
+    for (i, chunk) in chunks.iter().enumerate() {
+        // Per §4: video on even positions, audio on odd positions.
+        let expected_is_video = i % 2 == 0;
+        match (chunk, expected_is_video) {
+            (ChunkKind::Video, true) | (ChunkKind::Audio, false) => continue,
+            (ChunkKind::Video, false) => {
+                return Err(AmvDemuxerError::InvalidData(format!(
+                    "movi chunk #{i} must be audio (01wb) per §4 strict \
+                     1:1 alternation, got video (00dc)"
+                )));
+            }
+            (ChunkKind::Audio, true) => {
+                return Err(AmvDemuxerError::InvalidData(format!(
+                    "movi chunk #{i} must be video (00dc) per §4 strict \
+                     1:1 video-first alternation, got audio (01wb)"
+                )));
+            }
+            (ChunkKind::Other(tag), _) => {
+                return Err(AmvDemuxerError::InvalidData(format!(
+                    "movi chunk #{i} must be 00dc or 01wb per §4 \
+                     observed-tag set, got {:02X} {:02X} {:02X} {:02X}",
+                    tag[0], tag[1], tag[2], tag[3]
+                )));
+            }
+        }
+    }
+    // §4 strict 1:1 pairing rule: every video must have a paired audio
+    // block, so the total count is even — an odd-length sequence ending
+    // on a video chunk has a missing trailing audio block.
+    if chunks.len() % 2 != 0 {
+        return Err(AmvDemuxerError::InvalidData(format!(
+            "movi chunk count must be even per §4 strict 1:1 pairing rule, \
+             got {} chunks (missing trailing audio at #{})",
+            chunks.len(),
+            chunks.len()
+        )));
+    }
+    Ok(())
+}
+
 // ────────────────────────── prelude walker ──────────────────────────
 
 /// Parsed view of the AMV prelude — everything from offset 0 up to the
@@ -2164,6 +2247,125 @@ pub(crate) mod tests {
                 "fps={fps} must round-trip via frame_interval_samples"
             );
         }
+    }
+
+    /// §4 strict 1:1 video-first alternation — empty slice accepted
+    /// (no pairs to break).
+    #[test]
+    fn validate_movi_interleave_accepts_empty() {
+        validate_movi_interleave(&[]).expect("empty movi must pass");
+    }
+
+    /// §4: smallest valid pair (one video, one audio) is accepted.
+    #[test]
+    fn validate_movi_interleave_accepts_single_pair() {
+        let chunks = [ChunkKind::Video, ChunkKind::Audio];
+        validate_movi_interleave(&chunks).expect("single video+audio pair must pass");
+    }
+
+    /// §4: device-profile interleave (3 video/audio pairs alternating)
+    /// must be accepted. Mirrors the §4 worked-example pattern.
+    #[test]
+    fn validate_movi_interleave_accepts_three_pairs() {
+        let chunks = [
+            ChunkKind::Video,
+            ChunkKind::Audio,
+            ChunkKind::Video,
+            ChunkKind::Audio,
+            ChunkKind::Video,
+            ChunkKind::Audio,
+        ];
+        validate_movi_interleave(&chunks).expect("3-pair alternation must pass");
+    }
+
+    /// §4: first chunk being audio (not video-first) is rejected at
+    /// position 0.
+    #[test]
+    fn validate_movi_interleave_rejects_audio_first() {
+        let chunks = [ChunkKind::Audio, ChunkKind::Video];
+        let err = validate_movi_interleave(&chunks).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("must be video") && msg.contains("#0"),
+            "first-chunk-is-audio error must name #0 and 'must be video', got {msg}"
+        );
+    }
+
+    /// §4: two consecutive videos (missing audio between them) rejected
+    /// at the second video's position.
+    #[test]
+    fn validate_movi_interleave_rejects_consecutive_videos() {
+        let chunks = [ChunkKind::Video, ChunkKind::Video, ChunkKind::Audio];
+        let err = validate_movi_interleave(&chunks).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("must be audio") && msg.contains("#1"),
+            "consecutive-videos must name #1 and 'must be audio', got {msg}"
+        );
+    }
+
+    /// §4: two consecutive audios (missing video between them) rejected
+    /// at the second audio's position.
+    #[test]
+    fn validate_movi_interleave_rejects_consecutive_audios() {
+        let chunks = [
+            ChunkKind::Video,
+            ChunkKind::Audio,
+            ChunkKind::Audio,
+            ChunkKind::Video,
+        ];
+        let err = validate_movi_interleave(&chunks).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("must be video") && msg.contains("#2"),
+            "consecutive-audios must name #2 and 'must be video', got {msg}"
+        );
+    }
+
+    /// §4: odd-length sequence ending on a video chunk is rejected for
+    /// the missing trailing audio block (every video must pair with one
+    /// audio per §4 strict 1:1 rule).
+    #[test]
+    fn validate_movi_interleave_rejects_trailing_unpaired_video() {
+        let chunks = [ChunkKind::Video, ChunkKind::Audio, ChunkKind::Video];
+        let err = validate_movi_interleave(&chunks).unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("must be even") && msg.contains("missing trailing audio"),
+            "odd-length must report missing trailing audio, got {msg}"
+        );
+    }
+
+    /// §4: an `Other` chunk-kind (anything outside the observed
+    /// `00dc` / `01wb` set) is rejected at its position with the tag
+    /// bytes reported.
+    #[test]
+    fn validate_movi_interleave_rejects_other_tag() {
+        let chunks = [
+            ChunkKind::Video,
+            ChunkKind::Audio,
+            ChunkKind::Other(*b"junk"),
+        ];
+        let err = validate_movi_interleave(&chunks).unwrap_err();
+        let msg = format!("{err:?}");
+        // The tag bytes 'j','u','n','k' = 0x6A 0x75 0x6E 0x6B.
+        assert!(
+            msg.contains("#2") && msg.contains("6A") && msg.contains("75"),
+            "Other-tag must name #2 and report tag bytes, got {msg}"
+        );
+    }
+
+    /// §4: 2232-chunk sequence (comedian.amv's 1116 + 1116 paired
+    /// chunks) under the strict video-first alternation must be
+    /// accepted. Mirrors the trace's worked example end-to-end.
+    #[test]
+    fn validate_movi_interleave_accepts_comedian_chunk_count() {
+        let mut chunks = Vec::with_capacity(2232);
+        for _ in 0..1116 {
+            chunks.push(ChunkKind::Video);
+            chunks.push(ChunkKind::Audio);
+        }
+        validate_movi_interleave(&chunks).expect("comedian.amv 1116-pair walk must satisfy §4");
     }
 
     /// Helper: assemble a minimal but byte-correct AMV prelude (from
