@@ -8,6 +8,45 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `cargo-fuzz` harness under [`fuzz/`](./fuzz/) with two panic-free
+  targets covering the parse + demuxer-open public surface.
+  - `parse` exercises every public byte parser (`AmvHeader::parse`,
+    `AmvWaveFormat::parse`, `ChunkHeader::parse`,
+    `AmvAudioPreamble::parse`, `AmvDuration::from_packed` /
+    `from_frame_count`) and every strict / cross-check helper
+    (`AmvHeader::validate_sentinels`,
+    `AmvWaveFormat::validate_sentinels`,
+    `AmvWaveFormat::frame_interval_samples`,
+    `AmvAudioPreamble::validate_sentinels`,
+    `AmvAudioPreamble::is_consistent_with_frame_interval`,
+    `AmvDuration::is_consistent_with_frame_count`) plus the §4a
+    video-payload validators (`validate_video_payload_shape`,
+    `validate_video_payload_no_internal_markers`) against
+    arbitrary fuzz-supplied bytes.
+  - `demuxer_open` drives the full `AmvDemuxer::open` + bounded
+    `next_packet` drain path (capped at 32 packets per fuzz
+    iteration) plus the strict-mode `AmvDemuxer::open_strict`
+    variant, exercising the §1 RIFF probe, the §2 / §3 prelude
+    walk, the §4 `movi` chunk loop, the §4c `AMV_END_` trailer
+    detection, and the device-cut truncation-recovery surface
+    against arbitrary attacker-controlled inputs.
+  - The contract under test is that every entry point returns a
+    typed `Result<…, AmvDemuxerError>` (or `oxideav_core::Result<…>`
+    for the demuxer-open path) for any input byte sequence — no
+    panic, no integer overflow in a debug build, no out-of-bounds
+    index, no allocation proportional to an attacker-controlled
+    `size` field in a chunk header. Both targets build clean on
+    `nightly-aarch64-apple-darwin` via
+    `cargo fuzz build {parse,demuxer_open}` and survive a 2 000
+    mutated-iteration smoke run plus the staged `comedian.amv`
+    device fixture as a seed input. The fuzz crate carries
+    `default-features` on (matching the demuxer's open path) and
+    pulls `libfuzzer-sys = "0.4"` alongside `oxideav-core = "0.1"`
+    + the sibling `path = ".."` reference. The fuzz subdirectory
+    is excluded from the parent crate's compilation via its own
+    `[workspace] members = ["."]` declaration so the umbrella
+    workspace does not pull it into normal `cargo build`.
+
 - §4b ↔ §3b ↔ §2 frame-interval cross-check helpers — new
   `AmvWaveFormat::frame_interval_samples(fps) -> u32` typed accessor
   exposes the trace §4b worked-example sample budget per frame interval

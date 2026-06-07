@@ -1,0 +1,65 @@
+[package]
+name = "oxideav-amv-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# AMV's parse surface is the only piece worth fuzzing: a §1 RIFF
+# framing layer (`RIFF / AMV ` with zeroed `size` fields), a §2
+# 56-byte `amvh` body packing `[µs/frame, w, h, fps, flag, reserved,
+# packed-duration]`, a pair of §3 `strl` LISTs whose video bodies are
+# all-zero and whose audio `strf` is a 20-byte WAVEFORMATEX, then a §4
+# `movi` payload of strictly-1:1 alternating `00dc` / `01wb` chunks
+# bounded by an 8-byte `AMV_END_` ASCII trailer (§4c). Every field is
+# little-endian and attacker-controlled when the input is hostile;
+# every walk through the payload is driven by chunk-size arithmetic
+# the trace doc records as unpadded (`advance = 8 + size`) and the
+# audio preamble carries a `decoded_sample_count` that the demuxer
+# folds into a per-packet PTS.
+#
+# Workspace policy bars external multimedia-library source as a
+# cross-decode oracle (no `libavformat/amv*`, no third-party AMV
+# demuxer). The fuzz crate therefore covers an internal-only
+# panic-free contract — every public byte parser, every payload-shape
+# validator, and the full `AmvDemuxer::open` + `next_packet` drain
+# path must return `Result<T, AmvDemuxerError>` (or, for the
+# demuxer-open path, `oxideav_core::Result<…>`) on **any** input byte
+# sequence, without panicking, integer-overflowing in a debug build,
+# indexing out of bounds, or pre-allocating memory proportional to an
+# attacker-claimed header / chunk-size field.
+[dependencies]
+libfuzzer-sys = "0.4"
+oxideav-core = "0.1"
+
+[dependencies.oxideav-amv]
+path = ".."
+
+# Prevent this from interfering with the umbrella workspace.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+# Target 1: every public byte-parser entry point + every payload-shape
+# validator on arbitrary fuzz-supplied bytes. Confirms the parse
+# surface is panic-free across the entire attacker-controlled input
+# space.
+[[bin]]
+name = "parse"
+path = "fuzz_targets/parse.rs"
+test = false
+doc = false
+
+# Target 2: the full `AmvDemuxer::open` + bounded `next_packet` drain
+# path. Exercises the §1 RIFF probe, the §2/§3 prelude walk, and the
+# §4 `movi` chunk loop with the §4c `AMV_END_` trailer / truncation
+# recovery surfaces, all driven from attacker-controlled bytes.
+[[bin]]
+name = "demuxer_open"
+path = "fuzz_targets/demuxer_open.rs"
+test = false
+doc = false

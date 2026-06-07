@@ -163,6 +163,28 @@ comedian (matching) pair and `false` on the noel (off-by-one) pair,
 exactly the header-vs-chunk-count discrepancy a truncation-recovery
 pass needs to surface.
 
+A `cargo-fuzz` harness lives under [`fuzz/`](./fuzz/) with two
+panic-free targets: `parse` drives every public byte-parser entry
+point (`AmvHeader::parse`, `AmvWaveFormat::parse`, `ChunkHeader::parse`,
+`AmvAudioPreamble::parse`, `AmvDuration::from_packed` /
+`from_frame_count`) plus every strict / cross-check
+(`validate_sentinels`, `is_consistent_with_frame_count`,
+`is_consistent_with_frame_interval`) and the §4a video-payload
+validators (`validate_video_payload_shape` /
+`validate_video_payload_no_internal_markers`) against arbitrary
+fuzz-supplied bytes; `demuxer_open` drives the full
+`AmvDemuxer::open` + bounded `next_packet` drain path including the
+strict-mode `open_strict` variant. The contract under test is that
+every entry point returns a typed `Result<…, AmvDemuxerError>` (or
+`oxideav_core::Result<…>` for the demuxer-open path) on any byte
+sequence — no panic, no integer overflow in a debug build, no
+out-of-bounds index, no allocation proportional to an
+attacker-controlled `size` field in a chunk header. Both targets
+build clean on the `aarch64-apple-darwin` nightly toolchain via
+`cargo fuzz build {parse,demuxer_open}` and survive a smoke run of
+2 000 mutated iterations plus the staged `comedian.amv` device
+fixture as a seed input.
+
 Frame and sample **decoding** are out of scope — the video stream is declared
 as the `mjpeg` codec id (the actual JPEG payload requires the player's stripped
 quant / Huffman tables to be spliced back in, which a downstream codec
