@@ -860,6 +860,266 @@ pub fn validate_movi_interleave(chunks: &[ChunkKind]) -> Result<(), AmvDemuxerEr
     Ok(())
 }
 
+// ────────────────────── typed movi payload walker ──────────────────────
+
+/// Typed view of a single `movi` leaf chunk's payload, surfaced one at a
+/// time by [`MoviPayloadIter`] as it walks an in-memory `movi`-body byte
+/// buffer.
+///
+/// Each variant carries the chunk's file offset (relative to the start
+/// of the `movi`-body buffer the iterator was constructed over) and the
+/// chunk-payload byte slice borrowed from that buffer. The audio variant
+/// additionally surfaces the already-parsed §4b 8-byte preamble so
+/// strict callers don't have to re-parse it.
+///
+/// This is a **typed, opt-in** alternative to the demuxer's hot path
+/// (which forwards raw bytes per the container's no-decode contract).
+/// Tooling that wants to inspect every `00dc` JPEG payload or every
+/// `01wb` ADPCM block at a typed surface — e.g. to run
+/// [`validate_video_payload_no_internal_markers`] across the entire
+/// stream, or to cross-check every preamble's `decoded_sample_count`
+/// against the §4b frame-interval budget — calls [`MoviPayloadIter`]
+/// instead of re-walking the raw bytes by hand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoviPayload<'a> {
+    /// `00dc` — video frame. Body is the bare JPEG `FF D8 … FF D9`
+    /// payload (§4a: SOI..EOI bracket, no internal marker segments,
+    /// tables hardcoded in the player). Bracket and no-internal-marker
+    /// invariants are **not** enforced by the iterator — call
+    /// [`validate_video_payload_shape`] /
+    /// [`validate_video_payload_no_internal_markers`] on `body` if the
+    /// caller wants strict §4a enforcement.
+    Video {
+        /// File offset of the chunk's 8-byte header, measured from the
+        /// start of the `movi`-body buffer the iterator was constructed
+        /// over. The chunk's payload bytes therefore start at
+        /// `chunk_offset + 8` in that buffer.
+        chunk_offset: usize,
+        /// Borrowed body bytes, length matches the chunk's leaf-header
+        /// `size` field (§4 no-padding rule).
+        body: &'a [u8],
+    },
+    /// `01wb` — audio block. Body is the full §4b payload (8-byte
+    /// preamble followed by the compressed nibble body). `preamble`
+    /// is the already-parsed view of `body[0..8]`; `body` is the
+    /// complete payload including the preamble so callers can compute
+    /// the compressed-body length as `body.len() - AMV_AUDIO_PREAMBLE_LEN`
+    /// without re-slicing.
+    ///
+    /// `AmvAudioPreamble::parse` is invoked by the iterator before
+    /// emitting this variant, so a payload shorter than 8 bytes
+    /// surfaces as an iteration error rather than a malformed
+    /// `Audio` variant.
+    Audio {
+        /// File offset of the chunk's 8-byte header relative to the
+        /// `movi`-body buffer the iterator was constructed over.
+        chunk_offset: usize,
+        /// Parsed §4b 8-byte preamble — `state` + `decoded_sample_count`.
+        preamble: AmvAudioPreamble,
+        /// Borrowed full payload bytes (preamble + compressed body).
+        body: &'a [u8],
+    },
+    /// Any other 4-byte FOURCC tag. Real AMV files do not produce this
+    /// in practice (the trace records only `00dc` and `01wb` inside
+    /// `movi`), but the walker tolerates an unknown tag so the chunk
+    /// surfaces as data rather than aborting iteration — strict
+    /// callers should pair this iterator with
+    /// [`validate_movi_interleave`] to reject the `Other` case.
+    Other {
+        /// File offset of the chunk's 8-byte header relative to the
+        /// `movi`-body buffer the iterator was constructed over.
+        chunk_offset: usize,
+        /// Raw 4-byte FOURCC tag observed in the chunk header.
+        tag: [u8; 4],
+        /// Borrowed body bytes, length matches the chunk's leaf-header
+        /// `size` field.
+        body: &'a [u8],
+    },
+}
+
+impl<'a> MoviPayload<'a> {
+    /// Classify the payload as a [`ChunkKind`]. Mirrors
+    /// [`ChunkHeader::kind`] but for the typed-payload view —
+    /// convenient when feeding the iterator's output into
+    /// [`validate_movi_interleave`].
+    pub fn kind(&self) -> ChunkKind {
+        match self {
+            Self::Video { .. } => ChunkKind::Video,
+            Self::Audio { .. } => ChunkKind::Audio,
+            Self::Other { tag, .. } => ChunkKind::Other(*tag),
+        }
+    }
+
+    /// File offset of the chunk's 8-byte leaf header, relative to the
+    /// start of the `movi`-body buffer the iterator was constructed
+    /// over. The chunk's payload bytes therefore start at
+    /// `chunk_offset() + 8`.
+    pub fn chunk_offset(&self) -> usize {
+        match self {
+            Self::Video { chunk_offset, .. }
+            | Self::Audio { chunk_offset, .. }
+            | Self::Other { chunk_offset, .. } => *chunk_offset,
+        }
+    }
+
+    /// Borrowed payload bytes (the §4 leaf body, excluding the 8-byte
+    /// header). For the `Audio` variant this includes the 8-byte
+    /// preamble — callers that want only the compressed body should
+    /// take `&body[AMV_AUDIO_PREAMBLE_LEN..]`.
+    pub fn body(&self) -> &'a [u8] {
+        match self {
+            Self::Video { body, .. } | Self::Audio { body, .. } | Self::Other { body, .. } => body,
+        }
+    }
+}
+
+/// Walks an in-memory `movi`-body byte buffer producing typed
+/// per-chunk payload views (§4 chunk framing + §4a/§4b per-chunk shape).
+///
+/// The input buffer must start at the byte **after** the `LIST <size>
+/// 'movi'` FOURCC opener — i.e. the first byte of the first leaf chunk
+/// header (the byte the demuxer's read cursor lands on after consuming
+/// the 12-byte movi opener). The iterator advances by exactly `8 +
+/// size` bytes per chunk under §4's no-padding rule and terminates on
+/// one of three conditions:
+///
+/// * The cursor reaches end-of-buffer cleanly on an 8-byte boundary —
+///   iteration ends with `None`.
+/// * The next 8-byte window can't be read as a `ChunkHeader` (less
+///   than 8 bytes remain) — iteration yields `Err(InvalidData)` once
+///   then `None`.
+/// * A chunk's declared `size` runs past the buffer — iteration yields
+///   `Err(InvalidData)` once then `None`.
+/// * An `01wb` payload is shorter than [`AMV_AUDIO_PREAMBLE_LEN`] —
+///   iteration yields the preamble parse error once then `None`.
+///
+/// On an error the iterator latches a "done" flag so subsequent
+/// `next()` calls return `None` rather than re-reporting the same
+/// error — callers that want to surface the error should bind it on
+/// first appearance.
+///
+/// The §4c `AMV_END_` ASCII trailer is **not** consumed by this
+/// iterator — callers that want trailer-bounded walking should slice
+/// the input buffer to exclude the trailing 8 ASCII bytes before
+/// constructing the iterator (the demuxer's chunk-index path does
+/// exactly this).
+#[derive(Debug)]
+pub struct MoviPayloadIter<'a> {
+    /// The full `movi`-body byte buffer the iterator walks. Borrowed
+    /// for the iterator's lifetime so emitted slices can borrow from
+    /// it directly.
+    buf: &'a [u8],
+    /// Byte cursor into `buf`. Always advances by `8 + size` per
+    /// emitted chunk under §4's no-padding rule.
+    cursor: usize,
+    /// Latched-done flag set after a successful end-of-buffer landing
+    /// or after the first error — keeps `next()` returning `None`
+    /// from then on.
+    done: bool,
+}
+
+impl<'a> MoviPayloadIter<'a> {
+    /// Construct an iterator over the supplied `movi`-body byte
+    /// buffer. The buffer must start at the first leaf-chunk header
+    /// (the byte after the 12-byte `LIST <size> 'movi'` opener) and
+    /// must **not** include the §4c `AMV_END_` trailer.
+    pub fn new(movi_body: &'a [u8]) -> Self {
+        Self {
+            buf: movi_body,
+            cursor: 0,
+            done: false,
+        }
+    }
+
+    /// Byte cursor into the input buffer. Advances by `8 + size` after
+    /// each emitted chunk. Useful for callers that want to report the
+    /// offset at which iteration terminated.
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+}
+
+impl<'a> Iterator for MoviPayloadIter<'a> {
+    type Item = Result<MoviPayload<'a>, AmvDemuxerError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        // Clean end-of-buffer landing — every chunk consumed, no
+        // trailing bytes left over.
+        if self.cursor == self.buf.len() {
+            self.done = true;
+            return None;
+        }
+        // Less than a full 8-byte leaf header left — surface the
+        // truncation as an InvalidData error so a malformed input
+        // doesn't silently terminate iteration mid-stream.
+        if self.cursor + 8 > self.buf.len() {
+            self.done = true;
+            return Some(Err(AmvDemuxerError::InvalidData(format!(
+                "movi payload truncated at offset {}: {} bytes remain, \
+                 need 8 for a chunk header",
+                self.cursor,
+                self.buf.len() - self.cursor,
+            ))));
+        }
+        let header = match ChunkHeader::parse(&self.buf[self.cursor..self.cursor + 8]) {
+            Ok(h) => h,
+            Err(e) => {
+                self.done = true;
+                return Some(Err(e));
+            }
+        };
+        let body_start = self.cursor + 8;
+        let body_end = match body_start.checked_add(header.size as usize) {
+            Some(e) => e,
+            None => {
+                self.done = true;
+                return Some(Err(AmvDemuxerError::InvalidData(format!(
+                    "movi chunk at offset {} declared size {} overflows usize",
+                    self.cursor, header.size
+                ))));
+            }
+        };
+        if body_end > self.buf.len() {
+            self.done = true;
+            return Some(Err(AmvDemuxerError::InvalidData(format!(
+                "movi chunk at offset {} declared size {} runs past buffer \
+                 end (buffer is {} bytes, body would end at {})",
+                self.cursor,
+                header.size,
+                self.buf.len(),
+                body_end,
+            ))));
+        }
+        let body = &self.buf[body_start..body_end];
+        let chunk_offset = self.cursor;
+        // Advance the cursor by `8 + size` per §4 (no even-byte padding).
+        self.cursor = body_end;
+        let payload = match header.kind() {
+            ChunkKind::Video => MoviPayload::Video { chunk_offset, body },
+            ChunkKind::Audio => match AmvAudioPreamble::parse(body) {
+                Ok(preamble) => MoviPayload::Audio {
+                    chunk_offset,
+                    preamble,
+                    body,
+                },
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            },
+            ChunkKind::Other(tag) => MoviPayload::Other {
+                chunk_offset,
+                tag,
+                body,
+            },
+        };
+        Some(Ok(payload))
+    }
+}
+
 // ────────────────────────── prelude walker ──────────────────────────
 
 /// Parsed view of the AMV prelude — everything from offset 0 up to the
@@ -2366,6 +2626,270 @@ pub(crate) mod tests {
             chunks.push(ChunkKind::Audio);
         }
         validate_movi_interleave(&chunks).expect("comedian.amv 1116-pair walk must satisfy §4");
+    }
+
+    // ─────────────────── MoviPayloadIter tests ───────────────────
+
+    /// Helper: build a §4 leaf chunk (8-byte header + body) into a
+    /// growable buffer. `tag` is the FOURCC; `body` is the raw payload.
+    fn push_leaf(out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]) {
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(body);
+    }
+
+    /// Helper: assemble a synthetic `00dc` JPEG-shaped payload with the
+    /// requested entropy-byte count between the SOI / EOI bracket.
+    fn make_video_body(entropy_len: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(4 + entropy_len);
+        v.extend_from_slice(&JPEG_SOI);
+        v.extend(std::iter::repeat_n(0x00u8, entropy_len));
+        v.extend_from_slice(&JPEG_EOI);
+        v
+    }
+
+    /// Helper: assemble a synthetic `01wb` audio payload with the given
+    /// preamble fields and `compressed_len` bytes of (zeroed) body.
+    fn make_audio_body(state: u32, decoded_sample_count: u32, compressed_len: usize) -> Vec<u8> {
+        let mut v = Vec::with_capacity(AMV_AUDIO_PREAMBLE_LEN + compressed_len);
+        v.extend_from_slice(&state.to_le_bytes());
+        v.extend_from_slice(&decoded_sample_count.to_le_bytes());
+        v.extend(std::iter::repeat_n(0x00u8, compressed_len));
+        v
+    }
+
+    /// An empty `movi` body produces no chunks and no errors.
+    #[test]
+    fn movi_iter_empty_buffer_yields_no_chunks() {
+        let mut it = MoviPayloadIter::new(&[]);
+        assert!(it.next().is_none(), "empty input must yield None");
+        assert!(it.next().is_none(), "subsequent next() stays None");
+        assert_eq!(it.cursor(), 0);
+    }
+
+    /// §4: a single `00dc` + `01wb` pair walks cleanly under the strict
+    /// 8-byte-header + no-padding rule. Cursors must advance by
+    /// `8 + size` per chunk.
+    #[test]
+    fn movi_iter_walks_single_video_audio_pair() {
+        let video = make_video_body(10);
+        let audio = make_audio_body(0, 1837, 919);
+        let mut buf = Vec::new();
+        push_leaf(&mut buf, &VIDEO_CHUNK_TAG, &video);
+        push_leaf(&mut buf, &AUDIO_CHUNK_TAG, &audio);
+        let mut it = MoviPayloadIter::new(&buf);
+
+        // 1) Video chunk.
+        let v = it.next().expect("first chunk").expect("video parse");
+        match v {
+            MoviPayload::Video { chunk_offset, body } => {
+                assert_eq!(chunk_offset, 0);
+                assert_eq!(body, video.as_slice());
+            }
+            other => panic!("expected Video, got {other:?}"),
+        }
+        assert_eq!(v.kind(), ChunkKind::Video);
+
+        // 2) Audio chunk — typed preamble surfaces alongside body.
+        let a = it.next().expect("second chunk").expect("audio parse");
+        match a {
+            MoviPayload::Audio {
+                chunk_offset,
+                preamble,
+                body,
+            } => {
+                assert_eq!(chunk_offset, 8 + video.len());
+                assert_eq!(preamble.state, 0);
+                assert_eq!(preamble.decoded_sample_count, 1837);
+                assert_eq!(body, audio.as_slice());
+            }
+            other => panic!("expected Audio, got {other:?}"),
+        }
+        assert_eq!(a.kind(), ChunkKind::Audio);
+
+        // 3) Clean end-of-buffer landing.
+        assert!(it.next().is_none(), "iterator must terminate cleanly");
+        assert_eq!(it.cursor(), buf.len());
+    }
+
+    /// §4 no-padding rule: an odd-sized payload doesn't trip the walker
+    /// — the cursor advances by `8 + size` even when `size` is odd.
+    /// Mirrors the trace's worked example where chunk #2 starts at the
+    /// odd file offset `0x07A5`.
+    #[test]
+    fn movi_iter_no_word_padding_on_odd_sized_payload() {
+        // Video body length = 4 + 3 = 7 (odd).
+        let v_body = make_video_body(3);
+        assert_eq!(v_body.len() % 2, 1);
+        // Audio body length = 8 + 1 = 9 (odd).
+        let a_body = make_audio_body(0, 100, 1);
+        assert_eq!(a_body.len() % 2, 1);
+
+        let mut buf = Vec::new();
+        push_leaf(&mut buf, &VIDEO_CHUNK_TAG, &v_body);
+        push_leaf(&mut buf, &AUDIO_CHUNK_TAG, &a_body);
+
+        let mut it = MoviPayloadIter::new(&buf);
+        let v = it.next().unwrap().unwrap();
+        assert_eq!(v.chunk_offset(), 0);
+        let a = it.next().unwrap().unwrap();
+        // Second chunk header lands at exactly 8 + 7 = 15 (no padding).
+        assert_eq!(a.chunk_offset(), 8 + v_body.len());
+        assert!(it.next().is_none());
+    }
+
+    /// An unknown FOURCC surfaces as the `Other` variant carrying the
+    /// tag bytes verbatim. The trace records `00dc` / `01wb` as the
+    /// only observed tags, but the walker is permissive so a corrupt /
+    /// experimental chunk surfaces as data rather than aborting.
+    #[test]
+    fn movi_iter_unknown_tag_surfaces_as_other() {
+        let mut buf = Vec::new();
+        push_leaf(&mut buf, b"junk", &[0xAA, 0xBB, 0xCC]);
+        let mut it = MoviPayloadIter::new(&buf);
+        let p = it.next().unwrap().unwrap();
+        match p {
+            MoviPayload::Other {
+                chunk_offset,
+                tag,
+                body,
+            } => {
+                assert_eq!(chunk_offset, 0);
+                assert_eq!(&tag, b"junk");
+                assert_eq!(body, &[0xAA, 0xBB, 0xCC]);
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+        assert_eq!(p.kind(), ChunkKind::Other(*b"junk"));
+    }
+
+    /// A chunk-header read that lands in the last `<8` bytes of the
+    /// buffer surfaces as a truncation error once, then iteration
+    /// terminates (latched-done flag).
+    #[test]
+    fn movi_iter_trailing_truncation_surfaces_error_once_then_none() {
+        let mut buf = Vec::new();
+        push_leaf(&mut buf, &VIDEO_CHUNK_TAG, &make_video_body(2));
+        // Append 3 trailing bytes — not enough for an 8-byte header.
+        buf.extend_from_slice(&[0xDE, 0xAD, 0xBE]);
+        let mut it = MoviPayloadIter::new(&buf);
+        // First chunk reads cleanly.
+        assert!(matches!(
+            it.next().unwrap().unwrap(),
+            MoviPayload::Video { .. }
+        ));
+        // Second next() surfaces the truncation error.
+        let err = it.next().unwrap().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(
+                    msg.contains("truncated") && msg.contains("3 bytes"),
+                    "truncation message must name offset + remaining bytes, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+        // Latched-done — no further error replays.
+        assert!(it.next().is_none());
+        assert!(it.next().is_none());
+    }
+
+    /// A chunk whose declared body size runs past the buffer end
+    /// surfaces as InvalidData naming the offending offset and the
+    /// over-long body end.
+    #[test]
+    fn movi_iter_body_size_overrun_surfaces_error() {
+        let mut buf = Vec::new();
+        // Hand-write a chunk header claiming a 100-byte body but
+        // provide only 4 body bytes.
+        buf.extend_from_slice(&VIDEO_CHUNK_TAG);
+        buf.extend_from_slice(&100u32.to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]);
+        let mut it = MoviPayloadIter::new(&buf);
+        let err = it.next().unwrap().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(
+                    msg.contains("declared size 100") && msg.contains("runs past buffer end"),
+                    "overrun message must name size + condition, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+        assert!(it.next().is_none());
+    }
+
+    /// An `01wb` chunk whose body is shorter than the 8-byte preamble
+    /// surfaces as the preamble parser's InvalidData (single-shot, then
+    /// iteration terminates).
+    #[test]
+    fn movi_iter_audio_payload_shorter_than_preamble_errors() {
+        let mut buf = Vec::new();
+        // 5-byte body — shorter than AMV_AUDIO_PREAMBLE_LEN = 8.
+        push_leaf(&mut buf, &AUDIO_CHUNK_TAG, &[0, 0, 0, 0, 0]);
+        let mut it = MoviPayloadIter::new(&buf);
+        let err = it.next().unwrap().unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(
+                    msg.contains("preamble") && msg.contains("got 5"),
+                    "preamble-too-short message must name shortfall, got {msg}"
+                );
+            }
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+        assert!(it.next().is_none());
+    }
+
+    /// §4 worked example shape: a 3-pair (6-chunk) walk emits the
+    /// strict video-first alternation, and the kinds collected from the
+    /// iterator pass [`validate_movi_interleave`].
+    #[test]
+    fn movi_iter_three_pair_walk_kinds_pass_strict_interleave() {
+        let mut buf = Vec::new();
+        for i in 0..3 {
+            // Vary sizes slightly per pair so we're not just walking a
+            // single repeating record.
+            push_leaf(&mut buf, &VIDEO_CHUNK_TAG, &make_video_body(10 + i));
+            push_leaf(&mut buf, &AUDIO_CHUNK_TAG, &make_audio_body(0, 100, 5));
+        }
+        let it = MoviPayloadIter::new(&buf);
+        let kinds: Vec<ChunkKind> = it.map(|r| r.expect("clean 3-pair walk").kind()).collect();
+        assert_eq!(kinds.len(), 6);
+        validate_movi_interleave(&kinds).expect("3 pairs must satisfy §4");
+    }
+
+    /// Audio preamble accessors round-trip through the iterator —
+    /// every emitted `Audio` variant's preamble matches what
+    /// [`AmvAudioPreamble::parse`] would return on the same body.
+    #[test]
+    fn movi_iter_audio_preamble_matches_independent_parse() {
+        let body = make_audio_body(0xDEADBEEF, 1837, 919);
+        let mut buf = Vec::new();
+        push_leaf(&mut buf, &AUDIO_CHUNK_TAG, &body);
+        let mut it = MoviPayloadIter::new(&buf);
+        let p = it.next().unwrap().unwrap();
+        let independent = AmvAudioPreamble::parse(&body).unwrap();
+        match p {
+            MoviPayload::Audio { preamble, .. } => assert_eq!(preamble, independent),
+            other => panic!("expected Audio, got {other:?}"),
+        }
+    }
+
+    /// `body()` accessor returns the same slice as the variant's body
+    /// field — confirms the convenience method doesn't re-slice or
+    /// truncate.
+    #[test]
+    fn movi_iter_body_accessor_matches_payload_field() {
+        let v_body = make_video_body(7);
+        let a_body = make_audio_body(0, 200, 50);
+        let mut buf = Vec::new();
+        push_leaf(&mut buf, &VIDEO_CHUNK_TAG, &v_body);
+        push_leaf(&mut buf, &AUDIO_CHUNK_TAG, &a_body);
+        let it = MoviPayloadIter::new(&buf);
+        let payloads: Vec<MoviPayload> = it.map(|r| r.unwrap()).collect();
+        assert_eq!(payloads[0].body(), v_body.as_slice());
+        assert_eq!(payloads[1].body(), a_body.as_slice());
     }
 
     /// Helper: assemble a minimal but byte-correct AMV prelude (from

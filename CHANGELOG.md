@@ -8,6 +8,48 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4 typed chunk-payload iterator — new `MoviPayloadIter<'a>` walks
+  an in-memory `movi`-body byte buffer (the bytes between the
+  `LIST <size> 'movi'` opener and the §4c `AMV_END_` trailer) and
+  yields one `MoviPayload<'a>` per chunk as `Video { chunk_offset,
+  body }`, `Audio { chunk_offset, preamble, body }` (with the §4b
+  8-byte preamble already parsed via `AmvAudioPreamble::parse`), or
+  `Other { chunk_offset, tag, body }` for any FOURCC outside the
+  observed `00dc` / `01wb` set. The iterator advances by exactly
+  `8 + size` per chunk under §4's no-padding rule, terminates cleanly
+  on an end-of-buffer landing, and latches a done flag after the
+  first error so a malformed stream surfaces a single typed error
+  rather than panicking or silently terminating mid-walk. Error
+  variants cover the three §4 truncation modes observed in the trace
+  doc: trailing window with `<8` bytes left for a chunk header, a
+  chunk whose declared body size runs past the buffer, and an `01wb`
+  payload shorter than the 8-byte preamble. The new
+  `MoviPayload::kind()` accessor returns a `ChunkKind` so the typed
+  iterator's output can be fed directly into the existing
+  `validate_movi_interleave` validator without re-walking the bytes;
+  `MoviPayload::body()` and `MoviPayload::chunk_offset()` are
+  convenience accessors over the per-variant fields. Ten new unit
+  tests in `parse::tests` cover the empty-buffer no-yield path, the
+  single video + audio pair walk (with cursor accounting), the §4
+  no-padding-on-odd-sized-payload invariant (verifying the cursor
+  doesn't word-align even though both body lengths are odd), an
+  unknown-FOURCC `Other` surface, trailing-truncation error +
+  latched-done re-surface, declared-size overrun error, audio
+  preamble shorter than `AMV_AUDIO_PREAMBLE_LEN` error, a three-pair
+  walk whose collected kinds satisfy `validate_movi_interleave`, an
+  `AmvAudioPreamble` round-trip match against independent parse, and
+  a `body()`-accessor-matches-field cross-check. A new
+  `comedian_fixture_movi_payload_iter_walks_2232_chunks` integration
+  test in `demuxer::tests` loads the staged `comedian.amv` fixture,
+  locates the `movi` FOURCC, slices off the §4c 8-byte `AMV_END_`
+  trailer, and walks the iterator to confirm the §4 worked example
+  end-to-end: 1116 + 1116 = 2232 chunks under the strict video-first
+  alternation, no `Other` tags surface, the first video body is 1633
+  bytes (size `0x661`), the first audio preamble carries
+  `decoded_sample_count = 1837` (= `22_050 ÷ 12`), and the cursor
+  lands cleanly on the end of the movi-body slice (i.e. 8 bytes
+  before EOF in the original file).
+
 - §4 strict 1:1 video-first interleave validator — new
   `validate_movi_interleave` free function (also re-exported at the
   crate root) that walks a `&[ChunkKind]` sequence and confirms the

@@ -159,6 +159,25 @@ file whose final video chunk has no following audio block. The
 2232-chunk pattern (`comedian.amv`'s 1116 + 1116 paired chunks)
 passes end-to-end through the validator.
 
+A typed counterpart to that validator is also available without
+going through the demuxer's I/O path. `MoviPayloadIter` walks an
+in-memory `movi`-body byte buffer one chunk at a time and yields a
+`MoviPayload<'a>` enum that splits `Video { chunk_offset, body }`,
+`Audio { chunk_offset, preamble, body }` (with the §4b 8-byte
+preamble already parsed via `AmvAudioPreamble::parse`), and
+`Other { chunk_offset, tag, body }` for any FOURCC outside the
+observed `00dc` / `01wb` set. The iterator advances by exactly
+`8 + size` per chunk under §4's no-padding rule, terminates cleanly
+on an end-of-buffer landing, and latches a done flag after surfacing
+the first error (truncated trailing window, declared body size that
+runs past the buffer, or an `01wb` payload shorter than the 8-byte
+preamble). The `comedian.amv` integration test confirms the iterator
+walks all 2232 chunks (1116 video / 1116 audio) once the §4c
+`AMV_END_` trailer is sliced off the input — the first video body
+is 1633 bytes (size `0x661`) and the first audio preamble carries
+`decoded_sample_count = 1837` (the §4b worked-example value
+`22_050 ÷ 12`), exactly the trace doc's recorded constants.
+
 `AmvDuration::from_frame_count(frame_count, fps)` applies the trace §2
 worked example (`frame_count / fps → total_seconds`, then split into
 `[seconds, minutes, hours]`) as a pure function, so the same

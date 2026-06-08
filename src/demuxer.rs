@@ -1887,4 +1887,90 @@ mod tests {
             "expected to strict-marker-validate 1116 video chunks"
         );
     }
+
+    /// Real-fixture cross-check for [`MoviPayloadIter`]: load
+    /// `comedian.amv` into memory, locate the `movi` payload bytes
+    /// (between the `movi` FOURCC opener and the §4c 8-byte
+    /// `AMV_END_` trailer), and confirm the typed iterator walks
+    /// the same 1116 + 1116 = 2232 chunks the demuxer's I/O path
+    /// surfaces — with strict §4 video-first alternation and every
+    /// `01wb` block's preamble carrying `decoded_sample_count = 1837`
+    /// (the §4b worked-example value `22_050 ÷ 12`).
+    #[test]
+    fn comedian_fixture_movi_payload_iter_walks_2232_chunks() {
+        use crate::parse::{
+            validate_movi_interleave, MoviPayload, MoviPayloadIter, AMV_END_TRAILER,
+        };
+
+        let crate_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");
+        let workspace_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/container/amv/fixtures/comedian.amv");
+        let path = if crate_path.exists() {
+            crate_path
+        } else if workspace_path.exists() {
+            workspace_path
+        } else {
+            eprintln!("skipping comedian MoviPayloadIter fixture test: not staged");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read fixture");
+
+        // Locate the `movi` FOURCC inside the file; the §4 payload
+        // begins on the byte *after* it.
+        let movi_pos = bytes
+            .windows(4)
+            .position(|w| w == b"movi")
+            .expect("movi FOURCC present");
+        let movi_body_start = movi_pos + 4;
+        // §4c: the file ends in an 8-byte `AMV_END_` literal — slice
+        // it off so the iterator walks the chunk run only.
+        assert!(bytes.len() >= AMV_END_TRAILER.len());
+        let trailer_start = bytes.len() - AMV_END_TRAILER.len();
+        assert_eq!(&bytes[trailer_start..], &AMV_END_TRAILER);
+        let movi_body = &bytes[movi_body_start..trailer_start];
+
+        let mut iter = MoviPayloadIter::new(movi_body);
+        let mut kinds = Vec::with_capacity(2232);
+        let mut n_video = 0u32;
+        let mut n_audio = 0u32;
+        let mut first_video_size = None;
+        let mut first_audio_decoded = None;
+        for item in iter.by_ref() {
+            let payload = item.expect("comedian.amv movi walk must not error");
+            match payload {
+                MoviPayload::Video { body, .. } => {
+                    if first_video_size.is_none() {
+                        first_video_size = Some(body.len());
+                    }
+                    n_video += 1;
+                    kinds.push(crate::parse::ChunkKind::Video);
+                }
+                MoviPayload::Audio { preamble, .. } => {
+                    if first_audio_decoded.is_none() {
+                        first_audio_decoded = Some(preamble.decoded_sample_count);
+                    }
+                    n_audio += 1;
+                    kinds.push(crate::parse::ChunkKind::Audio);
+                }
+                MoviPayload::Other { tag, .. } => {
+                    panic!(
+                        "comedian.amv unexpected non-00dc/01wb chunk: \
+                         {:02X} {:02X} {:02X} {:02X}",
+                        tag[0], tag[1], tag[2], tag[3]
+                    );
+                }
+            }
+        }
+        // §4 worked-example invariants.
+        assert_eq!(n_video, 1116, "expected 1116 video chunks");
+        assert_eq!(n_audio, 1116, "expected 1116 audio chunks");
+        assert_eq!(first_video_size, Some(1633), "first video size = 0x661");
+        assert_eq!(first_audio_decoded, Some(1837), "first audio = 22050/12");
+        // Cursor must land cleanly on the end of the movi body slice
+        // (i.e. 8 bytes before EOF in the original file).
+        assert_eq!(iter.cursor(), movi_body.len());
+        // Strict §4 alternation must hold across the full walk.
+        validate_movi_interleave(&kinds).expect("comedian.amv chunk run satisfies §4");
+    }
 }
