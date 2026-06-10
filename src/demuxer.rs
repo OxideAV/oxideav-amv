@@ -1973,4 +1973,90 @@ mod tests {
         // Strict §4 alternation must hold across the full walk.
         validate_movi_interleave(&kinds).expect("comedian.amv chunk run satisfies §4");
     }
+
+    /// Real-fixture cross-check for the §4b nibble-packing budget: walk
+    /// `comedian.amv`'s `movi` payload, parse every `01wb` block's
+    /// preamble, and confirm the block-length cross-check
+    /// `AmvAudioPreamble::is_consistent_with_body_len`.
+    ///
+    /// The trace's §4b worked example is exact for the **first** audio
+    /// block: `1837` decoded samples in a `927`-byte payload (`8`
+    /// preamble + `919 = ceil(1837 / 2)` nibble body). The trace also
+    /// records that the block size is *near*-constant — "927 bytes,
+    /// occasionally 930" — so not every block satisfies the exact
+    /// `body == ceil(samples / 2)` relation; some carry a few padding
+    /// bytes. This test therefore pins the first block exactly (the
+    /// documented worked example) and asserts that the **majority** of
+    /// blocks satisfy the nibble budget, surfacing the matched / total
+    /// split without over-asserting on the padded outliers the trace
+    /// explicitly notes.
+    #[test]
+    fn comedian_fixture_audio_blocks_nibble_budget() {
+        use crate::parse::{MoviPayload, MoviPayloadIter, AMV_END_TRAILER};
+
+        let crate_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");
+        let workspace_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/container/amv/fixtures/comedian.amv");
+        let path = if crate_path.exists() {
+            crate_path
+        } else if workspace_path.exists() {
+            workspace_path
+        } else {
+            eprintln!("skipping comedian nibble-budget fixture test: not staged");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("read fixture");
+
+        let movi_pos = bytes
+            .windows(4)
+            .position(|w| w == b"movi")
+            .expect("movi FOURCC present");
+        let movi_body_start = movi_pos + 4;
+        let trailer_start = bytes.len() - AMV_END_TRAILER.len();
+        assert_eq!(&bytes[trailer_start..], &AMV_END_TRAILER);
+        let movi_body = &bytes[movi_body_start..trailer_start];
+
+        let mut total_audio = 0u32;
+        let mut budget_matches = 0u32;
+        let mut first_audio_checked = false;
+        for item in MoviPayloadIter::new(movi_body) {
+            let payload = item.expect("comedian.amv movi walk must not error");
+            if let MoviPayload::Audio { preamble, body, .. } = payload {
+                total_audio += 1;
+                let total_len = body.len() as u64;
+                if !first_audio_checked {
+                    // §4b worked example: first block is exactly
+                    // 1837 samples in a 927-byte payload (8 + 919).
+                    assert_eq!(preamble.decoded_sample_count, 1837);
+                    assert_eq!(total_len, 927);
+                    assert_eq!(preamble.nibble_body_len(), 919);
+                    assert!(
+                        preamble.is_consistent_with_body_len(total_len),
+                        "first audio block must satisfy the exact §4b nibble budget"
+                    );
+                    first_audio_checked = true;
+                }
+                if preamble.is_consistent_with_body_len(total_len) {
+                    budget_matches += 1;
+                }
+            }
+        }
+
+        assert_eq!(total_audio, 1116, "expected 1116 audio chunks");
+        assert!(
+            first_audio_checked,
+            "must have seen at least one audio block"
+        );
+        // The trace records "927 bytes, occasionally 930" — the exact
+        // nibble relation holds for the common case, so the matched count
+        // must dominate (well over half) even though a few padded blocks
+        // miss it. This is a loose, trace-faithful lower bound, not an
+        // all-must-match assertion.
+        assert!(
+            budget_matches * 2 > total_audio,
+            "expected the majority of audio blocks to satisfy the §4b \
+             nibble budget, got {budget_matches} / {total_audio}"
+        );
+    }
 }

@@ -143,6 +143,27 @@ budget and `false` otherwise — surfacing exactly the per-block
 sample-count discrepancy a recovered-from-truncation pass needs to
 flag.
 
+The §4b 4-bit-per-sample nibble-packing relation is exposed as a
+matching pair on `AmvAudioPreamble`. `nibble_body_len() -> u64`
+returns the expected compressed-body byte count for the block's
+declared `decoded_sample_count` — each mono sample is one 4-bit
+nibble and two nibbles pack into one byte, so
+`body = ceil(decoded_sample_count / 2)`, reproducing the trace's
+`ceil(1837 / 2) = 919` for the comedian first block. The companion
+`is_consistent_with_body_len(total_payload_len) -> bool` cross-checks
+a full `01wb` payload length against that budget: it returns `true`
+when `total_payload_len == AMV_AUDIO_PREAMBLE_LEN +
+ceil(decoded_sample_count / 2)` — `8 + 919 = 927` for the comedian
+first block — and `false` otherwise, including a saturating-safe
+`false` (no panic) on a sub-preamble length. Useful for a
+truncation-recovery / sanity pass that wants to flag an `01wb` block
+whose declared sample count is inconsistent with the bytes that
+actually landed. The staged `comedian.amv`'s first audio block
+matches the nibble budget exactly, and the majority of its 1116
+audio blocks do too — a trace-faithful loose lower bound that
+respects the doc's "927 bytes, occasionally 930" note, where the few
+padded blocks correctly miss the exact relation.
+
 The §4 strict 1:1 video-first interleave invariant — the trace's
 recorded pattern that every observed `.amv` file's `movi` payload is
 a flat stream of `00dc` video frames at even positions paired with

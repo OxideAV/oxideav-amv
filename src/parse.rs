@@ -655,6 +655,65 @@ impl AmvAudioPreamble {
         }
         self.decoded_sample_count == samples_per_sec / fps
     }
+
+    /// Expected compressed-body byte count for this block under the §4b
+    /// 4-bit-per-sample nibble-packing relation the trace records.
+    ///
+    /// Per §4b the `comedian.amv` first audio block carries
+    /// `decoded_sample_count = 1837` and a compressed body of `919`
+    /// bytes — "1837 mono samples encoded in 919 bytes ≈ 0.5 byte/sample
+    /// = 4 bits/sample", an IMA/DVI-ADPCM-style nibble codec where each
+    /// mono sample occupies one 4-bit nibble. Two nibbles pack into one
+    /// byte, so a block of `n` samples needs `ceil(n / 2)` body bytes —
+    /// `ceil(1837 / 2) = 919`, matching the trace's recorded body length
+    /// exactly.
+    ///
+    /// The result is the compressed-body byte count **excluding** the
+    /// 8-byte preamble itself (the preamble is the per-block header, not
+    /// part of the nibble-coded body). Returned as a `u64` so callers can
+    /// compare it against a chunk size without an intermediate cast.
+    ///
+    /// Useful for tooling that wants to derive the expected nibble-body
+    /// length from a parsed preamble — for example, to size a decode
+    /// buffer ahead of the unpack pass, or to cross-check a recovered
+    /// block's on-disk length against its declared sample count (see
+    /// [`Self::is_consistent_with_body_len`]).
+    pub fn nibble_body_len(&self) -> u64 {
+        (self.decoded_sample_count as u64).div_ceil(2)
+    }
+
+    /// Cross-check a full `01wb` payload length against this block's §4b
+    /// nibble-packing budget.
+    ///
+    /// The `total_payload_len` argument is the **complete** `01wb` chunk
+    /// payload length — the 8-byte preamble [`AMV_AUDIO_PREAMBLE_LEN`]
+    /// plus the compressed nibble body. This helper returns `true` when
+    ///
+    /// ```text
+    /// total_payload_len == AMV_AUDIO_PREAMBLE_LEN + ceil(decoded_sample_count / 2)
+    /// ```
+    ///
+    /// i.e. when the on-disk block length exactly matches the §4b
+    /// 4-bit-per-sample relation ([`Self::nibble_body_len`] plus the
+    /// preamble), and `false` otherwise. For the `comedian.amv` first
+    /// block this is `8 + 919 = 927`, the trace's recorded chunk size.
+    ///
+    /// A `total_payload_len` shorter than the 8-byte preamble returns
+    /// `false` rather than panicking — a sub-preamble length cannot carry
+    /// a valid block under §4b regardless of the declared sample count.
+    ///
+    /// Useful for a truncation-recovery / sanity pass that wants to flag
+    /// an `01wb` block whose declared `decoded_sample_count` is
+    /// inconsistent with the bytes that actually landed — e.g. a block
+    /// clipped mid-write whose compressed body is short of the nibble
+    /// budget its preamble promises.
+    pub fn is_consistent_with_body_len(&self, total_payload_len: u64) -> bool {
+        let preamble = AMV_AUDIO_PREAMBLE_LEN as u64;
+        match total_payload_len.checked_sub(preamble) {
+            Some(body_len) => body_len == self.nibble_body_len(),
+            None => false,
+        }
+    }
 }
 
 /// Strict byte-shape validation of a `00dc` video-chunk payload against
@@ -2506,6 +2565,124 @@ pub(crate) mod tests {
                 p.is_consistent_with_frame_interval(fmt.samples_per_sec, fps),
                 "fps={fps} must round-trip via frame_interval_samples"
             );
+        }
+    }
+
+    /// §4b nibble budget — the comedian first block's `1837` decoded
+    /// samples pack into `ceil(1837 / 2) = 919` compressed body bytes,
+    /// exactly the trace's recorded body length.
+    #[test]
+    fn audio_preamble_nibble_body_len_comedian_first_block() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert_eq!(p.nibble_body_len(), 919);
+    }
+
+    /// §4b nibble budget — an even sample count packs into exactly
+    /// `n / 2` body bytes with no ceiling round-up.
+    #[test]
+    fn audio_preamble_nibble_body_len_even_sample_count() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1836,
+        };
+        assert_eq!(p.nibble_body_len(), 918);
+    }
+
+    /// §4b nibble budget — a lone trailing sample still occupies a full
+    /// byte (one used nibble + one pad nibble), so `1` sample needs `1`
+    /// body byte.
+    #[test]
+    fn audio_preamble_nibble_body_len_rounds_up_odd() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1,
+        };
+        assert_eq!(p.nibble_body_len(), 1);
+    }
+
+    /// §4b nibble budget — a zero sample count needs zero body bytes.
+    #[test]
+    fn audio_preamble_nibble_body_len_zero() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 0,
+        };
+        assert_eq!(p.nibble_body_len(), 0);
+    }
+
+    /// §4b block-length cross-check — the comedian first block's full
+    /// `01wb` payload of `927` bytes (`8` preamble + `919` body) is
+    /// consistent with its declared `1837` decoded samples.
+    #[test]
+    fn audio_preamble_consistent_body_len_comedian() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert!(p.is_consistent_with_body_len(927));
+    }
+
+    /// §4b block-length cross-check — a payload one byte short of the
+    /// nibble budget (a body clipped mid-write) is rejected.
+    #[test]
+    fn audio_preamble_consistent_body_len_rejects_short_body() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert!(!p.is_consistent_with_body_len(926));
+    }
+
+    /// §4b block-length cross-check — a payload one byte over the nibble
+    /// budget is also rejected (the relation is exact, not a lower bound).
+    #[test]
+    fn audio_preamble_consistent_body_len_rejects_long_body() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert!(!p.is_consistent_with_body_len(928));
+    }
+
+    /// §4b block-length cross-check — a `total_payload_len` shorter than
+    /// the 8-byte preamble cannot carry a valid block and returns `false`
+    /// rather than panicking on the underflow.
+    #[test]
+    fn audio_preamble_consistent_body_len_rejects_sub_preamble() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert!(!p.is_consistent_with_body_len(7));
+        // The boundary case: exactly the preamble with a zero-length body
+        // only matches a zero-sample block.
+        assert!(!p.is_consistent_with_body_len(8));
+        let empty = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 0,
+        };
+        assert!(empty.is_consistent_with_body_len(8));
+    }
+
+    /// §4b end-to-end — `is_consistent_with_body_len` is the preamble
+    /// length plus `nibble_body_len`, pinned against each other for the
+    /// odd-sample-count round-up case.
+    #[test]
+    fn audio_preamble_consistent_body_len_matches_nibble_helper() {
+        for samples in [0u32, 1, 2, 3, 1836, 1837, 1378] {
+            let p = AmvAudioPreamble {
+                state: 0,
+                decoded_sample_count: samples,
+            };
+            let expected_total = AMV_AUDIO_PREAMBLE_LEN as u64 + p.nibble_body_len();
+            assert!(
+                p.is_consistent_with_body_len(expected_total),
+                "samples={samples} expected_total={expected_total}"
+            );
+            assert!(!p.is_consistent_with_body_len(expected_total + 1));
         }
     }
 

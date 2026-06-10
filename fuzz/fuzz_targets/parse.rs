@@ -41,7 +41,9 @@
 //!    `[FOURCC, size]` header.
 //! 9. [`oxideav_amv::AmvAudioPreamble::parse`] +
 //!    [`oxideav_amv::AmvAudioPreamble::validate_sentinels`] +
-//!    [`oxideav_amv::AmvAudioPreamble::is_consistent_with_frame_interval`]
+//!    [`oxideav_amv::AmvAudioPreamble::is_consistent_with_frame_interval`] +
+//!    [`oxideav_amv::AmvAudioPreamble::nibble_body_len`] +
+//!    [`oxideav_amv::AmvAudioPreamble::is_consistent_with_body_len`]
 //!    — the §4b 8-byte preamble + its strict / cross-check helpers.
 //! 10. [`oxideav_amv::validate_video_payload_shape`] +
 //!     [`oxideav_amv::validate_video_payload_no_internal_markers`]
@@ -128,11 +130,22 @@ fuzz_target!(|data: &[u8]| {
     // -----------------------------------------------------------------
     if let Ok(preamble) = AmvAudioPreamble::parse(data) {
         let _ = preamble.validate_sentinels();
+        // §4b nibble budget: the expected compressed-body byte count and
+        // the full-payload cross-check must never overflow or panic on an
+        // attacker-chosen decoded_sample_count.
+        let _ = preamble.nibble_body_len();
+        let _ = preamble.is_consistent_with_body_len(data.len() as u64);
         // Cross-check against an attacker-chosen rate / fps pair.
         if data.len() >= 16 {
             let rate = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
             let fps = u32::from_le_bytes([data[12], data[13], data[14], data[15]]);
             let _ = preamble.is_consistent_with_frame_interval(rate, fps);
+            // Drive the body-length cross-check with an attacker-chosen
+            // total length too (independent of the actual slice length).
+            let total = u64::from_le_bytes([
+                data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
+            ]);
+            let _ = preamble.is_consistent_with_body_len(total);
         }
     }
 

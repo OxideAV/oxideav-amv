@@ -8,6 +8,40 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4b 4-bit-per-sample nibble-budget helpers on `AmvAudioPreamble` —
+  new `nibble_body_len() -> u64` returns the expected compressed-body
+  byte count for the block's declared `decoded_sample_count` under the
+  trace §4b nibble-packing relation (each mono sample is one 4-bit
+  nibble, two per byte, so `body = ceil(decoded_sample_count / 2)`),
+  reproducing the trace's recorded `ceil(1837 / 2) = 919` for the
+  comedian first block. Companion
+  `is_consistent_with_body_len(total_payload_len) -> bool` cross-checks
+  a full `01wb` payload length against the budget — `true` when
+  `total_payload_len == AMV_AUDIO_PREAMBLE_LEN + ceil(decoded_sample_count
+  / 2)` (i.e. `8 + 919 = 927` for the comedian first block), `false`
+  otherwise, including a saturating-safe `false` on a sub-preamble
+  length rather than panicking on the underflow. Useful for a
+  truncation-recovery / sanity pass that wants to flag an `01wb` block
+  whose declared sample count is inconsistent with the bytes that
+  actually landed — a body clipped mid-write short of the nibble
+  budget its preamble promises. Eleven new unit tests cover the
+  comedian first-block exact match (`1837 → 919`), even / odd / zero
+  sample-count round-up cases, the full-payload `927`-byte accept, the
+  one-short / one-over rejects (the relation is exact, not a lower
+  bound), the sub-preamble + exactly-preamble boundary cases, and a
+  `nibble_body_len`-vs-`is_consistent_with_body_len` cross-pin across
+  seven sample counts. A new
+  `comedian_fixture_audio_blocks_nibble_budget` integration test walks
+  the staged `comedian.amv` `movi` payload, pins the first audio block
+  exactly to the §4b worked example (`1837` samples / `927`-byte
+  payload / `919`-byte nibble body), and asserts the majority of the
+  1116 audio blocks satisfy the nibble budget — a trace-faithful loose
+  lower bound that respects the doc's "927 bytes, occasionally 930"
+  note (the padded outliers correctly miss the exact relation). The
+  `parse` fuzz target now drives both helpers against
+  attacker-controlled `decoded_sample_count` / `total_payload_len`
+  pairs to confirm no overflow or panic.
+
 - §4 typed chunk-payload iterator — new `MoviPayloadIter<'a>` walks
   an in-memory `movi`-body byte buffer (the bytes between the
   `LIST <size> 'movi'` opener and the §4c `AMV_END_` trailer) and
