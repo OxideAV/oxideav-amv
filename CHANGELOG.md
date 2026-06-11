@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4a typed video-frame binding surface — new `AmvVideoFrame<'a>`
+  (`src/video.rs`) binds the §2 `amvh` stream geometry to a validated
+  `00dc` payload, the hand-off type a future AMV video decoder will
+  consume. Per trace §4a the `00dc` bitstream carries **no** frame
+  header of any kind (no quantization-table, Huffman-table, frame or
+  scan marker segments — those parameters are hardcoded in the
+  player's decoder) so the resolution exists *only* in the §2 header;
+  the binding makes that dependency explicit and type-safe.
+  `AmvVideoFrame::bind(header, body)` validates non-zero §2 geometry
+  plus the §4a SOI / EOI bracket (via the existing
+  `validate_video_payload_shape`); `bind_strict` additionally runs the
+  §4a no-internal-markers scan. Accessors: `width()` / `height()` (§2
+  body offsets +0x20 / +0x24), `body()` (full bracketed payload),
+  `entropy_coded()` (the window strictly between SOI and EOI — §4a
+  "immediately after SOI the bytes are entropy-coded data"), and
+  `is_keyframe()` (always `true` — §4a "Every frame is a keyframe",
+  intra-only). Nine new unit tests cover the minimal 4-byte bracket
+  bind, entropy-window slicing against the §4a worked-example bytes,
+  missing-SOI / missing-EOI / sub-minimum rejects, zero-width /
+  zero-height geometry rejects, the strict-bind internal-marker
+  reject vs. plain-bind accept, and byte-stuffing (`FF 00`)
+  acceptance under the strict scan. A new
+  `comedian_fixture_strict_binds_all_1116_video_frames` integration
+  test parses the §2 `amvh` straight from the staged fixture bytes,
+  walks the `movi` payload with `MoviPayloadIter`, and strict-binds
+  every `00dc` chunk: 1116 frames bound, all 128 × 96, all keyframes,
+  first three payload sizes pinned to the §4 chunk table
+  (1633 / 1627 / 1625), and frame 0's entropy window pinned to
+  `1633 − 4 = 1629` bytes beginning `E6 49 A6 93` (the §4a hexdump).
+  The actual entropy decode remains out of reach of the staged trace:
+  `amv-container-trace.md` §4a records that the tables / scan
+  parameters are device-hardcoded but does not enumerate them.
+
 - §4b 4-bit-per-sample nibble-budget helpers on `AmvAudioPreamble` —
   new `nibble_body_len() -> u64` returns the expected compressed-body
   byte count for the block's declared `decoded_sample_count` under the

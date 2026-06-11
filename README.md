@@ -117,6 +117,23 @@ bracket check **and** the new §4a strict-marker scan, and its 1116
 audio chunks all pass the §4b preamble check (verified end-to-end by
 the test suite).
 
+On top of those validators sits `AmvVideoFrame`, the typed hand-off
+surface for a future AMV video decoder. Per trace §4a the `00dc`
+bitstream carries no frame header at all — quantization / Huffman
+tables and scan parameters are hardcoded in the player and "the
+resolution comes from `amvh` (§2)" — so a decoder can never consume a
+chunk body in isolation. `AmvVideoFrame::bind(header, body)` makes the
+dependency explicit: it validates non-zero §2 geometry plus the §4a
+SOI / EOI bracket and yields a frame exposing `width()` / `height()`,
+the full `body()`, the `entropy_coded()` window strictly between SOI
+and EOI, and `is_keyframe()` (always `true` — §4a, intra-only;
+`bind_strict` adds the no-internal-markers scan). The fixture test
+strict-binds all 1116 `comedian.amv` frames at 128 × 96, pins the
+first three payload sizes to the §4 chunk table (1633 / 1627 / 1625)
+and frame 0's 1629-byte entropy window to the §4a hexdump bytes
+`E6 49 A6 93`. The entropy decode itself stays out of scope until the
+trace (or a follow-up doc) enumerates the device-hardcoded tables.
+
 For tooling that wants to recompute the `amvh +0x34` packed-byte
 duration independently of the muxer's `write_trailer` patch path —
 for example, when re-stamping a recovered truncated file's header
@@ -271,8 +288,8 @@ probing and the `.amv` extension hint for the read path, and
 
 The crate also exposes its byte-level parsers as a standalone library
 (`AmvHeader`, `AmvDuration`, `AmvWaveFormat`, `AmvAudioPreamble`,
-`ChunkHeader`, `ChunkKind`, plus the chunk-tag / trailer / JPEG-marker
-constants and the `validate_video_payload_shape` /
+`AmvVideoFrame`, `ChunkHeader`, `ChunkKind`, plus the chunk-tag /
+trailer / JPEG-marker constants and the `validate_video_payload_shape` /
 `validate_video_payload_no_internal_markers` /
 `validate_movi_interleave` free functions) for tooling that wants to
 inspect AMV files without the framework dependency at the demuxer

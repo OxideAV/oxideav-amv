@@ -24,6 +24,10 @@
 //! leaf chunk. The video stream is declared as `mjpeg` and the audio
 //! stream as `adpcm_amv`; actual frame / sample decoding lives in
 //! sibling codec crates and is invoked downstream of the demuxer.
+//! [`AmvVideoFrame`] is the typed hand-off surface for that future
+//! video decoder: it binds the `amvh` geometry (the only place the
+//! resolution exists — the `00dc` bitstream carries no frame header)
+//! to a validated `00dc` payload and exposes the entropy-coded window.
 //!
 //! ## What this crate writes
 //!
@@ -70,6 +74,7 @@
 mod demuxer;
 mod muxer;
 mod parse;
+mod video;
 
 pub use demuxer::{AmvDemuxer, AmvDemuxerError, ChunkIndexEntry};
 pub use muxer::AmvMuxer;
@@ -79,6 +84,7 @@ pub use parse::{
     ChunkHeader, ChunkKind, MoviPayload, MoviPayloadIter, AMVH_BODY_LEN, AMV_AUDIO_PREAMBLE_LEN,
     AMV_END_TRAILER, AMV_FORM_TYPE, AUDIO_CHUNK_TAG, JPEG_EOI, JPEG_SOI, VIDEO_CHUNK_TAG,
 };
+pub use video::AmvVideoFrame;
 
 use oxideav_core::{
     CodecRegistry, CodecResolver, ContainerRegistry, Demuxer, Error, ProbeData, ProbeScore,
