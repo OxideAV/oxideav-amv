@@ -15,3 +15,29 @@ categories = ["multimedia::encoding", "multimedia"]
 
 [dependencies]
 oxideav-core = "0.1"
+
+[dev-dependencies]
+# Round 289 (depth-mode benchmarks): Criterion drives four self-contained
+# bench binaries under `benches/` that A/B the container demux / index /
+# seek / mux hot paths. Every bench input is synthesised in-bench through
+# the crate's own public `AmvMuxer` write path (no committed fixture
+# file). Pinned to the same 0.5 line the other OxideAV crates with
+# benches use. Run with:
+#     cargo bench -p oxideav-amv --bench <name>
+criterion = "0.5"
+
+[[bench]]
+name = "demux_drain"
+harness = false
+
+[[bench]]
+name = "build_index"
+harness = false
+
+[[bench]]
+name = "indexed_seek"
+harness = false
+
+[[bench]]
+name = "mux_write"
+harness = false

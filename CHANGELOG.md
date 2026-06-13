@@ -8,6 +8,23 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Criterion benchmark suite (depth-mode round) — four self-contained
+  bench binaries under `benches/` that A/B the container hot paths, each
+  synthesising its input in-bench through the crate's **public**
+  `AmvMuxer` write path (no committed fixture file). `demux_drain` opens
+  and walks a 1116-pair file to the §4c `AMV_END_` trailer via
+  `AmvDemuxer` + `Demuxer::next_packet` (the 8-byte chunk-header parse,
+  §4 no-padding `8 + size` advance, per-stream PTS accounting);
+  `build_index` benches `build_chunk_index` (the Seek-skip-bodies offset
+  table walk); `indexed_seek` measures a 10-target seek spread on the
+  binary-search-backed `seek_to_via_index` path **and** the linear
+  disk-walking fallback in one group, quantifying the index payoff
+  (~7× on the local run: ~7.0 µs indexed vs ~49.4 µs linear);
+  `mux_write` benches the full `write_header` + 1116-pair `write_packet`
+  + `write_trailer` write path. A shared `benches/common/mod.rs` carries
+  the muxer driver (an `Arc<Mutex<Cursor<Vec<u8>>>>`-backed `WriteSeek`
+  so the bytes survive the muxer's `Box<dyn WriteSeek>` type erasure)
+  and the `comedian.amv` `StreamInfo` pair. Bench-only; no `src/` change.
 - §4a typed video-frame binding surface — new `AmvVideoFrame<'a>`
   (`src/video.rs`) binds the §2 `amvh` stream geometry to a validated
   `00dc` payload, the hand-off type a future AMV video decoder will

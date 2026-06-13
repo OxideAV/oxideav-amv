@@ -258,6 +258,29 @@ build clean on the `aarch64-apple-darwin` nightly toolchain via
 2 000 mutated iterations plus the staged `comedian.amv` device
 fixture as a seed input.
 
+A Criterion benchmark suite lives under [`benches/`](./benches/) with
+four self-contained binaries that A/B the container hot paths; every
+bench input is synthesised in-bench through the crate's **public**
+`AmvMuxer` write path, so no fixture file is committed. `demux_drain`
+opens and walks a 1116-pair file (the `comedian.amv` chunk count) to
+the §4c `AMV_END_` trailer through `AmvDemuxer` + `Demuxer::next_packet`
+— the 8-byte chunk-header parse, the §4 no-padding `8 + size` advance,
+and the per-stream PTS accounting. `build_index` benches
+`build_chunk_index`, the Seek-skip-bodies walk that records every
+chunk's file offset plus its pre-emit PTS. `indexed_seek` measures a
+ten-target seek spread (forward and backward jumps across the clip)
+twice in one group — once on the binary-search-backed
+`seek_to_via_index` path and once on the linear disk-walking fallback —
+quantifying the chunk-index payoff (the local run measured roughly a
+7× speedup: about 7.0 µs for the ten indexed seeks versus 49.4 µs for
+the same spread walked linearly). `mux_write` benches the full
+`write_header` + 1116-pair `write_packet` + `write_trailer` write path.
+A shared `benches/common/mod.rs` carries the muxer driver (an
+`Arc<Mutex<Cursor<Vec<u8>>>>`-backed `WriteSeek` so the bytes survive
+the muxer's `Box<dyn WriteSeek>` type erasure) and the `comedian.amv`
+`StreamInfo` pair. Run with
+`cargo bench -p oxideav-amv --bench <name>`.
+
 Frame and sample **decoding** are out of scope — the video stream is declared
 as the `mjpeg` codec id (the actual JPEG payload requires the player's stripped
 quant / Huffman tables to be spliced back in, which a downstream codec
