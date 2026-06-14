@@ -69,6 +69,21 @@ the same recovery, so an index built from a truncated file covers
 every chunk that did land and an indexed seek over it still navigates
 the surviving payload correctly.
 
+Because all RIFF / LIST sizes are zeroed and there is no `idx1` index
+(§1 quirks), the 8-byte `AMV_END_` ASCII trailer is the *only* byte
+bound the stream carries (§4c). On a clean trailer-bounded drain,
+`AmvDemuxer::trailer_offset()` reports the absolute file offset where
+that literal was observed, and `trailer_matches_eof(stream_len)`
+cross-checks it against a caller-supplied total length using the §4
+no-padding worked example: a correct `8 + size` walk lands the trailer
+at exactly `stream_len − 8`. For `comedian.amv` that is `0x348E31` —
+8 bytes before the `0x348E39` EOF — and a demuxer that had mis-applied
+AVI even-byte padding would desync and never see the literal at a
+clean 8-byte boundary. The accessor stays `None` for a stream drained
+by truncation (the trailer never landed), so together with
+`is_truncated()` it classifies all three terminal states: still
+walking, clean trailer EOF, or truncated EOF.
+
 Tooling that wants to filter "real device-profile AMV files" from
 garbled inputs up-front can use `AmvDemuxer::open_strict`. The strict
 variant runs the trace doc's §2 + §3 sentinel checks before any `movi`

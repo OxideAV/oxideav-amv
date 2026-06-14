@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4c trailer-offset cross-check on the demuxer — new
+  `AmvDemuxer::trailer_offset() -> Option<u64>` records the absolute
+  file offset at which the `AMV_END_` ASCII trailer is observed when the
+  `movi` walk terminates cleanly (via `next_packet` or the linear
+  `seek_to` path). Because all RIFF / LIST sizes are zeroed and there is
+  no `idx1` index (§1 quirks), this trailer is the *only* byte-bound the
+  stream carries (§4c), and the §4 no-padding proof turns on its exact
+  position. The companion `trailer_matches_eof(stream_len) ->
+  Option<bool>` applies that proof: a clean `8 + size` walk lands the
+  trailer at `stream_len − 8` (the trailer is the file's final 8 bytes).
+  The accessor stays `None` for a stream drained by truncation (the
+  trailer never landed), so together with `is_truncated()` it classifies
+  all three terminal states — still walking, clean trailer EOF, or
+  truncated EOF. Four new unit tests pin the clean-EOF offset and the
+  `stream_len ± 1` match/mismatch, the truncation `None` case, and the
+  `seek_to`-past-end recording path; the `comedian.amv` fixture walk now
+  additionally pins the §4 worked example directly — trailer at
+  `0x348E31`, EOF at `0x348E39`, `trailer_matches_eof` true.
 - Criterion benchmark suite (depth-mode round) — four self-contained
   bench binaries under `benches/` that A/B the container hot paths, each
   synthesising its input in-bench through the crate's **public**

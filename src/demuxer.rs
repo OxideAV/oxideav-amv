@@ -135,6 +135,13 @@ pub struct AmvDemuxer {
     /// "device-power-cut before trailer landed" from "saw `AMV_END_`
     /// cleanly".
     truncated: bool,
+    /// Absolute file offset at which the §4c [`AMV_END_TRAILER`] literal
+    /// was observed, recorded once the walk terminates cleanly on the
+    /// trailer (`next_packet` / `seek_to` reading the 8 trailer bytes at
+    /// the current cursor). `None` until the trailer is seen and `None`
+    /// for a stream that drained via truncation instead (the trailer
+    /// never landed). See [`AmvDemuxer::trailer_offset`].
+    trailer_offset: Option<u64>,
 }
 
 impl std::fmt::Debug for AmvDemuxer {
@@ -270,6 +277,7 @@ impl AmvDemuxer {
             next_audio_pts: 0,
             chunk_index: None,
             truncated: false,
+            trailer_offset: None,
         })
     }
 
@@ -439,6 +447,71 @@ impl AmvDemuxer {
     pub fn is_truncated(&self) -> bool {
         self.truncated
     }
+
+    /// Absolute file offset at which the §4c [`AMV_END_TRAILER`] literal
+    /// (`AMV_END_`) was observed, or `None` if the walk has not yet
+    /// reached a clean trailer-bounded EOF.
+    ///
+    /// AMV files carry no `idx1` index and all RIFF / LIST sizes are
+    /// zeroed (§1 quirks), so the 8-byte `AMV_END_` ASCII trailer is the
+    /// *only* thing that bounds the `movi` payload (§4c "This trailer …
+    /// is what bounds the stream for the device"). The trace's §4
+    /// no-padding proof turns on exactly this offset: walking
+    /// `comedian.amv` by `8 + size` per chunk for all 2232 chunks lands
+    /// the cursor at `0x348E31`, which is where the `AMV_END_` trailer
+    /// sits — `8` bytes before the `0x348E39` EOF. A demuxer that had
+    /// mis-applied AVI even-byte padding would desync and never see the
+    /// literal at a clean 8-byte boundary.
+    ///
+    /// The field is populated only when the walk terminates by reading
+    /// the trailer literal at the chunk-header cursor — via
+    /// [`Demuxer::next_packet`](oxideav_core::Demuxer::next_packet) or
+    /// [`Demuxer::seek_to`](oxideav_core::Demuxer::seek_to). It stays
+    /// `None` for a stream drained by truncation (the trailer never
+    /// landed — see [`Self::is_truncated`]), so the two accessors
+    /// together classify the three terminal states:
+    ///
+    /// * still walking → `trailer_offset() == None && !is_truncated()`,
+    /// * clean trailer EOF → `trailer_offset() == Some(off)`,
+    /// * truncated EOF → `trailer_offset() == None && is_truncated()`.
+    ///
+    /// On a clean walk the returned offset equals `file_len - 8` (the
+    /// trailer is the final 8 bytes), so a caller that also knows the
+    /// stream length can cross-check the no-padding walk arrived exactly
+    /// where §4 says it should. See [`Self::trailer_matches_eof`].
+    pub fn trailer_offset(&self) -> Option<u64> {
+        self.trailer_offset
+    }
+
+    /// Cross-check the observed §4c trailer offset against a known total
+    /// stream byte length, applying the §4 no-padding worked-example
+    /// invariant: a clean `8 + size` walk lands the `AMV_END_` trailer
+    /// at exactly `stream_len - 8` (the trailer is the final 8 bytes of
+    /// the file, with no `idx1` index between the payload and EOF — §4c).
+    ///
+    /// Returns:
+    ///
+    /// * `Some(true)` when the trailer was observed
+    ///   ([`Self::trailer_offset`] is `Some`) and its offset equals
+    ///   `stream_len.checked_sub(8)` — for `comedian.amv` this is
+    ///   `0x348E39 - 8 == 0x348E31`, the trace's recorded trailer
+    ///   position.
+    /// * `Some(false)` when the trailer was observed but its offset does
+    ///   **not** match `stream_len - 8` (e.g. trailing garbage after the
+    ///   trailer, or a `stream_len` that disagrees with the walk).
+    /// * `None` when no trailer has been observed yet — the walk has not
+    ///   reached a clean trailer-bounded EOF, so there is nothing to
+    ///   cross-check (the caller should consult [`Self::is_truncated`]).
+    ///
+    /// `stream_len` is the caller-supplied total file length in bytes
+    /// (e.g. from `std::fs::metadata`); the demuxer does not measure it
+    /// itself because the [`ReadSeek`](oxideav_core::ReadSeek) contract
+    /// is forward-walk oriented and a final length probe would perturb
+    /// the cursor.
+    pub fn trailer_matches_eof(&self, stream_len: u64) -> Option<bool> {
+        self.trailer_offset
+            .map(|off| stream_len.checked_sub(AMV_END_TRAILER.len() as u64) == Some(off))
+    }
 }
 
 impl Demuxer for AmvDemuxer {
@@ -478,6 +551,9 @@ impl Demuxer for AmvDemuxer {
         // sane; checking the literal first is simpler).
         if header_bytes == AMV_END_TRAILER {
             self.eof = true;
+            // Record where the §4c trailer landed — the only byte-bound
+            // the stream carries (§1 quirks: zeroed sizes, no idx1).
+            self.trailer_offset = Some(self.cursor);
             return Err(Error::Eof);
         }
 
@@ -591,6 +667,7 @@ impl Demuxer for AmvDemuxer {
             }
             if header_bytes == AMV_END_TRAILER {
                 self.eof = true;
+                self.trailer_offset = Some(self.cursor);
                 return Ok(match stream_index {
                     STREAM_INDEX_VIDEO => self.next_video_pts,
                     STREAM_INDEX_AUDIO => self.next_audio_pts,
@@ -1131,6 +1208,23 @@ mod tests {
         // §4 worked example: first video chunk is 1633 bytes (size
         // 0x661).
         assert_eq!(first_video_size, Some(1633));
+
+        // §4 no-padding proof: the `8 + size` walk lands the `AMV_END_`
+        // trailer at file offset 0x348E31 — exactly 8 bytes before the
+        // 0x348E39 EOF.
+        let stream_len = std::fs::metadata(&path).expect("metadata").len();
+        assert_eq!(stream_len, 0x348E39, "comedian.amv is 0x348E39 bytes");
+        assert_eq!(
+            d.trailer_offset(),
+            Some(0x348E31),
+            "§4 trailer lands at 0x348E31 after the no-padding walk"
+        );
+        assert_eq!(
+            d.trailer_matches_eof(stream_len),
+            Some(true),
+            "§4c trailer is the final 8 bytes (stream_len - 8)"
+        );
+        assert!(!d.is_truncated(), "complete fixture is not truncated");
     }
 
     /// Real-fixture seek_to test: walk to EOF, then seek back to video
@@ -1413,6 +1507,68 @@ mod tests {
             !d.is_truncated(),
             "drained via AMV_END_ — must not be flagged truncated"
         );
+    }
+
+    // --- §4c trailer-offset cross-check -----------------------------
+    //
+    // The §4c `AMV_END_` trailer is the only byte-bound the stream
+    // carries (§1 quirks: zeroed RIFF/LIST sizes, no idx1). The §4
+    // no-padding proof turns on its exact file offset — a clean
+    // `8 + size` walk must land it at `stream_len - 8`. These tests pin
+    // the `trailer_offset()` / `trailer_matches_eof()` accessors that
+    // surface that observation.
+
+    /// Before any walk the trailer offset is unknown; after a clean
+    /// `AMV_END_`-bounded drain it equals `stream_len - 8` (the trailer
+    /// is the final 8 bytes), and `trailer_matches_eof` confirms the
+    /// §4 no-padding landing.
+    #[test]
+    fn trailer_offset_records_clean_eof_position() {
+        let buf = build_synthetic_file(3);
+        let stream_len = buf.len() as u64;
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        // Not yet observed.
+        assert_eq!(d.trailer_offset(), None);
+        assert_eq!(d.trailer_matches_eof(stream_len), None);
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        // The trailer occupies the last 8 bytes of the file.
+        assert_eq!(d.trailer_offset(), Some(stream_len - 8));
+        assert_eq!(d.trailer_matches_eof(stream_len), Some(true));
+        // A stream_len that disagrees with the walk fails the check.
+        assert_eq!(d.trailer_matches_eof(stream_len + 1), Some(false));
+    }
+
+    /// A truncated stream (no `AMV_END_`) never records a trailer
+    /// offset — the three terminal states stay distinguishable:
+    /// truncated EOF has `trailer_offset() == None && is_truncated()`.
+    #[test]
+    fn trailer_offset_stays_none_on_truncation() {
+        let mut buf = build_synthetic_file(3);
+        buf.truncate(buf.len() - 8); // drop AMV_END_
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        while d.next_packet().is_ok() {}
+        assert!(d.is_truncated());
+        assert_eq!(d.trailer_offset(), None);
+        // With no observed trailer there is nothing to cross-check.
+        assert_eq!(d.trailer_matches_eof(1_000), None);
+    }
+
+    /// `seek_to` that walks off the end onto the trailer records the
+    /// offset too (the linear-seek path shares the §4c terminal check).
+    #[test]
+    fn trailer_offset_recorded_by_seek_to_past_end() {
+        let buf = build_synthetic_file(2);
+        let stream_len = buf.len() as u64;
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        let _ = d.seek_to(0, 1_000_000).expect("seek past end");
+        assert_eq!(d.trailer_offset(), Some(stream_len - 8));
+        assert_eq!(d.trailer_matches_eof(stream_len), Some(true));
     }
 
     /// Truncation pattern #1: the file ends exactly after the last
