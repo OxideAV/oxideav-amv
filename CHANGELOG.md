@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §2↔§4 header / walk duration cross-check on the demuxer — new
+  `AmvDemuxer::video_frames_emitted() -> u64` surfaces the count of
+  stream-0 video chunks the `movi` walk has drained (the value the
+  demuxer already tracks for PTS stamping, incremented by exactly one
+  per `00dc` chunk), and `duration_consistent_with_drained_frames() ->
+  bool` ties it back to the §2 `amvh` packed-byte duration via the
+  trace's central header↔payload invariant ("1116 frames ÷ 12 fps =
+  93 s = 1:33", §2). The cross-check is the demuxer-level companion to
+  the existing `AmvDuration::is_consistent_with_frame_count` free
+  function: that takes a caller-supplied frame count, whereas the new
+  method feeds it the count the walker actually drained, so after a full
+  forward drain a caller can confirm in one call that the device-written
+  duration agrees with the chunks that landed. On a truncated file the
+  header still records the device's intended full duration while the walk
+  only reached the surviving chunks, so the cross-check returns `false`
+  — the signal a recovery tool needs to decide whether to re-stamp the
+  header. Four new unit tests pin the per-chunk count tracking, the
+  matching (1116 frames / 1:33) and deliberately mismatched (3 frames /
+  1:33) synthetic cases, and a real `comedian.amv` fixture drain that
+  confirms its 1116-frame walk agrees with the packed `1:33` duration.
 - §4c trailer-offset cross-check on the demuxer — new
   `AmvDemuxer::trailer_offset() -> Option<u64>` records the absolute
   file offset at which the `AMV_END_` ASCII trailer is observed when the

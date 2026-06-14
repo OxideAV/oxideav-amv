@@ -84,6 +84,22 @@ by truncation (the trailer never landed), so together with
 `is_truncated()` it classifies all three terminal states: still
 walking, clean trailer EOF, or truncated EOF.
 
+The demuxer also ties the §4 `movi` walk back to the §2 header.
+`AmvDemuxer::video_frames_emitted()` reports the count of stream-0
+video chunks drained so far (the value already tracked for PTS
+stamping, bumped once per `00dc`), and
+`duration_consistent_with_drained_frames()` confirms — after a full
+forward drain — that the §2 `amvh` packed-byte duration agrees with
+that count via the trace's central invariant ("1116 frames ÷ 12 fps
+= 93 s = 1:33", §2). It is the demuxer-level companion to the
+`AmvDuration::is_consistent_with_frame_count` free function: the
+latter takes a caller-supplied count, the former feeds it the count
+the walk actually produced. A clean `comedian.amv` drain reports
+`true`; a truncated file returns `false` (the header records the
+device's intended full duration while only the surviving chunks
+landed) — exactly the signal a recovery tool needs to decide whether
+to re-stamp the header via `AmvDuration::from_frame_count`.
+
 Tooling that wants to filter "real device-profile AMV files" from
 garbled inputs up-front can use `AmvDemuxer::open_strict`. The strict
 variant runs the trace doc's §2 + §3 sentinel checks before any `movi`

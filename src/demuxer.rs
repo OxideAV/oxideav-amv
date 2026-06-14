@@ -448,6 +448,72 @@ impl AmvDemuxer {
         self.truncated
     }
 
+    /// Number of stream-0 video frames the walker has emitted so far.
+    ///
+    /// AMV interleaves chunks in a strict 1:1 video-first cadence (§4)
+    /// and stamps each video chunk with a monotonically increasing
+    /// `pts`/`dts` on the `1/fps` clock; the counter is incremented by
+    /// exactly one per emitted `00dc` chunk, so after a complete drain
+    /// it equals the total video-frame count the §4 `movi` walk found.
+    /// For `comedian.amv` that is `1116` — the value the trace's §2
+    /// worked example divides by `fps` to recover the packed duration
+    /// (`1116 ÷ 12 = 93 s = 1:33`).
+    ///
+    /// Because AMV carries no `idx1` index and zeroes every RIFF / LIST
+    /// size (§1 quirks), the only way to learn the frame count is to
+    /// walk the payload — this accessor surfaces the count the demuxer
+    /// already tracks for PTS stamping so a caller does not have to keep
+    /// its own tally alongside the walk. The count reflects whatever has
+    /// been drained at the moment it is read: it is `0` immediately after
+    /// [`Self::open`], grows as [`Demuxer::next_packet`] emits video
+    /// chunks, and on a truncated file (see [`Self::is_truncated`])
+    /// reports the number of complete video chunks that landed before the
+    /// device cut off. After a [`Demuxer::seek_to`] it reflects the seek
+    /// target's frame index (the counter is rewound / fast-forwarded with
+    /// the cursor), so read it only after a full forward drain when using
+    /// it as a total.
+    pub fn video_frames_emitted(&self) -> u64 {
+        // `next_video_pts` is the PTS the *next* video chunk will carry;
+        // since stamping starts at 0 and steps by 1 per emitted video
+        // chunk, it equals the count already emitted.
+        self.next_video_pts.max(0) as u64
+    }
+
+    /// Cross-check the §2 `amvh` packed-byte duration against the §4
+    /// `movi`-walk video-frame count, applying the trace's central
+    /// header↔payload invariant: "1116 frames ÷ 12 fps = 93 s = 1:33"
+    /// (§2). Returns `true` when the header's packed
+    /// `[seconds, minutes, hours]` triple equals
+    /// [`AmvDuration::from_frame_count`](crate::AmvDuration::from_frame_count) computed from
+    /// [`Self::video_frames_emitted`] and the header `fps`.
+    ///
+    /// This is the demuxer-level companion to
+    /// [`AmvDuration::is_consistent_with_frame_count`](crate::AmvDuration::is_consistent_with_frame_count): that free
+    /// function takes a caller-supplied frame count, whereas this method
+    /// feeds it the count the walker actually drained, so a caller that
+    /// has done a full forward drain can confirm in one call that the
+    /// device-written duration agrees with the chunks that landed.
+    ///
+    /// Read this **only after a complete forward drain to EOF**. On a
+    /// partial walk or right after a backwards [`Demuxer::seek_to`],
+    /// [`Self::video_frames_emitted`] reflects the cursor position rather
+    /// than the stream total, so the comparison would be against an
+    /// incomplete count.
+    ///
+    /// For a **clean** trailer-bounded drain ([`Self::trailer_offset`]
+    /// is `Some`) of a well-formed file this returns `true`. A truncated
+    /// file (see [`Self::is_truncated`]) typically returns `false`: the
+    /// header still records the device's intended full duration while the
+    /// walk only reached the chunks that survived the power-cut — that
+    /// disagreement is exactly the signal a recovery tool wants in order
+    /// to decide whether to re-stamp the header via
+    /// [`AmvDuration::from_frame_count`](crate::AmvDuration::from_frame_count).
+    pub fn duration_consistent_with_drained_frames(&self) -> bool {
+        self.header
+            .duration()
+            .is_consistent_with_frame_count(self.video_frames_emitted(), self.header.fps)
+    }
+
     /// Absolute file offset at which the §4c [`AMV_END_TRAILER`] literal
     /// (`AMV_END_`) was observed, or `None` if the walk has not yet
     /// reached a clean trailer-bounded EOF.
@@ -917,7 +983,16 @@ mod tests {
     /// the demuxer end-to-end without depending on the staged
     /// fixture's docs/.
     fn build_synthetic_file(n_pairs: usize) -> Vec<u8> {
-        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        build_synthetic_file_with_duration(n_pairs, 0x0000_0121)
+    }
+
+    /// Same as [`build_synthetic_file`] but with a caller-chosen
+    /// `amvh +0x34` packed-byte duration so the §2-header↔§4-walk
+    /// cross-check ([`AmvDemuxer::duration_consistent_with_drained_frames`])
+    /// can be exercised for both a matching and a deliberately
+    /// mismatched header.
+    fn build_synthetic_file_with_duration(n_pairs: usize, duration_packed: u32) -> Vec<u8> {
+        let mut buf = build_synthetic_prelude(128, 96, 12, duration_packed, 22_050);
         for i in 0..n_pairs {
             // Video: 4-byte payload with the iteration index so we
             // can tell frames apart.
@@ -950,6 +1025,81 @@ mod tests {
         assert_eq!(d.streams()[1].params.channels, Some(1));
         assert_eq!(d.cursor(), 0x13C);
         assert_eq!(d.duration_micros(), Some(93_000_000));
+    }
+
+    #[test]
+    fn video_frames_emitted_tracks_drained_count() {
+        // 12 pairs: 12 video chunks, 12 audio chunks, then trailer.
+        let buf = build_synthetic_file(12);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        assert_eq!(d.video_frames_emitted(), 0, "no frames before any drain");
+        // Emit one V/A pair → one video frame counted.
+        let _v0 = d.next_packet().expect("v0");
+        assert_eq!(d.video_frames_emitted(), 1, "one video chunk emitted");
+        let _a0 = d.next_packet().expect("a0");
+        assert_eq!(
+            d.video_frames_emitted(),
+            1,
+            "audio chunk does not bump the video count"
+        );
+        // Drain the rest to EOF.
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert_eq!(
+            d.video_frames_emitted(),
+            12,
+            "all 12 video chunks counted after a full drain"
+        );
+    }
+
+    #[test]
+    fn duration_cross_check_matches_when_header_agrees_with_walk() {
+        // §2 worked example: at 12 fps, 1116 video frames pack to
+        // 1116 / 12 = 93 s = 1:33 = packed 0x0000_0121. Build a file
+        // whose header carries exactly that duration and whose walk
+        // drains exactly 1116 video frames, and confirm the demuxer's
+        // header↔walk cross-check agrees after a full drain.
+        let buf = build_synthetic_file_with_duration(1116, 0x0000_0121);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert_eq!(d.video_frames_emitted(), 1116);
+        assert!(
+            d.duration_consistent_with_drained_frames(),
+            "§2 packed 1:33 must agree with 1116 frames at 12 fps"
+        );
+    }
+
+    #[test]
+    fn duration_cross_check_rejects_when_header_disagrees_with_walk() {
+        // Header still declares the full 1:33 duration (0x0000_0121),
+        // but the file only carries 3 video frames — the shape of a
+        // truncated / re-stamped file whose header was not corrected.
+        // 3 / 12 = 0 s, which is NOT 1:33, so the cross-check fails.
+        let buf = build_synthetic_file_with_duration(3, 0x0000_0121);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert_eq!(d.video_frames_emitted(), 3);
+        assert!(
+            !d.duration_consistent_with_drained_frames(),
+            "header's 1:33 must not agree with only 3 drained frames"
+        );
     }
 
     #[test]
@@ -1225,6 +1375,47 @@ mod tests {
             "§4c trailer is the final 8 bytes (stream_len - 8)"
         );
         assert!(!d.is_truncated(), "complete fixture is not truncated");
+    }
+
+    /// Real-fixture cross-check: walk `comedian.amv` to EOF and confirm
+    /// the §2 `amvh` packed duration agrees with the §4 `movi`-walk
+    /// video-frame count, the trace's central header↔payload invariant
+    /// ("1116 frames ÷ 12 fps = 93 s = 1:33", §2).
+    #[test]
+    fn comedian_fixture_duration_agrees_with_drained_frame_count() {
+        let crate_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");
+        let workspace_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/container/amv/fixtures/comedian.amv");
+        let path = if crate_path.exists() {
+            crate_path
+        } else if workspace_path.exists() {
+            workspace_path
+        } else {
+            eprintln!("skipping comedian duration cross-check: fixture not found");
+            return;
+        };
+        let f = std::fs::File::open(&path).expect("open comedian.amv");
+        let mut d =
+            AmvDemuxer::open(std::io::BufReader::new(f)).expect("open comedian.amv demuxer");
+        // Drain to a clean trailer-bounded EOF.
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert!(!d.is_truncated(), "complete fixture drains via the trailer");
+        assert_eq!(
+            d.video_frames_emitted(),
+            1116,
+            "§4 walk drains 1116 video frames"
+        );
+        assert!(
+            d.duration_consistent_with_drained_frames(),
+            "§2 packed 1:33 must agree with 1116 frames at 12 fps"
+        );
     }
 
     /// Real-fixture seek_to test: walk to EOF, then seek back to video
