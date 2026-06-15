@@ -49,7 +49,13 @@ id and the audio stream as the `adpcm_amv` placeholder.
 - **Consistency checks** — `video_frames_emitted()` and
   `duration_consistent_with_drained_frames()` tie the `movi` walk back
   to the `amvh` packed-byte duration via the trace invariant
-  (frames ÷ fps = duration).
+  (frames ÷ fps = duration). `audio_blocks_emitted()` and
+  `movi_interleave_balanced()` add the §4 strict 1:1 video:audio pairing
+  cross-check at the demuxer level: after a clean trailer-bounded drain
+  the `01wb`-block count equals the `00dc`-frame count ("1116 / 1116,
+  perfectly paired"), so a truncation that cut off after a trailing video
+  frame surfaces as an imbalance — without buffering the whole chunk-kind
+  sequence the way the free-function `validate_movi_interleave` requires.
 
 ### Muxer
 

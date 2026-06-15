@@ -8,6 +8,34 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4 demuxer-level 1:1 video:audio interleave cross-check — new
+  `AmvDemuxer::audio_blocks_emitted() -> u64` surfaces the count of
+  `01wb` audio **blocks** (chunks) the `movi` walk has drained, the
+  chunk-count companion to the existing `video_frames_emitted()` (which
+  the audio `pts` accumulator, a *sample* count, could not provide), and
+  `AmvDemuxer::movi_interleave_balanced() -> bool` ties the two together
+  via the trace's §4 strict 1:1 video-first pairing rule ("1116 `00dc`
+  then 1116 `01wb`, perfectly paired"; §5 hierarchy "strict 1:1,
+  video-first"). After a clean trailer-bounded drain the `01wb` and
+  `00dc` counts are equal, so a truncation that cut the device off after
+  a trailing `00dc` but before its paired `01wb` surfaces as an imbalance
+  (`video_frames_emitted() - audio_blocks_emitted() == 1`) — the same
+  unpaired-trailing-video signal the free-function
+  `validate_movi_interleave` reports, but computed streaming over the
+  walk **without** buffering the entire chunk-kind sequence into a `Vec`
+  the way that function requires. The new counter mirrors the audio-PTS
+  counter's lifecycle exactly: it is rewound / fast-forwarded with the
+  cursor by `seek_to` (linear and indexed paths), preserved across
+  `build_chunk_index`, and a new `ChunkIndexEntry::audio_blocks_before`
+  field lets an indexed seek snap it to the target without re-walking;
+  the indexed past-end case derives the count exactly (unlike the
+  unrecoverable last-block sample count) so `movi_interleave_balanced`
+  stays correct after a seek beyond the last chunk. Six new unit tests
+  pin the streaming count, the at-pair-boundary-only `true` window, the
+  full-drain balance, the truncated-trailing-video imbalance, the
+  linear-seek rewind, and the indexed-seek + past-end + index-entry
+  monotonic `audio_blocks_before` cases.
+
 - §2 `amvh` reserved-span strict validation — `AmvDemuxer::open_strict`
   (via `AmvPrelude::parse_strict`) now enforces the trace's §2 "reserved
   / zeroed (7 dwords)" annotation for the 28 bytes between

@@ -93,6 +93,13 @@ pub struct ChunkIndexEntry {
     /// consuming this chunk. For an audio chunk this is the `pts` that
     /// `next_packet` will stamp on the emitted packet.
     pub audio_pts_before: i64,
+    /// Cumulative count of `01wb` audio **blocks** (chunks) emitted
+    /// **before** consuming this chunk — the chunk-count companion to
+    /// [`Self::audio_pts_before`]'s sample count. Lets a seek snap the
+    /// demuxer's [`AmvDemuxer::audio_blocks_emitted`] counter to the
+    /// indexed position without re-walking, preserving the §4
+    /// 1:1-pairing cross-check after an indexed seek.
+    pub audio_blocks_before: u64,
 }
 
 /// The pure-Rust AMV demuxer. Owns a seekable byte reader (anything
@@ -123,6 +130,18 @@ pub struct AmvDemuxer {
     /// each audio chunk by reading the 8-byte preamble's
     /// `decoded sample count` field (§4b).
     next_audio_pts: i64,
+    /// Number of `01wb` audio **blocks** (chunks) the walker has
+    /// emitted so far. Distinct from [`Self::next_audio_pts`] (which
+    /// accumulates *decoded samples* from the §4b preambles): this is
+    /// the chunk count, incremented by exactly one per `01wb` chunk and
+    /// rewound / fast-forwarded with the cursor exactly like
+    /// `next_audio_pts`, so it equals the audio-block count drained at
+    /// any walk position. It is the §4 1:1-pairing companion to
+    /// `next_video_pts` — after a clean trailer-bounded drain the two
+    /// counts are equal ("1116 `00dc` then 1116 `01wb`, perfectly
+    /// paired", §4). See [`AmvDemuxer::audio_blocks_emitted`] /
+    /// [`AmvDemuxer::movi_interleave_balanced`].
+    next_audio_blocks: u64,
     /// Optional cached index of every chunk inside `movi`. Populated
     /// lazily by [`AmvDemuxer::build_chunk_index`]; once populated,
     /// [`AmvDemuxer::seek_to`] switches from a linear walk to a binary
@@ -154,6 +173,7 @@ impl std::fmt::Debug for AmvDemuxer {
             .field("eof", &self.eof)
             .field("next_video_pts", &self.next_video_pts)
             .field("next_audio_pts", &self.next_audio_pts)
+            .field("next_audio_blocks", &self.next_audio_blocks)
             .field(
                 "chunk_index_len",
                 &self.chunk_index.as_ref().map(|v| v.len()),
@@ -275,6 +295,7 @@ impl AmvDemuxer {
             eof: false,
             next_video_pts: 0,
             next_audio_pts: 0,
+            next_audio_blocks: 0,
             chunk_index: None,
             truncated: false,
             trailer_offset: None,
@@ -316,20 +337,22 @@ impl AmvDemuxer {
     /// AMV files have no embedded index (§1 quirk #2), so this is the
     /// equivalent of synthesising one. Idempotent: calling it twice
     /// rebuilds from scratch. The current walker state (`cursor`,
-    /// `next_video_pts`, `next_audio_pts`, `eof`) is preserved across
-    /// the call so it can be invoked mid-walk without disturbing the
-    /// caller's position.
+    /// `next_video_pts`, `next_audio_pts`, `next_audio_blocks`, `eof`)
+    /// is preserved across the call so it can be invoked mid-walk
+    /// without disturbing the caller's position.
     pub fn build_chunk_index(&mut self) -> std::result::Result<(), AmvDemuxerError> {
         // Save existing walker state so callers can invoke this mid-walk.
         let saved_cursor = self.cursor;
         let saved_video_pts = self.next_video_pts;
         let saved_audio_pts = self.next_audio_pts;
+        let saved_audio_blocks = self.next_audio_blocks;
         let saved_eof = self.eof;
 
         let mut index = Vec::new();
         let mut cursor = self.movi_start;
         let mut video_pts: i64 = 0;
         let mut audio_pts: i64 = 0;
+        let mut audio_blocks: u64 = 0;
 
         loop {
             self.reader.seek(SeekFrom::Start(cursor))?;
@@ -359,6 +382,7 @@ impl AmvDemuxer {
                         kind,
                         video_pts_before: video_pts,
                         audio_pts_before: audio_pts,
+                        audio_blocks_before: audio_blocks,
                     });
                     cursor += chunk.advance_total();
                     video_pts += 1;
@@ -394,9 +418,11 @@ impl AmvDemuxer {
                         kind,
                         video_pts_before: video_pts,
                         audio_pts_before: audio_pts,
+                        audio_blocks_before: audio_blocks,
                     });
                     cursor += chunk.advance_total();
                     audio_pts += block_samples;
+                    audio_blocks += 1;
                 }
                 ChunkKind::Other(other) => {
                     // Out-of-spec tag mid-walk. Surface it so the caller
@@ -416,6 +442,7 @@ impl AmvDemuxer {
         self.cursor = saved_cursor;
         self.next_video_pts = saved_video_pts;
         self.next_audio_pts = saved_audio_pts;
+        self.next_audio_blocks = saved_audio_blocks;
         self.eof = saved_eof;
         self.reader.seek(SeekFrom::Start(saved_cursor))?;
 
@@ -477,6 +504,69 @@ impl AmvDemuxer {
         // since stamping starts at 0 and steps by 1 per emitted video
         // chunk, it equals the count already emitted.
         self.next_video_pts.max(0) as u64
+    }
+
+    /// Number of stream-1 `01wb` audio **blocks** (chunks) the walker
+    /// has emitted so far — the chunk-count companion to
+    /// [`Self::video_frames_emitted`].
+    ///
+    /// This is **not** the decoded-sample PTS (that is what the audio
+    /// stream's `pts` tracks, accumulated from each block's §4b
+    /// preamble); it is the count of `01wb` leaf chunks, incremented by
+    /// exactly one per emitted audio packet. Under §4's strict 1:1
+    /// video-first interleave every `00dc` is followed by exactly one
+    /// `01wb`, so after a complete trailer-bounded drain this equals
+    /// [`Self::video_frames_emitted`] — "1116 `00dc` then 1116 `01wb`,
+    /// perfectly paired" (§4). For `comedian.amv` both reach `1116`,
+    /// for `noel-son-lumiere.amv` both reach `2928`.
+    ///
+    /// Like the video counter, it reflects whatever has been drained at
+    /// the moment it is read: `0` immediately after [`Self::open`], it
+    /// grows as [`Demuxer::next_packet`] emits audio chunks, and it is
+    /// rewound / fast-forwarded with the cursor by [`Demuxer::seek_to`]
+    /// (including the indexed seek path, which snaps it to the target
+    /// entry's [`ChunkIndexEntry::audio_blocks_before`]). On a truncated
+    /// file (see [`Self::is_truncated`]) it reports the number of
+    /// complete audio blocks that landed before the device cut off — so
+    /// `video_frames_emitted() - audio_blocks_emitted()` is the count of
+    /// video frames left unpaired by the power-cut. Use it as a stream
+    /// total only after a full forward drain.
+    pub fn audio_blocks_emitted(&self) -> u64 {
+        self.next_audio_blocks
+    }
+
+    /// Confirm the §4 strict 1:1 video-first interleave came out
+    /// **balanced** — exactly as many `01wb` audio blocks as `00dc`
+    /// video frames — at the current walk position.
+    ///
+    /// Per trace §4 every observed `.amv` file pairs each video frame
+    /// with exactly one audio block ("1116 `00dc` then 1116 `01wb`,
+    /// perfectly paired"; the §5 hierarchy summary annotates the `movi`
+    /// payload "strict 1:1, video-first"). Because the cadence is video
+    /// first, during a walk the video count leads the audio count by at
+    /// most one (right after a `00dc` is emitted but before its paired
+    /// `01wb`); the two are equal exactly when the walk sits on a clean
+    /// video/audio pair boundary.
+    ///
+    /// Returns `true` when [`Self::video_frames_emitted`] equals
+    /// [`Self::audio_blocks_emitted`]. Read **after a complete forward
+    /// drain to a clean trailer-bounded EOF** (see
+    /// [`Self::trailer_offset`]), this is the demuxer-level, streaming
+    /// equivalent of [`validate_movi_interleave`](crate::validate_movi_interleave)'s
+    /// even-count rule — it confirms the §4 pairing held over the whole
+    /// payload **without** buffering the entire chunk-kind sequence into
+    /// a `Vec`, which the free function requires. On a truncated file
+    /// (see [`Self::is_truncated`]) it typically returns `false`: the
+    /// device cut off after a `00dc` but before its paired `01wb`,
+    /// leaving the video count one ahead — exactly the unpaired-trailing
+    /// -video signal the free function reports as a missing trailing
+    /// audio block.
+    ///
+    /// Mid-walk it is `true` only at pair boundaries (after each `01wb`,
+    /// before the next `00dc`), so a caller using it as a whole-stream
+    /// integrity check must first drain to EOF.
+    pub fn movi_interleave_balanced(&self) -> bool {
+        self.video_frames_emitted() == self.audio_blocks_emitted()
     }
 
     /// Cross-check the §2 `amvh` packed-byte duration against the §4
@@ -708,6 +798,7 @@ impl Demuxer for AmvDemuxer {
             self.eof = false;
             self.next_video_pts = 0;
             self.next_audio_pts = 0;
+            self.next_audio_blocks = 0;
         }
 
         // Linear walk: read 8-byte chunk headers, advance past bodies
@@ -791,6 +882,7 @@ impl Demuxer for AmvDemuxer {
                     }
                     self.cursor += chunk.advance_total();
                     self.next_audio_pts += block_samples;
+                    self.next_audio_blocks += 1;
                 }
                 ChunkKind::Other(other) => {
                     return Err(Error::invalid(format!(
@@ -850,6 +942,7 @@ impl AmvDemuxer {
                 self.cursor = entry.file_offset;
                 self.next_video_pts = entry.video_pts_before;
                 self.next_audio_pts = entry.audio_pts_before;
+                self.next_audio_blocks = entry.audio_blocks_before;
                 self.eof = false;
                 self.reader
                     .seek(SeekFrom::Start(self.cursor))
@@ -883,6 +976,15 @@ impl AmvDemuxer {
                     // exceeds requested_pts" - if none does, EOF is
                     // the answer).
                     self.next_audio_pts = last.audio_pts_before;
+                    // The audio *block* count, unlike the sample count,
+                    // is recoverable exactly from the entry: step past
+                    // the last chunk by adding one block iff it is an
+                    // `01wb`. This keeps `audio_blocks_emitted` (and so
+                    // the §4 `movi_interleave_balanced` cross-check)
+                    // correct at a past-end seek — both counters then
+                    // equal the full-drain totals.
+                    self.next_audio_blocks = last.audio_blocks_before
+                        + if last.kind == ChunkKind::Audio { 1 } else { 0 };
                 }
                 self.eof = true;
                 Ok(match stream_index {
@@ -933,6 +1035,12 @@ impl AmvDemuxer {
             return Err(Error::Eof);
         }
         self.cursor += chunk.advance_total();
+        // A complete `01wb` chunk landed — count it as one audio block
+        // for the §4 1:1-pairing cross-check (see
+        // `movi_interleave_balanced`). The block count steps by exactly
+        // one regardless of the preamble's decoded-sample contribution
+        // below, mirroring the video side's per-chunk `+1`.
+        self.next_audio_blocks += 1;
         // §4b: the first 8 bytes of every `01wb` payload are an
         // 8-byte preamble — `u32` per-block state + `u32` decoded
         // sample count. Use the decoded-sample-count to drive PTS
@@ -1100,6 +1208,192 @@ mod tests {
             !d.duration_consistent_with_drained_frames(),
             "header's 1:33 must not agree with only 3 drained frames"
         );
+    }
+
+    #[test]
+    fn audio_blocks_emitted_tracks_drained_count() {
+        // §4: every `01wb` chunk bumps the audio-block counter by one;
+        // a `00dc` chunk leaves it untouched (it bumps the video count).
+        let buf = build_synthetic_file(12);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        assert_eq!(d.audio_blocks_emitted(), 0, "no blocks before any drain");
+        // First `00dc`: video count goes to 1, audio blocks stay 0 —
+        // §4 video-first cadence means the video count leads by one.
+        let _v0 = d.next_packet().expect("v0");
+        assert_eq!(d.video_frames_emitted(), 1);
+        assert_eq!(
+            d.audio_blocks_emitted(),
+            0,
+            "video chunk does not bump the audio-block count"
+        );
+        // First `01wb`: audio block counted, counts now equal.
+        let _a0 = d.next_packet().expect("a0");
+        assert_eq!(d.audio_blocks_emitted(), 1, "one audio block emitted");
+        // Drain to EOF.
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert_eq!(
+            d.audio_blocks_emitted(),
+            12,
+            "all 12 audio blocks counted after a full drain"
+        );
+        assert_eq!(
+            d.video_frames_emitted(),
+            12,
+            "all 12 video frames counted after a full drain"
+        );
+    }
+
+    #[test]
+    fn interleave_balanced_is_true_only_at_pair_boundaries_then_holds_at_eof() {
+        // §4 strict 1:1 video-first: during the walk the video count
+        // leads the audio count by at most one, so `balanced` is true
+        // exactly at pair boundaries (start, and after each `01wb`).
+        let buf = build_synthetic_file(3);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        // At the start (0 == 0) — balanced.
+        assert!(d.movi_interleave_balanced(), "balanced before any drain");
+        // After the first `00dc` (1 vs 0) — NOT balanced (video leads).
+        let _v0 = d.next_packet().expect("v0");
+        assert!(
+            !d.movi_interleave_balanced(),
+            "video leads by one after a `00dc`"
+        );
+        // After its paired `01wb` (1 vs 1) — balanced again.
+        let _a0 = d.next_packet().expect("a0");
+        assert!(
+            d.movi_interleave_balanced(),
+            "balanced at the pair boundary after `01wb`"
+        );
+        // Drain the rest to a clean trailer EOF.
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert!(
+            d.trailer_offset().is_some(),
+            "clean trailer-bounded drain expected"
+        );
+        assert!(
+            d.movi_interleave_balanced(),
+            "§4 1:1 pairing holds over the whole payload (3 == 3)"
+        );
+        assert_eq!(d.video_frames_emitted(), 3);
+        assert_eq!(d.audio_blocks_emitted(), 3);
+    }
+
+    #[test]
+    fn interleave_unbalanced_when_truncated_after_trailing_video() {
+        // §4 reports a missing trailing audio block as the unpaired
+        // -video signal. Build a complete 3-pair file, then drop the
+        // trailer + the final `01wb` + the final `00dc`'s body to leave
+        // a power-cut shape ending after a `00dc` header with no body.
+        // The demuxer's body-truncation recovery drops the partial
+        // video frame and surfaces a graceful EOF, leaving 2 complete
+        // video frames and 2 complete audio blocks — still balanced.
+        // To force an imbalance we truncate so the LAST complete chunk
+        // is a `00dc` with a fully-read body but no following `01wb`.
+        let full = build_synthetic_file(3);
+        // Layout per pair: `00dc`(8+4) + `01wb`(8+12) = 32 bytes; the
+        // prelude is 0x13C. Keep the prelude + 2 full pairs + the third
+        // pair's complete `00dc` (12 bytes), dropping its `01wb` and the
+        // trailer. That leaves 3 video frames but only 2 audio blocks.
+        let cut = 0x13C + 2 * 32 + 12;
+        let truncated = full[..cut].to_vec();
+        let mut d = AmvDemuxer::open(Cursor::new(truncated)).expect("open");
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert!(d.is_truncated(), "no trailer landed → truncated drain");
+        assert!(d.trailer_offset().is_none());
+        assert_eq!(d.video_frames_emitted(), 3, "3 complete video frames");
+        assert_eq!(d.audio_blocks_emitted(), 2, "only 2 complete audio blocks");
+        assert!(
+            !d.movi_interleave_balanced(),
+            "trailing unpaired video frame leaves the interleave unbalanced"
+        );
+        assert_eq!(
+            d.video_frames_emitted() - d.audio_blocks_emitted(),
+            1,
+            "exactly one video frame left unpaired by the cut"
+        );
+    }
+
+    #[test]
+    fn audio_blocks_rewind_with_cursor_on_backward_seek() {
+        // The audio-block counter must rewind / fast-forward with the
+        // cursor exactly like the PTS counters so `balanced` stays
+        // meaningful across seeks (linear path — no index built).
+        let buf = build_synthetic_file(5);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        // Forward seek to video frame 4 → 4 video + 4 audio walked past.
+        d.seek_to(0, 4).expect("seek fwd");
+        assert_eq!(d.video_frames_emitted(), 4);
+        assert_eq!(d.audio_blocks_emitted(), 4);
+        assert!(d.movi_interleave_balanced(), "pair boundary at frame 4");
+        // Backward seek to frame 1 → counters rewind together.
+        d.seek_to(0, 1).expect("seek back");
+        assert_eq!(d.video_frames_emitted(), 1);
+        assert_eq!(d.audio_blocks_emitted(), 1);
+        assert!(d.movi_interleave_balanced(), "pair boundary at frame 1");
+    }
+
+    #[test]
+    fn audio_blocks_track_indexed_seek_and_past_end() {
+        // The indexed seek path snaps the audio-block counter to the
+        // target entry's `audio_blocks_before`, and a past-end indexed
+        // seek lands both counters on the full-drain totals.
+        let buf = build_synthetic_file(5);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d.build_chunk_index().expect("index");
+        // Indexed seek to video frame 3 — 3 complete pairs precede it.
+        d.seek_to(0, 3).expect("indexed seek");
+        assert_eq!(d.video_frames_emitted(), 3);
+        assert_eq!(d.audio_blocks_emitted(), 3);
+        assert!(d.movi_interleave_balanced());
+        // Past-end indexed seek — both counters reach the 5/5 totals.
+        d.seek_to(0, 1_000_000).expect("indexed past-end");
+        assert_eq!(d.video_frames_emitted(), 5);
+        assert_eq!(d.audio_blocks_emitted(), 5);
+        assert!(
+            d.movi_interleave_balanced(),
+            "past-end indexed seek lands on the balanced full-drain totals"
+        );
+    }
+
+    #[test]
+    fn chunk_index_records_audio_blocks_before_monotonically() {
+        // Each indexed `01wb` entry's `audio_blocks_before` equals the
+        // number of audio blocks ahead of it; video entries share the
+        // count of the block before them (the §4 video-first cadence).
+        let buf = build_synthetic_file(4);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        d.build_chunk_index().expect("index");
+        let idx = d.chunk_index().expect("built");
+        // 4 pairs → 8 entries, V A V A V A V A.
+        let mut seen_audio = 0u64;
+        for entry in idx {
+            assert_eq!(
+                entry.audio_blocks_before, seen_audio,
+                "audio_blocks_before must equal blocks emitted ahead of {entry:?}"
+            );
+            if entry.kind == ChunkKind::Audio {
+                seen_audio += 1;
+            }
+        }
+        assert_eq!(seen_audio, 4, "four audio blocks indexed");
     }
 
     #[test]
