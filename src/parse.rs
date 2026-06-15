@@ -714,6 +714,43 @@ impl AmvAudioPreamble {
             None => false,
         }
     }
+
+    /// Number of bytes a full `01wb` payload carries **beyond** this
+    /// block's exact §4b nibble budget — the trace's "occasionally 930"
+    /// padding case quantified.
+    ///
+    /// Per §4b the audio block size is "near-constant (927 bytes,
+    /// occasionally 930)": the exact budget for the `comedian.amv` first
+    /// block is `AMV_AUDIO_PREAMBLE_LEN + ceil(decoded_sample_count / 2)`
+    /// = `8 + 919 = 927`, but a few blocks land at 930 — three bytes of
+    /// trailing padding past the nibble-coded body. [`Self::is_consistent_with_body_len`]
+    /// answers the boolean "is the on-disk length exactly the budget?";
+    /// this companion turns that into a signed measurement so a recovery /
+    /// inspection pass can tell *how* a block deviates rather than just
+    /// *that* it does:
+    ///
+    /// * `Some(0)` — the exact §4b budget (the 927-byte common case).
+    /// * `Some(n)`, `n > 0` — `n` trailing padding bytes past the nibble
+    ///   body (the §4b "930" case reports `Some(3)`).
+    /// * `None` — `total_payload_len` is shorter than the exact budget
+    ///   (preamble + nibble body), i.e. the block is missing bytes its
+    ///   declared `decoded_sample_count` requires — a short / truncated
+    ///   block. A length below the 8-byte preamble itself also returns
+    ///   `None` rather than panicking.
+    ///
+    /// `Some(0)` is exactly the case for which
+    /// [`Self::is_consistent_with_body_len`] returns `true`; any other
+    /// `Some(_)` is a padded block (still a valid, trace-recorded device
+    /// shape) and `None` is a short block (invalid under §4b).
+    ///
+    /// Useful for a truncation-recovery / sanity pass that wants to
+    /// distinguish trace-faithful padded blocks from genuinely clipped
+    /// ones and to recover the padded slack without a second cast.
+    pub fn body_padding_slack(&self, total_payload_len: u64) -> Option<u64> {
+        let preamble = AMV_AUDIO_PREAMBLE_LEN as u64;
+        let body_len = total_payload_len.checked_sub(preamble)?;
+        body_len.checked_sub(self.nibble_body_len())
+    }
 }
 
 /// Strict byte-shape validation of a `00dc` video-chunk payload against
@@ -2683,6 +2720,82 @@ pub(crate) mod tests {
                 "samples={samples} expected_total={expected_total}"
             );
             assert!(!p.is_consistent_with_body_len(expected_total + 1));
+        }
+    }
+
+    /// §4b padding slack — the comedian first block at the exact `927`
+    /// budget reports zero slack.
+    #[test]
+    fn audio_preamble_padding_slack_exact_budget() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert_eq!(p.body_padding_slack(927), Some(0));
+    }
+
+    /// §4b padding slack — the trace's "occasionally 930" padded block
+    /// reports three bytes of trailing padding past the `927` nibble
+    /// budget.
+    #[test]
+    fn audio_preamble_padding_slack_padded_930() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert_eq!(p.body_padding_slack(930), Some(3));
+    }
+
+    /// §4b padding slack — a block one byte short of its nibble budget
+    /// (clipped mid-write) reports `None`, not a wrapped underflow.
+    #[test]
+    fn audio_preamble_padding_slack_short_body_is_none() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert_eq!(p.body_padding_slack(926), None);
+    }
+
+    /// §4b padding slack — a `total_payload_len` below the 8-byte
+    /// preamble returns `None` rather than panicking on the underflow.
+    #[test]
+    fn audio_preamble_padding_slack_sub_preamble_is_none() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert_eq!(p.body_padding_slack(7), None);
+        assert_eq!(p.body_padding_slack(0), None);
+    }
+
+    /// §4b padding slack — `Some(0)` is exactly the set of lengths for
+    /// which `is_consistent_with_body_len` returns `true`, and any other
+    /// `Some(_)` is a padded (still valid) block, across the odd / even /
+    /// zero sample-count cases.
+    #[test]
+    fn audio_preamble_padding_slack_agrees_with_consistency() {
+        for samples in [0u32, 1, 2, 3, 1836, 1837, 1378] {
+            let p = AmvAudioPreamble {
+                state: 0,
+                decoded_sample_count: samples,
+            };
+            let exact = AMV_AUDIO_PREAMBLE_LEN as u64 + p.nibble_body_len();
+            assert_eq!(p.body_padding_slack(exact), Some(0), "samples={samples}");
+            assert!(p.is_consistent_with_body_len(exact));
+            // A padded block: slack is the number of bytes past the budget,
+            // and the exact-relation boolean correctly reports false.
+            assert_eq!(
+                p.body_padding_slack(exact + 3),
+                Some(3),
+                "samples={samples}"
+            );
+            assert!(!p.is_consistent_with_body_len(exact + 3));
+            // A short block: None, and the boolean is false.
+            if exact > 0 {
+                assert_eq!(p.body_padding_slack(exact - 1), None, "samples={samples}");
+                assert!(!p.is_consistent_with_body_len(exact - 1));
+            }
         }
     }
 

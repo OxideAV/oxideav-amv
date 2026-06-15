@@ -10,6 +10,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4b audio-block padding-slack accessor — new
+  `AmvAudioPreamble::body_padding_slack(total_payload_len) -> Option<u64>`
+  quantifies the trace's "occasionally 930" padded-block case: it returns
+  `Some(0)` for the exact nibble budget (`8 + ceil(decoded_sample_count / 2)`
+  = the 927-byte common case), `Some(n)` for `n` trailing padding bytes
+  past that budget (the §4b 930-byte block reports `Some(3)`), and `None`
+  for a payload shorter than the budget (a clipped / truncated block) or
+  below the 8-byte preamble — saturating-safe, no panic, no underflow
+  wrap. It is the signed companion to the boolean
+  `is_consistent_with_body_len` (whose `true` set is exactly this helper's
+  `Some(0)` set): a recovery / inspection pass can now tell *how* a block
+  deviates — padded vs. clipped — instead of only *that* it does, and can
+  recover the padded slack directly. Five new unit tests pin the exact /
+  padded-930 / short / sub-preamble cases plus an agreement sweep across
+  odd / even / zero sample counts against `is_consistent_with_body_len`;
+  the `parse` fuzz target drives the new accessor with both the slice
+  length and an attacker-chosen total length.
+
 - §2↔§4 header / walk duration cross-check on the demuxer — new
   `AmvDemuxer::video_frames_emitted() -> u64` surfaces the count of
   stream-0 video chunks the `movi` walk has drained (the value the

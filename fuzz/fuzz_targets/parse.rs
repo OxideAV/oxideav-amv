@@ -43,7 +43,8 @@
 //!    [`oxideav_amv::AmvAudioPreamble::validate_sentinels`] +
 //!    [`oxideav_amv::AmvAudioPreamble::is_consistent_with_frame_interval`] +
 //!    [`oxideav_amv::AmvAudioPreamble::nibble_body_len`] +
-//!    [`oxideav_amv::AmvAudioPreamble::is_consistent_with_body_len`]
+//!    [`oxideav_amv::AmvAudioPreamble::is_consistent_with_body_len`] +
+//!    [`oxideav_amv::AmvAudioPreamble::body_padding_slack`]
 //!    — the §4b 8-byte preamble + its strict / cross-check helpers.
 //! 10. [`oxideav_amv::validate_video_payload_shape`] +
 //!     [`oxideav_amv::validate_video_payload_no_internal_markers`]
@@ -135,6 +136,9 @@ fuzz_target!(|data: &[u8]| {
         // attacker-chosen decoded_sample_count.
         let _ = preamble.nibble_body_len();
         let _ = preamble.is_consistent_with_body_len(data.len() as u64);
+        // §4b padding slack: must never overflow / panic on an
+        // attacker-chosen total length vs. decoded_sample_count.
+        let _ = preamble.body_padding_slack(data.len() as u64);
         // Cross-check against an attacker-chosen rate / fps pair.
         if data.len() >= 16 {
             let rate = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
@@ -146,6 +150,7 @@ fuzz_target!(|data: &[u8]| {
                 data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15],
             ]);
             let _ = preamble.is_consistent_with_body_len(total);
+            let _ = preamble.body_padding_slack(total);
         }
     }
 

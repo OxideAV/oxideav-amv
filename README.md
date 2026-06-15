@@ -210,7 +210,17 @@ actually landed. The staged `comedian.amv`'s first audio block
 matches the nibble budget exactly, and the majority of its 1116
 audio blocks do too — a trace-faithful loose lower bound that
 respects the doc's "927 bytes, occasionally 930" note, where the few
-padded blocks correctly miss the exact relation.
+padded blocks correctly miss the exact relation. For those padded
+blocks, `AmvAudioPreamble::body_padding_slack(total_payload_len) ->
+Option<u64>` is the signed companion to the boolean check: it returns
+`Some(0)` at the exact 927-byte budget, `Some(3)` for the §4b
+"occasionally 930" padded case (three trailing bytes past the nibble
+body), and `None` when the payload is shorter than the budget (a
+clipped / truncated block) or below the 8-byte preamble — saturating
+safe, no underflow wrap. Its `Some(0)` set is exactly the set for
+which `is_consistent_with_body_len` returns `true`, so a recovery /
+inspection pass can tell *how* a block deviates (padded vs. clipped)
+instead of only *that* it does, and recover the padded slack directly.
 
 The §4 strict 1:1 video-first interleave invariant — the trace's
 recorded pattern that every observed `.amv` file's `movi` payload is
