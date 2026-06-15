@@ -43,8 +43,9 @@ id and the audio stream as the `adpcm_amv` placeholder.
   truncated EOF).
 - **Strict mode** — `open_strict` (and `AmvHeader::validate_sentinels` /
   `AmvWaveFormat::validate_sentinels`) gate on the device-profile
-  sentinel constants from the trace before any `movi` work; the default
-  `open` stays permissive.
+  sentinel constants from the trace before any `movi` work, including the
+  §2 `amvh` reserved 7-dword span (`+0x04..+0x1C`) and the §3 all-zero
+  stream-header bodies; the default `open` stays permissive.
 - **Consistency checks** — `video_frames_emitted()` and
   `duration_consistent_with_drained_frames()` tie the `movi` walk back
   to the `amvh` packed-byte duration via the trace invariant

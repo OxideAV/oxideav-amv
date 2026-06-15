@@ -40,6 +40,14 @@ pub const AMV_END_TRAILER: [u8; 8] = *b"AMV_END_";
 /// can sanity-check it before deciding to trust the body fields.
 pub const AMVH_BODY_LEN: u32 = 0x38;
 
+/// Byte offset (within the `amvh` body) of the §2 reserved span that
+/// the trace records as "reserved / zeroed (7 dwords)" — the 28 bytes
+/// between `dwMicroSecPerFrame` (+0x00) and `width` (+0x20).
+const AMVH_RESERVED_SPAN_OFFSET: usize = 0x04;
+/// Length of the §2 reserved span — seven little-endian dwords
+/// (`+0x04 … +0x1C` inclusive, i.e. `+0x04 .. +0x20`).
+const AMVH_RESERVED_SPAN_LEN: usize = 7 * 4;
+
 /// Video leaf chunk tag (§4a). The two-digit stream-index prefix
 /// `"00"` plus the AVI convention `dc` for "DIB compressed".
 pub const VIDEO_CHUNK_TAG: [u8; 4] = *b"00dc";
@@ -1241,6 +1249,14 @@ impl AmvPrelude {
     ///   `amvh` body so a corrupted `dwMicroSecPerFrame` / `flag_one` /
     ///   `reserved_30` is rejected immediately rather than silently fed
     ///   downstream.
+    /// * Verifies the §2 `amvh` reserved span the trace records as
+    ///   "reserved / zeroed (7 dwords)" — the 28 bytes between
+    ///   `dwMicroSecPerFrame` (+0x00) and `width` (+0x20) — is entirely
+    ///   zero in the input slice. `AmvHeader::parse` discards these bytes
+    ///   (it parses only the four carry-data dwords), so this is the only
+    ///   place the §2 "reserved / zeroed" annotation is enforced; a
+    ///   non-zero byte in that span surfaces an
+    ///   [`AmvDemuxerError::InvalidData`] naming the offending offset.
     /// * Verifies the three §3 stream-header bodies the trace records as
     ///   "entirely zero" really are entirely zero in the input slice —
     ///   the 56-byte video `strh` body, the 36-byte video `strf` body,
@@ -1261,6 +1277,23 @@ impl AmvPrelude {
     pub(crate) fn parse_strict(slice: &[u8]) -> Result<Self, AmvDemuxerError> {
         let prelude = Self::parse(slice)?;
         prelude.header.validate_sentinels()?;
+
+        // §2 amvh reserved span — the trace records the 28 bytes between
+        // `dwMicroSecPerFrame` (+0x00) and `width` (+0x20) as "reserved /
+        // zeroed (7 dwords)". `AmvHeader::parse` skips this span entirely
+        // (it reads only the four carry-data dwords) and
+        // `validate_sentinels` can only see the parsed struct, so the
+        // all-zero invariant is checked here against the raw slice —
+        // mirroring the §3 strh/strf all-zero checks below. The amvh body
+        // begins at `AMVH_OFFSET + 8`, so the span sits at file offset
+        // `AMVH_OFFSET + 8 + 0x04`.
+        let amvh_reserved_at = AMVH_OFFSET as usize + 8 + AMVH_RESERVED_SPAN_OFFSET;
+        require_all_zero(
+            slice,
+            amvh_reserved_at,
+            AMVH_RESERVED_SPAN_LEN,
+            "amvh reserved span (+0x04..+0x1C)",
+        )?;
 
         // §3a video strh body — 56 bytes immediately after the `strh`
         // FOURCC + size at file offset STRL_VIDEO_OFFSET + 12.
@@ -1748,6 +1781,46 @@ pub(crate) mod tests {
                 assert!(msg.contains("video strh body"));
             }
             other => panic!("expected InvalidData(strh), got {other:?}"),
+        }
+    }
+
+    /// §2 reserved-span enforcement: a non-zero byte anywhere in the
+    /// 28-byte "reserved / zeroed (7 dwords)" span between
+    /// `dwMicroSecPerFrame` (+0x00) and `width` (+0x20) must be rejected
+    /// by strict parse. The amvh body begins at file offset 0x20, so the
+    /// reserved span occupies file 0x24..0x40 — corrupt its first byte
+    /// (+0x04 → file 0x24, the first reserved dword) and the last byte
+    /// (+0x1C+3 → file 0x3F, the last reserved dword) to confirm the
+    /// whole span is covered, not just its head.
+    #[test]
+    fn prelude_parse_strict_rejects_non_zero_amvh_reserved_span_head() {
+        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        // First reserved dword: amvh body +0x04 → file 0x20 + 0x04 = 0x24.
+        buf[0x24] = 0x42;
+        let err = AmvPrelude::parse_strict(&buf).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("amvh reserved span"));
+                assert!(msg.contains("0x24"));
+            }
+            other => panic!("expected InvalidData(amvh reserved span), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prelude_parse_strict_rejects_non_zero_amvh_reserved_span_tail() {
+        let mut buf = build_synthetic_prelude(128, 96, 12, 0x0000_0121, 22_050);
+        // Last reserved byte: amvh body +0x1F → file 0x20 + 0x1F = 0x3F
+        // (the high byte of the 7th reserved dword, immediately before
+        // `width` at body +0x20 / file 0x40).
+        buf[0x3F] = 0x42;
+        let err = AmvPrelude::parse_strict(&buf).unwrap_err();
+        match err {
+            AmvDemuxerError::InvalidData(msg) => {
+                assert!(msg.contains("amvh reserved span"));
+                assert!(msg.contains("0x3f"));
+            }
+            other => panic!("expected InvalidData(amvh reserved span), got {other:?}"),
         }
     }
 

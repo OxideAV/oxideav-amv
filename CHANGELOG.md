@@ -6,6 +6,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- §2 `amvh` reserved-span strict validation — `AmvDemuxer::open_strict`
+  (via `AmvPrelude::parse_strict`) now enforces the trace's §2 "reserved
+  / zeroed (7 dwords)" annotation for the 28 bytes between
+  `dwMicroSecPerFrame` (+0x00) and `width` (+0x20). This was the one §2
+  invariant strict mode did not cover: `AmvHeader::parse` discards that
+  span (it reads only the four carry-data dwords) so `validate_sentinels`
+  — which only sees the parsed struct — could not check it, leaving a gap
+  alongside the §3 strh/strf all-zero checks already in `parse_strict`.
+  The new check runs against the raw prelude slice (the same
+  `require_all_zero` helper the §3 bodies use) and surfaces an
+  `InvalidData` error naming the offending file offset. The permissive
+  `AmvDemuxer::open` path is unchanged; strictness stays opt-in. Two new
+  unit tests pin head (file 0x24, the first reserved dword) and tail
+  (file 0x3F, the last reserved byte before `width`) corruption rejects,
+  confirming the whole span is covered; the existing synthetic / fixture
+  strict-accept tests continue to pass (the device profiles leave the
+  span zero).
+
 ## [0.0.9](https://github.com/OxideAV/oxideav-amv/compare/v0.0.8...v0.0.9) - 2026-05-18
 
 ### Added
