@@ -6,6 +6,8 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/OxideAV/oxideav-amv/compare/v0.0.8...v0.0.9) - 2026-05-18
+
 ### Added
 
 - §2↔§4 header / walk duration cross-check on the demuxer — new
