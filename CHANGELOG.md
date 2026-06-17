@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4a JPEG header reconstruction — new `reconstruct_jpeg(&AmvVideoFrame)`
+  and convenience `reconstruct_jpeg_from_payload(&AmvHeader, &[u8])`
+  splice the device-stripped marker segments back into a bare `00dc`
+  video frame, producing a standards-conforming baseline JFIF/JPEG that a
+  generic JPEG/MJPEG decoder accepts unchanged. The AMV encoder removes
+  the `DQT` / `SOF0` / `DHT` / `SOS` segments from every frame (on disk a
+  `00dc` payload is `FF D8` + bare entropy data + `FF D9`); per the trace
+  §4a reconstruction proof the player hardcodes the JPEG Annex K example
+  tables verbatim and unscaled, so the reconstructor inserts: a `DQT`
+  with quant K.1 (luma `Tq=0`) / K.2 (chroma `Tq=1`) emitted in zig-zag
+  order (T.81 §B.2.4.1); a baseline `SOF0` at the §2 `amvh` resolution,
+  8-bit, 3-component, **4:2:0** sampling (luma `2×2`, chroma `1×1`); a
+  single `DHT` carrying Huffman K.3/K.4 luma+chroma DC+AC with class /
+  destination `00 10 01 11`; and one interleaved `SOS` with full spectral
+  selection `Ss=0 Se=63 Ah=0 Al=0`. The SOI/EOI are reused from the
+  payload and the entropy-coded bytes are copied through byte-for-byte —
+  no DCT, Huffman walk or dequantisation is performed (image decode stays
+  the codec crate's job). All Annex K table values are the public
+  ITU-T T.81 examples transcribed from the clean-room
+  `docs/image/jpeg/tables/*.csv` extracts the trace §4a cites by name.
+  Nine new tests cover the marker order/lengths, the zig-zag emission,
+  4:2:0 SOF0 geometry, the four-table DHT, the SOS scan, verbatim entropy
+  preservation, and a real-fixture reconstruction of `comedian.amv`'s
+  first frame to a complete baseline JPEG pinned to the §4a entropy head.
+
 - §4 demuxer-level 1:1 video:audio interleave cross-check — new
   `AmvDemuxer::audio_blocks_emitted() -> u64` surfaces the count of
   `01wb` audio **blocks** (chunks) the `movi` walk has drained, the

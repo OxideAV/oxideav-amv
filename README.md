@@ -66,6 +66,25 @@ count), the all-zero stream-header bodies plus the 20-byte audio
 `WAVEFORMATEX`, the no-byte-padding chunk walk, and the `AMV_END_`
 trailer. Mux → demux round-trips byte-identically.
 
+### JPEG header reconstruction
+
+The AMV device's encoder *strips* the JPEG marker segments (`DQT`,
+`SOF0`, `DHT`, `SOS`) from every `00dc` video frame — the on-disk
+payload is `FF D8` + bare entropy-coded data + `FF D9` — and the player
+splices fixed bytes back in before decode. `reconstruct_jpeg`
+(and the convenience `reconstruct_jpeg_from_payload`) is that splice:
+given an `AmvVideoFrame` (the §2 geometry bound to a `00dc` payload) it
+emits a standards-conforming baseline JFIF/JPEG that any generic
+JPEG/MJPEG decoder accepts unchanged. Per the trace §4a
+reconstruction proof the inserted segments are the JPEG Annex K example
+tables verbatim and unscaled — quant K.1 (luma) / K.2 (chroma) in
+zig-zag order, Huffman K.3/K.4 (luma+chroma DC+AC), baseline SOF0 at the
+`amvh` resolution with 4:2:0 sampling, and one full-spectral interleaved
+scan. The entropy-coded bytes are copied through byte-for-byte; no DCT,
+Huffman walk or dequantisation happens here (that is the codec crate's
+job downstream). The fixture test reconstructs `comedian.amv`'s first
+frame to a complete baseline JPEG and pins the §4a entropy head.
+
 ### Standalone byte parsers
 
 The byte-level types are usable without the framework: `AmvHeader`,

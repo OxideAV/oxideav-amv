@@ -72,11 +72,13 @@
 #![warn(missing_docs)]
 
 mod demuxer;
+mod jpeg_reconstruct;
 mod muxer;
 mod parse;
 mod video;
 
 pub use demuxer::{AmvDemuxer, AmvDemuxerError, ChunkIndexEntry};
+pub use jpeg_reconstruct::{reconstruct_jpeg, reconstruct_jpeg_from_payload};
 pub use muxer::AmvMuxer;
 pub use parse::{
     validate_movi_interleave, validate_video_payload_no_internal_markers,
