@@ -71,12 +71,14 @@
 #![warn(missing_debug_implementations)]
 #![warn(missing_docs)]
 
+mod adpcm;
 mod demuxer;
 mod jpeg_reconstruct;
 mod muxer;
 mod parse;
 mod video;
 
+pub use adpcm::decode_audio_block;
 pub use demuxer::{AmvDemuxer, AmvDemuxerError, ChunkIndexEntry};
 pub use jpeg_reconstruct::{reconstruct_jpeg, reconstruct_jpeg_from_payload};
 pub use muxer::AmvMuxer;

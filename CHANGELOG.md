@@ -8,6 +8,47 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4b AMV-IMA-ADPCM audio decode — new `decode_audio_block(&AmvAudioPreamble,
+  compressed_body) -> Vec<i16>` (re-exported at the crate root) turns the
+  nibble-packed body of an `01wb` block into the 16-bit PCM mono samples the
+  §3b `WAVEFORMATEX` declares — the audio counterpart of the §4a
+  `reconstruct_jpeg` wire-format helper. Per the freshly-staged trace §4b
+  "IMA step / index tables — STANDARD" subsection the codec is **standard**
+  IMA/DVI ADPCM: the 89-entry step-size table (7, 8, 9, … 27086, 29794, 32767)
+  and the 8-entry index-adjust table `{-1,-1,-1,-1,2,4,6,8}` are the canonical
+  IMA tables, used unmodified (carried as `const` arrays since `docs/` is not
+  part of the published crate). The decode applies the trace's verbatim
+  recurrence — `diff = step>>3`, plus `step>>2` / `step>>1` / `step` for nibble
+  bits 0 / 1 / 2, sign from bit 3, predictor clamped to int16, step index
+  clamped to `[0, 88]` — unpacks nibbles **low-nibble-first** (standard IMA
+  byte order), and keeps exactly `decoded_sample_count` outputs (stopping early
+  on a truncated body, matching the demuxer's §4c truncation tolerance). Each
+  block is **self-contained**: the predictor is re-seeded from the header
+  `int16` (`AmvAudioPreamble::initial_predictor`) and the step index is reset to
+  0 at block start (no state carries across blocks). A real-fixture test decodes
+  all 1116 blocks of `comedian.amv` to **2 050 650 mono samples = exactly
+  93.0 s at 22 050 Hz** (matching the §2 container duration, 1:33) with a
+  sub-0.1 % ±32768 clip rate — the trace §4b decode-sanity result (0.024 %; a
+  wrong decode runs at 0.6 %+). **Empirical correction to trace §4b:** the
+  "refined header layout" reports preamble `+0x02` as "always `00 00`", but it
+  is in fact non-zero in some blocks of the staged fixture (e.g. `30` at audio
+  block 50). The validated decode resets the step index to 0 regardless — as
+  the trace's own §4b gap note prescribes ("treating header +2 as the step
+  index made the output worse") — and a regression test pins that an
+  `initial_step_index() == 30` preamble still decodes its first nibble at step
+  index 0; feeding `+0x02` in instead inflates the fixture clip rate ~27×
+  (0.024 % → 0.64 %). Twelve new unit tests cover the canonical-IMA table
+  values, the per-nibble recurrence worked example, the index-never-negative
+  and index/predictor clamp bounds, low-nibble-first ordering, output
+  truncation to `decoded_sample_count`, short-body / empty-body handling,
+  predictor re-seeding, the step-index-0-reset correction, and the full
+  fixture decode-sanity pin. Decode-adjacent wire glue only — the heavyweight
+  image DCT/Huffman decode stays the downstream `mjpeg` codec's job. Suggested
+  docs erratum: §4b "8-byte block header layout (refined)" should soften
+  "always `00 00`" for `+0x02` to "0 in the first blocks surveyed; non-zero in
+  later blocks (e.g. 30); the validated decode resets the step index to 0
+  regardless".
+
 - §4b refined audio-preamble split — new `AmvAudioPreamble::initial_predictor()
   -> i16`, `initial_step_index() -> i16`, and `step_index_in_ima_range() ->
   bool` accessors surface the trace's §4b "8-byte block header layout

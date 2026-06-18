@@ -18,9 +18,16 @@ length. See the
 [trace document](https://github.com/OxideAV/oxideav-workspace/blob/master/docs/container/amv/amv-container-trace.md)
 in the workspace for the full byte-by-byte layout.
 
-This is a **container-only** crate. Frame and sample *decoding* live in
-sibling codec crates: the video stream is declared as the `mjpeg` codec
-id and the audio stream as the `adpcm_amv` placeholder.
+This is primarily a **container** crate — it identifies, demuxes and
+muxes AMV files and declares the video stream as the `mjpeg` codec id and
+the audio stream as `adpcm_amv`. It additionally carries the two
+*decode-adjacent wire-format helpers* the AMV device's stripped/hardcoded
+profile makes intrinsic to the format: `reconstruct_jpeg` splices the
+device-stripped JPEG marker segments back into a `00dc` frame, and
+`decode_audio_block` applies the standard IMA/DVI ADPCM recurrence to an
+`01wb` block (see below). Both are pure trace-derived realisations of the
+device profile; the heavyweight DCT/Huffman image decode remains the
+downstream `mjpeg` codec's job.
 
 ## Capabilities
 
@@ -84,6 +91,33 @@ scan. The entropy-coded bytes are copied through byte-for-byte; no DCT,
 Huffman walk or dequantisation happens here (that is the codec crate's
 job downstream). The fixture test reconstructs `comedian.amv`'s first
 frame to a complete baseline JPEG and pins the §4a entropy head.
+
+### AMV-IMA-ADPCM audio decode
+
+`decode_audio_block(&AmvAudioPreamble, compressed_body)` is the audio
+counterpart of `reconstruct_jpeg`: it turns the nibble-packed body of an
+`01wb` block into the 16-bit PCM mono samples the §3b `WAVEFORMATEX`
+declares. Per trace §4b the codec is **standard** IMA/DVI ADPCM — the
+89-entry step-size table and the 8-entry index-adjust table
+`{-1,-1,-1,-1,2,4,6,8}` are the canonical IMA tables, used unmodified;
+the only AMV-specific traits are the container framing (the 8-byte
+per-block header carrying an `int16` predictor seed, one block per video
+frame, low-nibble-first packing). Each block is self-contained: the
+predictor is re-seeded from the header `int16` and the step index is
+reset to 0 at block start (no state carries across blocks). The decode
+applies the trace's verbatim recurrence (`diff = step>>3` plus `step>>2`
+/ `step>>1` / `step` for nibble bits 0/1/2, sign from bit 3, predictor
+clamped to int16, step index clamped to `[0, 88]`) and keeps exactly
+`decoded_sample_count` outputs, stopping early on a truncated body. The
+fixture test decodes all 1116 blocks of `comedian.amv` to **2 050 650
+mono samples = exactly 93.0 s at 22 050 Hz** (matching the §2 container
+duration) with a sub-0.1 % ±32768 clip rate, the trace §4b
+decode-sanity result. **Empirical correction:** trace §4b's "refined
+header layout" reports preamble `+0x02` as "always `00 00`", but it is
+non-zero in some blocks (e.g. `30` at audio block 50); the validated
+decode resets the step index to 0 regardless, as the trace's gap note
+("treating header +2 as the step index made the output worse")
+prescribes — feeding `+0x02` in instead inflates the clip rate ~27×.
 
 ### Standalone byte parsers
 
