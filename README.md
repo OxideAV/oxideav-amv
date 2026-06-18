@@ -97,7 +97,13 @@ header-to-payload dependency explicit (the `00dc` bitstream carries no
 frame header — resolution comes from `amvh`), exposing the entropy-coded
 window between SOI and EOI for a future decoder. AMV's per-block audio
 preamble (`state`, `decoded_sample_count`) is surfaced verbatim, with
-nibble-budget / sample-interval cross-checks for recovery tooling.
+nibble-budget / sample-interval cross-checks for recovery tooling. The §4b
+"refined" split re-reads the raw `state` dword as the two packed signed-16-bit
+fields it actually carries — `initial_predictor()` (the per-block ADPCM seed at
+`+0x00`) and `initial_step_index()` (`+0x02`, always 0 in both fixtures) — with
+`step_index_in_ima_range()` range-checking the step index against the canonical
+IMA `[0, 88]` table bound (`IMA_STEP_INDEX_MAX`); the nibble-to-PCM decode
+itself stays the downstream `adpcm_amv` codec's job.
 
 ### Fuzz + bench
 

@@ -579,10 +579,14 @@ pub const AMV_AUDIO_PREAMBLE_LEN: usize = 8;
 ///   (`22_050 ÷ 12 ≈ 1837` mono samples in the comedian first block).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AmvAudioPreamble {
-    /// First u32 at preamble +0x00. Per-block state — initial predictor
-    /// / step index for the nibble decoder. Surfaced verbatim because
-    /// the trace records only one observation (the first block's `0`)
-    /// and explicitly notes the field's content varies block-to-block.
+    /// First u32 at preamble +0x00. Per-block decoder seed, surfaced
+    /// verbatim. The trace's §4b "refined" layout re-reads this dword as
+    /// two packed signed 16-bit fields — an `initialPredictor` at `+0x00`
+    /// and an `initialStepIndex` at `+0x02` — exposed by
+    /// [`AmvAudioPreamble::initial_predictor`] /
+    /// [`AmvAudioPreamble::initial_step_index`]. It is kept as a raw
+    /// `u32` here so callers that only want the whole dword (or that
+    /// pre-date the §4b refinement) are unaffected.
     pub state: u32,
     /// Second u32 at preamble +0x04. Number of decoded mono samples the
     /// following compressed body unpacks into. Drives the per-packet
@@ -759,7 +763,79 @@ impl AmvAudioPreamble {
         let body_len = total_payload_len.checked_sub(preamble)?;
         body_len.checked_sub(self.nibble_body_len())
     }
+
+    /// §4b-refined preamble split: the **initial predictor** seed, the
+    /// signed 16-bit value at preamble `+0x00`.
+    ///
+    /// The trace's §4b "8-byte block header layout (refined)" subsection
+    /// re-reads the first dword that [`Self::state`] surfaces verbatim and
+    /// establishes it is **not** a block index but two packed 16-bit
+    /// fields: a signed `initialPredictor` at `+0x00` and an
+    /// `initialStepIndex` at `+0x02`. The refinement was reached by
+    /// reading the first dword across many blocks — "values for blocks
+    /// 0–7 are `0, 1, -9, 8, 1, -2, -4, 5` (non-monotonic)", a small
+    /// signed 16-bit value rather than a counter — and confirmed by the
+    /// decode being sane only when each block re-seeds its predictor from
+    /// this field (the trace's §4b decode-sanity paragraph: wrong
+    /// seeding "instead produced heavy clamping … railing at ±32768").
+    ///
+    /// This is the **low** 16 bits of [`Self::state`] reinterpreted as a
+    /// signed `i16` (little-endian byte order is preserved: `state`'s
+    /// low byte is `+0x00`, the next is `+0x01`). The block is
+    /// self-contained — the predictor is re-seeded from this value at the
+    /// start of every block, no state carries across blocks (trace §4b).
+    ///
+    /// The container crate surfaces the field; the nibble-to-PCM decode
+    /// itself is the downstream `adpcm_amv` codec's job (the
+    /// no-decode container contract). For blocks 0–7 of `comedian.amv`
+    /// this returns `0, 1, -9, 8, 1, -2, -4, 5` — the trace's worked
+    /// example.
+    pub fn initial_predictor(&self) -> i16 {
+        (self.state & 0xFFFF) as u16 as i16
+    }
+
+    /// §4b-refined preamble split: the **initial step index**, the signed
+    /// 16-bit value at preamble `+0x02` (the high 16 bits of
+    /// [`Self::state`]).
+    ///
+    /// Per the §4b refined layout this field "is **always `00 00`**" in
+    /// the `comedian.amv` sample: every block re-seeds the predictor from
+    /// `+0x00` and **resets the step index to 0** at block start. The
+    /// trace flags a gap — it "cannot confirm from these bytes whether a
+    /// non-zero value would be honoured as a real starting step index or
+    /// is simply an always-zero reserved field" — so the container parser
+    /// surfaces the raw value rather than asserting it; see
+    /// [`Self::step_index_in_ima_range`] for the IMA `[0, 88]` bound a
+    /// strict caller can apply.
+    pub fn initial_step_index(&self) -> i16 {
+        (self.state >> 16) as u16 as i16
+    }
+
+    /// Whether [`Self::initial_step_index`] falls inside the canonical
+    /// IMA/DVI-ADPCM step-table index range `[0, 88]` (trace §4b: the
+    /// "89-entry step-size table" indexed `0..=88`, with the decoder
+    /// "index clamped to `[0, 88]`").
+    ///
+    /// Returns `true` for the always-zero value observed in both staged
+    /// fixtures and for any other in-range seed. A negative or
+    /// `> 88` value would index outside the standard step table — useful
+    /// for a recovery / sanity pass to flag a corrupted or non-conforming
+    /// preamble before a downstream decoder seeds from it. This does
+    /// **not** assert the trace's always-zero observation (which §4b
+    /// flags as an unresolved gap), only the structural table bound.
+    pub fn step_index_in_ima_range(&self) -> bool {
+        let idx = self.initial_step_index();
+        (0..=IMA_STEP_INDEX_MAX).contains(&idx)
+    }
 }
+
+/// Maximum valid IMA/DVI-ADPCM step-table index — the table has 89
+/// entries (indices `0..=88`), per trace §4b ("89-entry step-size
+/// table … index clamped to `[0, 88]`"). The standard IMA tables
+/// themselves live in the downstream `adpcm_amv` codec; the container
+/// crate uses only this bound to range-check the §4b preamble's
+/// `initialStepIndex` field.
+pub const IMA_STEP_INDEX_MAX: i16 = 88;
 
 /// Strict byte-shape validation of a `00dc` video-chunk payload against
 /// the §4a invariants the trace records.
@@ -2482,6 +2558,72 @@ pub(crate) mod tests {
         let p = AmvAudioPreamble::parse(&body).unwrap();
         assert_eq!(p.state, 0xDEAD_BEEF);
         assert_eq!(p.decoded_sample_count, 1837);
+    }
+
+    /// §4b refined split: the comedian first block's `+0x00` dword is
+    /// `initialPredictor = 0`, `initialStepIndex = 0`.
+    #[test]
+    fn audio_preamble_refined_split_first_block_all_zero() {
+        let p = AmvAudioPreamble {
+            state: 0,
+            decoded_sample_count: 1837,
+        };
+        assert_eq!(p.initial_predictor(), 0);
+        assert_eq!(p.initial_step_index(), 0);
+        assert!(p.step_index_in_ima_range());
+    }
+
+    /// §4b refined split worked example: "values for blocks 0–7 are
+    /// `0, 1, -9, 8, 1, -2, -4, 5`" — the signed-16-bit predictor seeds,
+    /// with the step index always 0 (`+2..+3` always `00 00`). Build the
+    /// raw dword for each block (low i16 = predictor, high i16 = 0) and
+    /// confirm the accessor recovers the trace's signed value.
+    #[test]
+    fn audio_preamble_refined_predictor_seeds_blocks_0_to_7() {
+        let seeds: [i16; 8] = [0, 1, -9, 8, 1, -2, -4, 5];
+        for &seed in &seeds {
+            // Pack: low 16 bits = predictor (LE), high 16 bits = step index 0.
+            let state = (seed as u16) as u32;
+            let p = AmvAudioPreamble {
+                state,
+                decoded_sample_count: 1837,
+            };
+            assert_eq!(p.initial_predictor(), seed, "predictor seed {seed}");
+            assert_eq!(p.initial_step_index(), 0, "step index always 0 for {seed}");
+            assert!(p.step_index_in_ima_range());
+        }
+    }
+
+    /// §4b refined split round-trips from the raw little-endian bytes:
+    /// `+0x00..+0x02` is the signed predictor, `+0x02..+0x04` the step
+    /// index, parsed straight off an `01wb` payload.
+    #[test]
+    fn audio_preamble_refined_split_parses_from_bytes() {
+        let mut body = vec![0u8; AMV_AUDIO_PREAMBLE_LEN];
+        // predictor = -9 at +0x00, step index = 0 at +0x02.
+        body[0..2].copy_from_slice(&(-9i16).to_le_bytes());
+        body[2..4].copy_from_slice(&0i16.to_le_bytes());
+        body[4..8].copy_from_slice(&1837u32.to_le_bytes());
+        let p = AmvAudioPreamble::parse(&body).unwrap();
+        assert_eq!(p.initial_predictor(), -9);
+        assert_eq!(p.initial_step_index(), 0);
+        // Raw dword still surfaces verbatim (low byte F7 FF = -9 LE).
+        assert_eq!(p.state & 0xFFFF, 0xFFF7);
+    }
+
+    /// `step_index_in_ima_range` enforces the §4b `[0, 88]` IMA bound:
+    /// 0 and 88 in range, 89 and negative out of range.
+    #[test]
+    fn audio_preamble_step_index_ima_range_bound() {
+        let mk = |step: i16| AmvAudioPreamble {
+            state: ((step as u16) as u32) << 16,
+            decoded_sample_count: 1837,
+        };
+        assert!(mk(0).step_index_in_ima_range());
+        assert!(mk(IMA_STEP_INDEX_MAX).step_index_in_ima_range());
+        assert_eq!(IMA_STEP_INDEX_MAX, 88);
+        assert!(!mk(89).step_index_in_ima_range());
+        assert!(!mk(-1).step_index_in_ima_range());
     }
 
     /// Slice shorter than 8 bytes cannot carry the preamble.

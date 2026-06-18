@@ -8,6 +8,31 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4b refined audio-preamble split — new `AmvAudioPreamble::initial_predictor()
+  -> i16`, `initial_step_index() -> i16`, and `step_index_in_ima_range() ->
+  bool` accessors surface the trace's §4b "8-byte block header layout
+  (refined)" subsection. That refinement re-reads the first dword the existing
+  raw `state: u32` field carries verbatim and establishes it is **not** a block
+  index — "values for blocks 0–7 are `0, 1, -9, 8, 1, -2, -4, 5`
+  (non-monotonic)" — but two packed signed 16-bit fields: an `initialPredictor`
+  ADPCM seed at preamble `+0x00` and an `initialStepIndex` at `+0x02`
+  ("always `00 00`" in both staged fixtures; each block re-seeds the predictor
+  and resets the step index to 0, no state carries across blocks).
+  `initial_predictor()` returns the low 16 bits of `state` reinterpreted as a
+  signed `i16` (little-endian byte order preserved); `initial_step_index()`
+  returns the high 16 bits. `step_index_in_ima_range()` range-checks the step
+  index against the canonical IMA/DVI-ADPCM `[0, 88]` table bound (the §4b
+  "89-entry step-size table … index clamped to `[0, 88]`"), exposed as the new
+  public `IMA_STEP_INDEX_MAX = 88` constant; the actual IMA step/index tables
+  and the nibble-to-PCM decode itself stay the downstream `adpcm_amv` codec's
+  job under the container's no-decode contract. The raw `state: u32` field is
+  unchanged (callers predating the refinement, or wanting the whole dword, are
+  unaffected). Five new unit tests pin the all-zero first-block split, the
+  signed-predictor worked example for blocks 0–7, a little-endian round-trip
+  parsed straight off an `01wb` payload (predictor `-9`), the `[0, 88]` IMA
+  range bound (0 and 88 in range; 89 and `-1` out), and the
+  `IMA_STEP_INDEX_MAX == 88` constant. Container-format parse only; no decode.
+
 - §4a JPEG header reconstruction — new `reconstruct_jpeg(&AmvVideoFrame)`
   and convenience `reconstruct_jpeg_from_payload(&AmvHeader, &[u8])`
   splice the device-stripped marker segments back into a bare `00dc`
