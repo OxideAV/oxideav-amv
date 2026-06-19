@@ -41,6 +41,22 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   *real* decoded raster and pins that the upright top row equals the mirrored
   bottom row and that a second flip restores the decoder output.
 
+- §4b whole-payload audio decode + **PCM end-to-end** validation — new
+  `decode_audio_payload(payload) -> Result<Vec<i16>, AmvDemuxerError>`
+  (re-exported at the crate root) is the audio counterpart of
+  `reconstruct_jpeg_from_payload`: it takes a full `01wb` leaf-chunk payload
+  (the §4b 8-byte preamble **plus** body), parses the preamble off the front
+  and decodes the rest, removing the manual `AmvAudioPreamble::parse` +
+  `&payload[AMV_AUDIO_PREAMBLE_LEN..]` slice every consumer would repeat. A
+  new integration test (`tests/decode_audio_pcm.rs`) drives the whole
+  `comedian.amv` audio track through it into one contiguous 16-bit mono PCM
+  buffer (2 050 650 samples), wraps it in a standard WAV, and cross-checks it
+  with a **black-box `ffprobe`** — which independently reads back 22 050 Hz,
+  mono, **93.000 s** (matching the §2 container 1:33). The probe is an opaque
+  validator; no audio-tool source is read, and the test skips when `ffprobe`
+  is absent. Three new unit tests pin the convenience against the manual split,
+  the preamble-only empty case, and the short-preamble rejection.
+
 - §4b AMV-IMA-ADPCM audio decode — new `decode_audio_block(&AmvAudioPreamble,
   compressed_body) -> Vec<i16>` (re-exported at the crate root) turns the
   nibble-packed body of an `01wb` block into the 16-bit PCM mono samples the

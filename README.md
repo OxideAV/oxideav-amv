@@ -139,6 +139,17 @@ decode resets the step index to 0 regardless, as the trace's gap note
 ("treating header +2 as the step index made the output worse")
 prescribes — feeding `+0x02` in instead inflates the clip rate ~27×.
 
+`decode_audio_payload(payload)` is the whole-payload convenience (the
+audio counterpart of `reconstruct_jpeg_from_payload`): it takes a full
+`01wb` leaf-chunk body — the 8-byte §4b preamble plus the compressed
+nibbles — parses the preamble and decodes the rest in one call. An
+**end-to-end PCM** integration test (`tests/decode_audio_pcm.rs`) drives
+the whole `comedian.amv` audio track through it into one 2 050 650-sample
+mono buffer, wraps it in a standard WAV, and cross-checks it with a
+**black-box `ffprobe`**, which independently reads back 22 050 Hz, mono,
+93.000 s. The probe is opaque (no audio-tool source read); the test skips
+when `ffprobe` is absent.
+
 ### Standalone byte parsers
 
 The byte-level types are usable without the framework: `AmvHeader`,

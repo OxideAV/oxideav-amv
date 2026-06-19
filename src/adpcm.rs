@@ -164,6 +164,31 @@ pub fn decode_audio_block(preamble: &AmvAudioPreamble, compressed_body: &[u8]) -
     out
 }
 
+/// Decode a whole `01wb` audio-chunk *payload* (the §4b 8-byte preamble
+/// **plus** its compressed body) into 16-bit PCM mono samples — the audio
+/// counterpart of [`crate::reconstruct_jpeg_from_payload`], which takes a
+/// raw `00dc` payload.
+///
+/// `payload` is the full leaf-chunk body a [`crate::MoviPayload::Audio`]
+/// hands back (or `&01wb_chunk_bytes`): this parses the §4b preamble off
+/// the front via [`AmvAudioPreamble::parse`] (seeding the predictor from
+/// `+0x00` and the sample count from `+0x04`), then decodes the remaining
+/// bytes with [`decode_audio_block`]. It removes the manual
+/// `AmvAudioPreamble::parse` + `&payload[AMV_AUDIO_PREAMBLE_LEN..]` slice
+/// step every consumer would otherwise repeat.
+///
+/// Returns the demuxer error if `payload` is shorter than the 8-byte
+/// preamble (`AMV_AUDIO_PREAMBLE_LEN`). A payload that is exactly the
+/// preamble with no compressed body decodes to an empty `Vec` (the §4b
+/// degenerate empty block).
+pub fn decode_audio_payload(payload: &[u8]) -> Result<Vec<i16>, crate::AmvDemuxerError> {
+    let preamble = AmvAudioPreamble::parse(payload)?;
+    Ok(decode_audio_block(
+        &preamble,
+        &payload[crate::parse::AMV_AUDIO_PREAMBLE_LEN..],
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,6 +347,42 @@ mod tests {
         assert_eq!(out[0], 7, "decode resets step index to 0, ignoring +0x02");
     }
 
+    #[test]
+    fn decode_audio_payload_matches_manual_preamble_split() {
+        // The whole-payload convenience equals parse-preamble + decode-body.
+        // Build a payload: predictor seed -9 (low 16 of state), step index 0,
+        // sample count 4, then two body bytes (4 nibbles).
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&((-9i16 as u16) as u32).to_le_bytes()); // state +0x00
+        payload.extend_from_slice(&4u32.to_le_bytes()); // count +0x04
+        payload.extend_from_slice(&[0x40, 0x44]); // body
+        let via_payload = decode_audio_payload(&payload).expect("payload decodes");
+        let pre = AmvAudioPreamble::parse(&payload).unwrap();
+        let via_block = decode_audio_block(&pre, &payload[8..]);
+        assert_eq!(via_payload, via_block);
+        assert_eq!(via_payload.len(), 4);
+        assert_eq!(
+            via_payload[0], -9,
+            "first sample is the re-seeded predictor"
+        );
+    }
+
+    #[test]
+    fn decode_audio_payload_preamble_only_is_empty() {
+        // Exactly 8 preamble bytes, no body -> empty PCM.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&10u32.to_le_bytes());
+        let out = decode_audio_payload(&payload).expect("preamble-only decodes");
+        assert!(out.is_empty(), "no body yields no samples");
+    }
+
+    #[test]
+    fn decode_audio_payload_rejects_short_preamble() {
+        // Fewer than 8 bytes cannot carry a preamble.
+        assert!(decode_audio_payload(&[0x00, 0x01, 0x02]).is_err());
+    }
+
     fn comedian_header() -> AmvHeader {
         AmvHeader {
             micros_per_frame: 83_333,
@@ -371,9 +432,14 @@ mod tests {
 
         for payload in MoviPayloadIter::new(movi_body).filter_map(|r| r.ok()) {
             if let MoviPayload::Audio { body, .. } = payload {
-                let preamble = AmvAudioPreamble::parse(body).expect("preamble");
-                let pcm = decode_audio_block(&preamble, &body[AMV_AUDIO_PREAMBLE_LEN..]);
+                // Whole-payload convenience: equals the manual
+                // parse-preamble + decode-body split (cross-checked on the
+                // first block).
+                let pcm = decode_audio_payload(body).expect("01wb payload decodes");
                 if blocks == 0 {
+                    let preamble = AmvAudioPreamble::parse(body).expect("preamble");
+                    let split = decode_audio_block(&preamble, &body[AMV_AUDIO_PREAMBLE_LEN..]);
+                    assert_eq!(pcm, split, "payload convenience == manual split");
                     first_block_len = pcm.len();
                 }
                 for &s in &pcm {
