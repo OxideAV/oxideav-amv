@@ -309,3 +309,51 @@ fn comedian_frame_reconstructs_and_decodes_to_coherent_pixels() {
         );
     }
 }
+
+/// §4a bottom-up orientation, end-to-end: the baseline-JPEG decode of the
+/// reconstructed frame comes out vertically mirrored (DIB row order), and
+/// the public [`oxideav_amv::flip_rows_vertical`] blit-time transform is
+/// the documented correction. Applies it to a *real* decoded raster and
+/// pins the §4a involution property on real pixels.
+#[test]
+fn comedian_frame_vertical_flip_yields_upright_and_round_trips() {
+    let Some(path) = comedian_fixture() else {
+        eprintln!("skipping orientation: comedian.amv not staged");
+        return;
+    };
+    let Some(dec) = find_decoder() else {
+        eprintln!("skipping orientation: no djpeg/magick on PATH");
+        return;
+    };
+
+    let (_header, frames) = reconstruct_first_frames(&path, 1);
+    let raster = match decode_to_raster(dec, &frames[0]) {
+        Ok(r) => r,
+        Err(e) => panic!("frame reconstruction did not decode cleanly: {e}"),
+    };
+    let bytes_per_row = raster.width * 3; // P6 = 3 bytes/pixel.
+    let mirrored = raster.rgb.clone();
+
+    // The §4a flip changes a non-degenerate natural raster (the decode is
+    // not accidentally top-bottom symmetric).
+    let mut upright = mirrored.clone();
+    oxideav_amv::flip_rows_vertical(&mut upright, raster.height, bytes_per_row);
+    assert_ne!(
+        upright, mirrored,
+        "vertical flip must change the mirrored decode output"
+    );
+
+    // Top row of the upright raster equals the bottom row of the mirrored
+    // decode (DIB bottom-up convention) — the literal §4a row reversal.
+    let last_row = (raster.height - 1) * bytes_per_row;
+    assert_eq!(
+        &upright[..bytes_per_row],
+        &mirrored[last_row..last_row + bytes_per_row],
+        "upright top row == mirrored bottom row"
+    );
+
+    // Involution: flipping the upright raster again returns the decoder's
+    // mirrored output verbatim.
+    oxideav_amv::flip_rows_vertical(&mut upright, raster.height, bytes_per_row);
+    assert_eq!(upright, mirrored, "double flip restores the decode output");
+}

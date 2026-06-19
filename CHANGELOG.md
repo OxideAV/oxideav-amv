@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4a end-to-end **decode-to-pixels** validation — a new integration test
+  (`tests/decode_to_pixels.rs`) proves the milestone the §4a JPEG-marker
+  reconstruction was built for: a real `comedian.amv` `00dc` frame, run
+  through `reconstruct_jpeg_from_payload`, decodes to a *coherent pixel
+  raster*. The crate stays container-only (no DCT/Huffman decode lives here);
+  the reconstructed standards-conforming baseline JPEG is handed to a
+  **black-box JPEG decoder binary** (`djpeg` from libjpeg, falling back to
+  `magick`) exactly as the trace §4a reconstruction oracle prescribes — clean
+  decode with no premature-end-of-data error (the decoder exits 0, confirming
+  the hardcoded 4:2:0 MCU geometry matches the bit budget of the verbatim
+  Annex-K tables) plus a coherent-natural-image check (luma std and vertical
+  total-variation thresholds). The three first frames decode to 128 × 96
+  rasters with luma std 34.9 and vertical TV 10.6 — matching the trace's
+  ~8.8 4:2:0 figure, where a wrong 4:1:1 sampling or wrong tables would desync
+  or scramble. The test skips automatically when no JPEG decoder binary is on
+  `PATH`. No decoder *source* is read; the validator is an opaque process.
+
+- §4a **bottom-up orientation** helper — new `flip_rows_vertical(pixels,
+  height, bytes_per_row)` (re-exported at the crate root) is the documented
+  blit-time correction for the §4a orientation note: *"the decoded raster
+  comes out vertically mirrored; a single vertical flip yields the upright
+  natural image … consistent with the `dc` ('DIB') chunk convention (bottom-up
+  DIB row order)."* It reverses whole rows in place for any interleaved pixel
+  format (RGB/RGBA/grayscale/packed YCbCr), so a consumer that decodes the
+  reconstructed JPEG applies it once to get the upright image. Kept out of
+  `reconstruct_jpeg` (which must stay byte-faithful to a standard JPEG) — it is
+  a post-decode transform, not a codec table. Six new unit tests pin the
+  exact top↔bottom row swap, the involution (double-flip identity), odd-height
+  middle-row preservation, single-row / empty no-ops, and the geometry-mismatch
+  panic; the decode-to-pixels integration test additionally applies it to a
+  *real* decoded raster and pins that the upright top row equals the mirrored
+  bottom row and that a second flip restores the decoder output.
+
 - §4b AMV-IMA-ADPCM audio decode — new `decode_audio_block(&AmvAudioPreamble,
   compressed_body) -> Vec<i16>` (re-exported at the crate root) turns the
   nibble-packed body of an `01wb` block into the 16-bit PCM mono samples the

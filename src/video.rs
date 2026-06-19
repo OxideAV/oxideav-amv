@@ -127,6 +127,62 @@ impl<'a> AmvVideoFrame<'a> {
     }
 }
 
+/// Flip a decoded raster vertically (top row ↔ bottom row), in place —
+/// the §4a **bottom-up orientation** transform.
+///
+/// The bytes that come out of a baseline JPEG decoder applied to the
+/// reconstructed AMV frame (see [`crate::reconstruct_jpeg`]) are
+/// **vertically mirrored**: trace §4a records that *"the decoded raster
+/// comes out vertically mirrored; a single vertical flip yields the
+/// upright natural image. This is consistent with the `dc` ('DIB') chunk
+/// convention (bottom-up DIB row order)."* It is an orientation transform
+/// applied at *blit* time — **not** a codec table and **not** part of the
+/// JPEG reconstruction — so it lives here as a small post-decode helper
+/// rather than inside [`crate::reconstruct_jpeg`] (which only re-inserts
+/// the stripped marker segments and must stay byte-faithful to a standard
+/// JPEG).
+///
+/// `pixels` is a tightly-packed raster of `height` rows, each
+/// `bytes_per_row` bytes (`bytes_per_row = width × bytes_per_pixel`); the
+/// function swaps whole rows, so it works for any interleaved pixel
+/// format (RGB, RGBA, grayscale, packed YCbCr). The slice length must be
+/// exactly `height × bytes_per_row`.
+///
+/// # Panics
+///
+/// Panics if `pixels.len() != height * bytes_per_row` (a caller passing a
+/// mismatched geometry is a bug, not recoverable input).
+///
+/// # Example
+///
+/// ```
+/// use oxideav_amv::flip_rows_vertical;
+/// // 2 rows of 3 bytes each (a 1-pixel-wide RGB image, 2 rows):
+/// let mut px = vec![1, 2, 3, /* row 0 */ 4, 5, 6 /* row 1 */];
+/// flip_rows_vertical(&mut px, 2, 3);
+/// assert_eq!(px, vec![4, 5, 6, 1, 2, 3]);
+/// ```
+pub fn flip_rows_vertical(pixels: &mut [u8], height: usize, bytes_per_row: usize) {
+    assert_eq!(
+        pixels.len(),
+        height.saturating_mul(bytes_per_row),
+        "raster length {} must equal height({height}) × bytes_per_row({bytes_per_row})",
+        pixels.len()
+    );
+    if height < 2 || bytes_per_row == 0 {
+        return;
+    }
+    let mut top = 0usize;
+    let mut bottom = height - 1;
+    while top < bottom {
+        let (head, tail) = pixels.split_at_mut(bottom * bytes_per_row);
+        head[top * bytes_per_row..top * bytes_per_row + bytes_per_row]
+            .swap_with_slice(&mut tail[..bytes_per_row]);
+        top += 1;
+        bottom -= 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +352,60 @@ mod tests {
             "§4a first entropy-coded bytes after SOI"
         );
         assert_eq!(first_entropy_len, Some(1633 - 4), "entropy window length");
+    }
+
+    #[test]
+    fn flip_rows_vertical_swaps_top_and_bottom_rows() {
+        // 4 rows of 2 bytes each.
+        let mut px = vec![
+            0xA0, 0xA1, // row 0
+            0xB0, 0xB1, // row 1
+            0xC0, 0xC1, // row 2
+            0xD0, 0xD1, // row 3
+        ];
+        flip_rows_vertical(&mut px, 4, 2);
+        assert_eq!(px, vec![0xD0, 0xD1, 0xC0, 0xC1, 0xB0, 0xB1, 0xA0, 0xA1]);
+    }
+
+    #[test]
+    fn flip_rows_vertical_is_an_involution() {
+        // Flipping twice restores the original (§4a: a single flip yields
+        // upright; flipping again returns to the mirrored decode output).
+        let orig: Vec<u8> = (0u8..30).collect(); // 5 rows × 6 bytes (a 2-px RGB row).
+        let mut px = orig.clone();
+        flip_rows_vertical(&mut px, 5, 6);
+        assert_ne!(px, orig, "odd-row-count raster actually changes");
+        flip_rows_vertical(&mut px, 5, 6);
+        assert_eq!(px, orig, "double flip is identity");
+    }
+
+    #[test]
+    fn flip_rows_vertical_odd_height_keeps_middle_row() {
+        // 3 rows of 1 byte: middle row is its own mirror.
+        let mut px = vec![1u8, 2, 3];
+        flip_rows_vertical(&mut px, 3, 1);
+        assert_eq!(px, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn flip_rows_vertical_single_row_is_noop() {
+        let mut px = vec![7u8, 8, 9];
+        flip_rows_vertical(&mut px, 1, 3);
+        assert_eq!(px, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn flip_rows_vertical_empty_is_noop() {
+        let mut px: Vec<u8> = Vec::new();
+        flip_rows_vertical(&mut px, 0, 0);
+        assert!(px.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "must equal height")]
+    fn flip_rows_vertical_rejects_geometry_mismatch() {
+        let mut px = vec![0u8; 5];
+        // 2 rows × 3 bytes = 6 ≠ 5.
+        flip_rows_vertical(&mut px, 2, 3);
     }
 }

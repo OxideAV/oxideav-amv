@@ -92,6 +92,26 @@ Huffman walk or dequantisation happens here (that is the codec crate's
 job downstream). The fixture test reconstructs `comedian.amv`'s first
 frame to a complete baseline JPEG and pins the §4a entropy head.
 
+An **end-to-end decode-to-pixels** integration test
+(`tests/decode_to_pixels.rs`) closes the loop the §4a reconstruction was
+built for: it reconstructs real `comedian.amv` frames and hands them to a
+**black-box JPEG decoder binary** (`djpeg` from libjpeg, falling back to
+`magick`) — exactly the trace §4a reconstruction oracle. A clean decode
+(the validator exits with no premature-end-of-data error) confirms the
+hardcoded 4:2:0 MCU geometry matches the bit budget of the verbatim
+Annex-K tables, and a luma-std / vertical-total-variation check confirms a
+coherent natural image (frame 0 decodes 128 × 96 with luma std 34.9 and
+vertical TV 10.6, matching the trace's ~8.8 4:2:0 figure; a wrong sampling
+would desync or scramble). The test skips when no decoder binary is on
+`PATH`; no decoder *source* is read — the validator is an opaque process.
+
+`flip_rows_vertical(pixels, height, bytes_per_row)` is the §4a blit-time
+**orientation** correction: the baseline-JPEG decode comes out vertically
+mirrored (the `dc` "DIB" bottom-up row convention), and a single in-place
+whole-row reversal yields the upright natural image. It is a post-decode
+transform — kept out of `reconstruct_jpeg`, which must stay byte-faithful
+to a standard JPEG — and works for any interleaved pixel format.
+
 ### AMV-IMA-ADPCM audio decode
 
 `decode_audio_block(&AmvAudioPreamble, compressed_body)` is the audio

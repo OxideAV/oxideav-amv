@@ -89,7 +89,7 @@ pub use parse::{
     AMV_END_TRAILER, AMV_FORM_TYPE, AUDIO_CHUNK_TAG, IMA_STEP_INDEX_MAX, JPEG_EOI, JPEG_SOI,
     VIDEO_CHUNK_TAG,
 };
-pub use video::AmvVideoFrame;
+pub use video::{flip_rows_vertical, AmvVideoFrame};
 
 use oxideav_core::{
     CodecRegistry, CodecResolver, ContainerRegistry, Demuxer, Error, ProbeData, ProbeScore,
