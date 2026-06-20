@@ -59,7 +59,7 @@ use crate::video::AmvVideoFrame;
 
 /// Annex K Table K.1 — default **luminance** quantization table, in
 /// natural (row-major) 8×8 order. `Tq=0`. (docs `…/default-quant-table-luminance.csv`.)
-const QUANT_LUMA: [u8; 64] = [
+pub(crate) const QUANT_LUMA: [u8; 64] = [
     16, 11, 10, 16, 24, 40, 51, 61, //
     12, 12, 14, 19, 26, 58, 60, 55, //
     14, 13, 16, 24, 40, 57, 69, 56, //
@@ -72,7 +72,7 @@ const QUANT_LUMA: [u8; 64] = [
 
 /// Annex K Table K.2 — default **chrominance** quantization table, in
 /// natural (row-major) 8×8 order. `Tq=1`. (docs `…/default-quant-table-chrominance.csv`.)
-const QUANT_CHROMA: [u8; 64] = [
+pub(crate) const QUANT_CHROMA: [u8; 64] = [
     17, 18, 24, 47, 99, 99, 99, 99, //
     18, 21, 26, 66, 99, 99, 99, 99, //
     24, 26, 56, 99, 99, 99, 99, 99, //
@@ -88,7 +88,7 @@ const QUANT_CHROMA: [u8; 64] = [
 /// segment transmits the table in zig-zag order, so element `k` of the
 /// emitted byte run is the natural-order value whose zig-zag index is
 /// `k`. (docs `…/zigzag-scan-order.csv`.)
-const ZIGZAG: [u8; 64] = [
+pub(crate) const ZIGZAG: [u8; 64] = [
     0, 1, 5, 6, 14, 15, 27, 28, //
     2, 4, 7, 13, 16, 26, 29, 42, //
     3, 8, 12, 17, 25, 30, 41, 43, //
@@ -104,14 +104,14 @@ const ZIGZAG: [u8; 64] = [
 // 17-entry convention; only entries 1..=16 are transmitted in a DHT).
 
 /// K.3 luma DC `BITS` (lengths 1..=16). (docs `…/huffman-dc-luminance-bits.csv`, indices 1..=16.)
-const DC_LUMA_BITS: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
+pub(crate) const DC_LUMA_BITS: [u8; 16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0];
 /// K.3 luma DC `HUFFVAL`. (docs `…/huffman-dc-luminance-val.csv`.)
-const DC_LUMA_VALS: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+pub(crate) const DC_LUMA_VALS: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
 /// K.3 luma AC `BITS` (lengths 1..=16). (docs `…/huffman-ac-luminance-bits.csv`, indices 1..=16.)
-const AC_LUMA_BITS: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d];
+pub(crate) const AC_LUMA_BITS: [u8; 16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 0x7d];
 /// K.3 luma AC `HUFFVAL` (162 entries). (docs `…/huffman-ac-luminance-val.csv`.)
-const AC_LUMA_VALS: [u8; 162] = [
+pub(crate) const AC_LUMA_VALS: [u8; 162] = [
     0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
     0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
     0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
@@ -126,14 +126,14 @@ const AC_LUMA_VALS: [u8; 162] = [
 ];
 
 /// K.4 chroma DC `BITS` (lengths 1..=16). (docs `…/huffman-dc-chrominance-bits.csv`, indices 1..=16.)
-const DC_CHROMA_BITS: [u8; 16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
+pub(crate) const DC_CHROMA_BITS: [u8; 16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0];
 /// K.4 chroma DC `HUFFVAL`. (docs `…/huffman-dc-chrominance-val.csv`.)
-const DC_CHROMA_VALS: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+pub(crate) const DC_CHROMA_VALS: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 
 /// K.4 chroma AC `BITS` (lengths 1..=16). (docs `…/huffman-ac-chrominance-bits.csv`, indices 1..=16.)
-const AC_CHROMA_BITS: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
+pub(crate) const AC_CHROMA_BITS: [u8; 16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 0x77];
 /// K.4 chroma AC `HUFFVAL` (162 entries). (docs `…/huffman-ac-chrominance-val.csv`.)
-const AC_CHROMA_VALS: [u8; 162] = [
+pub(crate) const AC_CHROMA_VALS: [u8; 162] = [
     0x00, 0x01, 0x02, 0x03, 0x11, 0x04, 0x05, 0x21, 0x31, 0x06, 0x12, 0x41, 0x51, 0x07, 0x61, 0x71,
     0x13, 0x22, 0x32, 0x81, 0x08, 0x14, 0x42, 0x91, 0xa1, 0xb1, 0xc1, 0x09, 0x23, 0x33, 0x52, 0xf0,
     0x15, 0x62, 0x72, 0xd1, 0x0a, 0x16, 0x24, 0x34, 0xe1, 0x25, 0xf1, 0x17, 0x18, 0x19, 0x1a, 0x26,
