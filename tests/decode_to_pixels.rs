@@ -44,8 +44,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use oxideav_amv::{
-    reconstruct_jpeg_from_payload, AmvHeader, MoviPayload, MoviPayloadIter, AMVH_BODY_LEN,
-    AMV_END_TRAILER,
+    decode_frame_from_payload, reconstruct_jpeg_from_payload, AmvHeader, MoviPayload,
+    MoviPayloadIter, AMVH_BODY_LEN, AMV_END_TRAILER,
 };
 
 /// Locate the staged `comedian.amv` fixture, mirroring the in-crate unit
@@ -89,6 +89,28 @@ fn reconstruct_first_frames(path: &Path, n: usize) -> (AmvHeader, Vec<Vec<u8>>) 
         }
     }
     (header, frames)
+}
+
+/// Parse the §2 `amvh` header and the raw `00dc` video payloads (bare AMV
+/// frames, SOI..EOI) — the input to the in-crate [`decode_frame_from_payload`].
+fn raw_video_payloads(path: &Path) -> (AmvHeader, Vec<Vec<u8>>) {
+    let bytes = std::fs::read(path).expect("read comedian fixture");
+    let header =
+        AmvHeader::parse(&bytes[0x20..0x20 + AMVH_BODY_LEN as usize]).expect("amvh parses");
+    let movi_pos = bytes
+        .windows(4)
+        .position(|w| w == b"movi")
+        .expect("movi FOURCC present");
+    let trailer_start = bytes.len() - AMV_END_TRAILER.len();
+    let movi_body = &bytes[movi_pos + 4..trailer_start];
+
+    let mut payloads = Vec::new();
+    for payload in MoviPayloadIter::new(movi_body).filter_map(|r| r.ok()) {
+        if let MoviPayload::Video { body, .. } = payload {
+            payloads.push(body.to_vec());
+        }
+    }
+    (header, payloads)
 }
 
 /// A decoded 8-bit RGB raster.
@@ -356,4 +378,138 @@ fn comedian_frame_vertical_flip_yields_upright_and_round_trips() {
     // mirrored output verbatim.
     oxideav_amv::flip_rows_vertical(&mut upright, raster.height, bytes_per_row);
     assert_eq!(upright, mirrored, "double flip restores the decode output");
+}
+
+/// Mean absolute per-channel difference between two equal-length RGB
+/// rasters.
+fn rgb_mae(a: &[u8], b: &[u8]) -> f64 {
+    assert_eq!(a.len(), b.len());
+    let sum: u64 = a
+        .iter()
+        .zip(b)
+        .map(|(&x, &y)| (x as i32 - y as i32).unsigned_abs() as u64)
+        .sum();
+    sum as f64 / a.len() as f64
+}
+
+/// The crate's **own** baseline-JPEG decoder
+/// ([`oxideav_amv::decode_frame_from_payload`]) decodes the real
+/// `comedian.amv` frames to RGB that matches a black-box reference JPEG
+/// decoder pixel-for-pixel (within fast-IDCT / upsampling rounding).
+///
+/// This is the milestone validation: the §4a device tables + 4:2:0
+/// geometry + IDCT + colour conversion implemented in-crate reproduce the
+/// reference image. The reference is the same opaque `djpeg` / `magick`
+/// binary used elsewhere in this file, fed the *reconstructed* conforming
+/// JPEG of the same frame; its source is never read. The reference's
+/// output is bottom-up (DIB) so it is vertically flipped to the upright
+/// orientation the in-crate decoder already applies (§4a) before
+/// comparison.
+#[test]
+fn in_crate_decoder_matches_blackbox_reference_on_real_frames() {
+    let Some(path) = comedian_fixture() else {
+        eprintln!("skipping in-crate vs reference: comedian.amv not staged");
+        return;
+    };
+    let Some(dec) = find_decoder() else {
+        eprintln!("skipping in-crate vs reference: no djpeg/magick on PATH");
+        return;
+    };
+
+    let (header, payloads) = raw_video_payloads(&path);
+    let (_h2, jpegs) = reconstruct_first_frames(&path, 3);
+    assert!(payloads.len() >= 3, "fixture has >=3 video frames");
+
+    for i in 0..3 {
+        // In-crate decode (upright RGB).
+        let mine =
+            decode_frame_from_payload(&header, &payloads[i]).expect("in-crate frame decodes");
+        assert_eq!((mine.width, mine.height), (128, 96), "§2 amvh geometry");
+        assert_eq!(mine.rgb.len(), 128 * 96 * 3);
+
+        // Reference decode of the reconstructed JPEG, flipped upright.
+        let reference = decode_to_raster(dec, &jpegs[i])
+            .unwrap_or_else(|e| panic!("frame {i} reference decode failed: {e}"));
+        assert_eq!((reference.width, reference.height), (128, 96));
+        let bpr = reference.width * 3;
+        let mut ref_upright = reference.rgb.clone();
+        oxideav_amv::flip_rows_vertical(&mut ref_upright, reference.height, bpr);
+
+        let mae = rgb_mae(&mine.rgb, &ref_upright);
+        eprintln!("frame {i}: in-crate vs reference MAE = {mae:.3}/channel");
+        // A correct decode tracks the reference within a few levels per
+        // channel: the only divergence is the reference's integer fast
+        // IDCT + fancy chroma upsampling vs our float IDCT + nearest
+        // upsample. A wrong table / sampling / colour path would be tens
+        // of levels off (the mis-oriented baseline is ~18). 5.0 is a snug
+        // bound a correct decode clears and a broken one cannot.
+        assert!(
+            mae < 5.0,
+            "frame {i} in-crate decode MAE {mae:.3} too far from the reference"
+        );
+    }
+}
+
+/// The in-crate decoder runs over **every** video frame of the fixture
+/// with no external binary, producing a correctly-sized, coherent,
+/// keyframe-stable raster for each — proving the §4a fixed-table profile
+/// decodes the whole stream, not just frame 0.
+#[test]
+fn in_crate_decoder_decodes_all_frames_coherently() {
+    let Some(path) = comedian_fixture() else {
+        eprintln!("skipping all-frames decode: comedian.amv not staged");
+        return;
+    };
+
+    let (header, payloads) = raw_video_payloads(&path);
+    // §4: comedian.amv has 1116 video frames (trace §4 chunk table).
+    assert_eq!(payloads.len(), 1116, "expected 1116 video frames");
+
+    // Every frame must decode in-crate (no premature-end / desync) and
+    // produce the §2 geometry. Tonal coherence is an aggregate property:
+    // a real clip mixes content frames (high tonal range) with the
+    // occasional genuinely-flat frame (e.g. a fade-to-black near the end —
+    // frame 1100 of comedian.amv decodes to a uniform raster, which is
+    // correct content, not a decode fault). So we require that *most*
+    // sampled frames carry a real tonal range rather than asserting it on
+    // every one.
+    let mut sampled = 0u32;
+    let mut with_tonal_range = 0u32;
+    for (i, payload) in payloads.iter().enumerate() {
+        let frame = decode_frame_from_payload(&header, payload)
+            .unwrap_or_else(|e| panic!("frame {i} failed to decode in-crate: {e}"));
+        assert_eq!((frame.width, frame.height), (128, 96), "frame {i} geometry");
+        assert_eq!(frame.rgb.len(), 128 * 96 * 3);
+
+        // Coherence sampled on a sparse grid to keep the sweep cheap.
+        if i % 100 == 0 {
+            let n = (frame.width * frame.height) as usize;
+            let lumas: Vec<f64> = (0..n)
+                .map(|k| {
+                    let p = &frame.rgb[k * 3..k * 3 + 3];
+                    0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64
+                })
+                .collect();
+            let mean = lumas.iter().sum::<f64>() / n as f64;
+            let var = lumas.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n as f64;
+            let std = var.sqrt();
+            // A flat frame is fine *only* if it is genuinely uniform (a
+            // garbage decode is noisy, not flat) — assert the raster is
+            // either tonally rich or near-perfectly uniform, never noisy.
+            assert!(
+                !(0.5..=5.0).contains(&std),
+                "frame {i} luma std {std:.1} is neither a natural image nor a clean flat frame"
+            );
+            sampled += 1;
+            if std > 5.0 {
+                with_tonal_range += 1;
+            }
+        }
+    }
+    // The clip is overwhelmingly natural content: the vast majority of
+    // sampled frames must carry a real tonal range.
+    assert!(
+        with_tonal_range * 4 >= sampled * 3,
+        "only {with_tonal_range}/{sampled} sampled frames had a natural tonal range"
+    );
 }

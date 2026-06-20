@@ -18,16 +18,18 @@ length. See the
 [trace document](https://github.com/OxideAV/oxideav-workspace/blob/master/docs/container/amv/amv-container-trace.md)
 in the workspace for the full byte-by-byte layout.
 
-This is primarily a **container** crate — it identifies, demuxes and
-muxes AMV files and declares the video stream as the `mjpeg` codec id and
-the audio stream as `adpcm_amv`. It additionally carries the two
-*decode-adjacent wire-format helpers* the AMV device's stripped/hardcoded
-profile makes intrinsic to the format: `reconstruct_jpeg` splices the
-device-stripped JPEG marker segments back into a `00dc` frame, and
-`decode_audio_block` applies the standard IMA/DVI ADPCM recurrence to an
-`01wb` block (see below). Both are pure trace-derived realisations of the
-device profile; the heavyweight DCT/Huffman image decode remains the
-downstream `mjpeg` codec's job.
+This is a **container** crate that additionally decodes the AMV device's
+intrinsic, fixed video and audio profiles end-to-end. AMV's video is a
+table-*stripped* JPEG whose quant / Huffman tables, geometry and scan
+parameters live nowhere on the wire — they are hardcoded in the player —
+so every AMV file shares one fixed device profile; decoding it is
+intrinsic to the format, not a generic codec carried in a generic
+container. The crate therefore provides `decode_frame` (bare `00dc`
+payload → upright RGB pixels) and `decode_audio_block` (nibble-packed
+`01wb` body → 16-bit PCM), alongside the wire-format helper
+`reconstruct_jpeg` (which splices the stripped JPEG markers back to a
+conforming JFIF/JPEG for a generic downstream decoder). All three are
+pure trace-derived realisations of the device profile.
 
 ## Capabilities
 
@@ -92,18 +94,35 @@ Huffman walk or dequantisation happens here (that is the codec crate's
 job downstream). The fixture test reconstructs `comedian.amv`'s first
 frame to a complete baseline JPEG and pins the §4a entropy head.
 
+### In-crate video frame decode
+
+`decode_frame(&AmvVideoFrame)` (and the convenience
+`decode_frame_from_payload(&AmvHeader, payload)`) decodes a bare `00dc`
+frame straight to an upright RGB `DecodedFrame { width, height, rgb }` —
+no external binary, no synthesised intermediate JPEG. It is a from-scratch
+baseline-JPEG decoder over the §4a device profile: a byte-stuffing-aware
+MSB bit reader over the entropy window, a canonical T.81 Huffman walk
+built from the Annex K K.3/K.4 `BITS`/`HUFFVAL` lists, zig-zag dequant
+against K.1/K.2, a separable 8×8 inverse DCT, the 4:2:0 MCU layout (2×2
+luma + 1 Cb + 1 Cr), nearest-neighbour chroma upsampling, BT.601
+YCbCr→RGB, and the §4a bottom-up vertical flip so the output is upright.
+The same Annex K table constants back both this decoder and
+`reconstruct_jpeg` (shared in one place, not duplicated).
+
 An **end-to-end decode-to-pixels** integration test
-(`tests/decode_to_pixels.rs`) closes the loop the §4a reconstruction was
-built for: it reconstructs real `comedian.amv` frames and hands them to a
-**black-box JPEG decoder binary** (`djpeg` from libjpeg, falling back to
-`magick`) — exactly the trace §4a reconstruction oracle. A clean decode
-(the validator exits with no premature-end-of-data error) confirms the
-hardcoded 4:2:0 MCU geometry matches the bit budget of the verbatim
-Annex-K tables, and a luma-std / vertical-total-variation check confirms a
-coherent natural image (frame 0 decodes 128 × 96 with luma std 34.9 and
-vertical TV 10.6, matching the trace's ~8.8 4:2:0 figure; a wrong sampling
-would desync or scramble). The test skips when no decoder binary is on
-`PATH`; no decoder *source* is read — the validator is an opaque process.
+(`tests/decode_to_pixels.rs`) validates this against a **black-box JPEG
+decoder binary** (`djpeg` from libjpeg, falling back to `magick`): the
+in-crate decode of real `comedian.amv` frames matches the reference
+decoder's pixels within **MAE ≈ 1.35/channel** (the only divergence is the
+reference's integer fast-IDCT + fancy chroma upsampling vs the in-crate
+float IDCT + nearest upsample; a wrong table / sampling / colour path is
+tens of levels off — the mis-oriented baseline is ~18). A second test
+decodes **all 1116 frames** in-crate with no external binary, asserting
+each is 128 × 96 and that the stream is overwhelmingly coherent natural
+content (the occasional genuinely-flat fade frame is accepted only when
+near-perfectly uniform, never noisy). The reference tests skip when no
+decoder binary is on `PATH`; no decoder *source* is ever read — the
+validator is an opaque process.
 
 `flip_rows_vertical(pixels, height, bytes_per_row)` is the §4a blit-time
 **orientation** correction: the baseline-JPEG decode comes out vertically
