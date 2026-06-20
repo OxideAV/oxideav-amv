@@ -314,6 +314,29 @@ impl AmvDemuxer {
         &self.audio_format
     }
 
+    /// Decode a video [`Packet`] emitted by this demuxer straight to an
+    /// upright RGB [`crate::DecodedFrame`].
+    ///
+    /// This is the demux→pixels one-call convenience: it binds the
+    /// demuxer's parsed §2 `amvh` geometry (the only place the AMV video
+    /// resolution exists — the `00dc` bitstream carries no frame header)
+    /// to the packet's raw `00dc` payload and runs the in-crate
+    /// §4a baseline-JPEG decoder ([`crate::decode_frame_from_payload`]).
+    ///
+    /// Returns [`Error::invalid`] if `packet` is not a video packet
+    /// (stream index `0`), or surfaces the decode error for a malformed
+    /// payload (missing SOI/EOI bracket, internal markers, zero geometry).
+    pub fn decode_video_packet(&self, packet: &Packet) -> Result<crate::DecodedFrame> {
+        if packet.stream_index != STREAM_INDEX_VIDEO {
+            return Err(Error::invalid(format!(
+                "amv: decode_video_packet expects a video packet (stream {STREAM_INDEX_VIDEO}), \
+                 got stream {}",
+                packet.stream_index
+            )));
+        }
+        crate::decode_frame_from_payload(&self.header, &packet.data).map_err(Error::from)
+    }
+
     /// Convenience: current `movi`-walk cursor (file offset of the
     /// next chunk header). Exposed for tests + audit; not part of the
     /// stable contract.

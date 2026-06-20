@@ -108,6 +108,10 @@ luma + 1 Cb + 1 Cr), nearest-neighbour chroma upsampling, BT.601
 YCbCr→RGB, and the §4a bottom-up vertical flip so the output is upright.
 The same Annex K table constants back both this decoder and
 `reconstruct_jpeg` (shared in one place, not duplicated).
+`AmvDemuxer::decode_video_packet(&packet)` is the demux→pixels one-call
+convenience: it binds the demuxer's parsed `amvh` geometry to a video
+`Packet`'s raw `00dc` payload and returns the upright `DecodedFrame`
+(rejecting a non-video packet).
 
 An **end-to-end decode-to-pixels** integration test
 (`tests/decode_to_pixels.rs`) validates this against a **black-box JPEG

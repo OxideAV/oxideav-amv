@@ -1,44 +1,49 @@
-//! End-to-end milestone validation: a real AMV `00dc` video frame, run
-//! through the §4a device-stripped-JPEG reconstruction
-//! ([`oxideav_amv::reconstruct_jpeg_from_payload`]), decodes to a
-//! coherent pixel raster.
+//! End-to-end §4a video milestone validation: real AMV `00dc` frames
+//! decode to coherent RGB rasters, both through the in-crate baseline
+//! decoder and (for cross-validation) a black-box reference decoder.
 //!
-//! The crate is a *container*: it reassembles the marker segments the
-//! AMV device strips (`DQT` / `SOF0` / `DHT` / `SOS`) and copies the
-//! entropy-coded scan through verbatim, producing a standards-conforming
-//! baseline JFIF/JPEG. The heavyweight DCT / Huffman image decode is the
-//! downstream `mjpeg` codec's job — so this test does not implement a
-//! decoder. It proves the reconstruction is *decodable to pixels* by
-//! handing the reconstructed bytes to a **black-box JPEG decoder binary**
-//! (`djpeg` from libjpeg, or `magick`/`ffmpeg`) exactly as trace §4a's
-//! reconstruction oracle prescribes:
+//! Two complementary paths are exercised:
 //!
-//! > "A reconstruction is judged correct when (a) a strict baseline
-//! > decoder consumes the entropy stream with no 'premature end of data'
-//! > error … and (b) the decoded raster is a coherent natural image."
+//! 1. **Reconstruction + black-box decode.** The §4a device-stripped
+//!    marker segments are spliced back
+//!    ([`oxideav_amv::reconstruct_jpeg_from_payload`]) into a
+//!    standards-conforming baseline JFIF/JPEG, which a black-box decoder
+//!    binary (`djpeg` from libjpeg, falling back to `magick`) consumes —
+//!    exactly the trace §4a reconstruction oracle:
 //!
-//! No decoder *source* is read — the validator is an opaque process that
-//! consumes the reconstructed JPEG and emits pixels; this test only
-//! inspects those pixels. Skipped automatically when no JPEG decoder
-//! binary is on `PATH` (CI ships libjpeg; some dev machines may not).
+//!    > "A reconstruction is judged correct when (a) a strict baseline
+//!    > decoder consumes the entropy stream with no 'premature end of
+//!    > data' error … and (b) the decoded raster is a coherent natural
+//!    > image."
+//!
+//! 2. **In-crate decode** ([`oxideav_amv::decode_frame_from_payload`] /
+//!    [`oxideav_amv::AmvDemuxer::decode_video_packet`]) — the crate's
+//!    own baseline-JPEG decoder over the §4a device profile, producing
+//!    upright RGB with no external binary. The two paths are cross-checked
+//!    pixel-for-pixel: the in-crate decode matches the reference within a
+//!    few levels per channel (MAE ≈ 1.35), the residual being the
+//!    reference's integer fast-IDCT + fancy upsampling vs the in-crate
+//!    float IDCT + nearest upsample.
+//!
+//! No decoder *source* is read — the black-box binary is an opaque
+//! process. The reference-comparison tests skip when no JPEG decoder
+//! binary is on `PATH`; the in-crate-only tests always run.
 //!
 //! ## What is asserted (trace §4a)
 //!
-//! * **Clean decode** — the validator exits successfully (no premature
-//!   end of data), i.e. the hardcoded MCU geometry (4:2:0, 6 blocks/MCU)
-//!   exactly matches the bit budget of the verbatim Annex-K Huffman
-//!   tables. Wrong tables/sampling would desync and fail here.
+//! * **Clean decode** — no premature end of data: the hardcoded MCU
+//!   geometry (4:2:0, 6 blocks/MCU) matches the bit budget of the
+//!   verbatim Annex-K Huffman tables. Wrong tables/sampling desync.
 //! * **Geometry** — the decoded raster is the §2 `amvh` resolution
 //!   (128 × 96 for `comedian.amv`).
-//! * **Coherent natural image** — the luma plane has a real tonal range
-//!   (std well above flat-noise) and *low* vertical total-variation
-//!   (smooth, not the scrambled 4-wide strips a wrong 4:1:1 sampling
-//!   would produce). Trace §4a reports a vert-TV near 8.8 for frame 0
-//!   under 4:2:0; we assert a generous upper bound that 4:1:1 / noise
-//!   would blow past.
-//! * **Inter-frame consistency** — three reconstructed frames decode to
-//!   the same geometry and a stable tonal profile (an intra-only,
-//!   fixed-table codec — every frame is a keyframe, §4a).
+//! * **Coherent natural image** — a real tonal range and low vertical
+//!   total-variation (smooth, not the scrambled strips a wrong 4:1:1
+//!   sampling would produce; trace §4a reports vert-TV ≈ 8.8 for frame 0).
+//! * **In-crate ↔ reference agreement** — the two decode paths produce
+//!   the same pixels within fast-IDCT / upsampling rounding.
+//! * **Whole-stream + demuxer surface** — all 1116 frames decode
+//!   in-crate, and the public `AmvDemuxer::decode_video_packet` path
+//!   yields pixels from a real file open.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -511,5 +516,59 @@ fn in_crate_decoder_decodes_all_frames_coherently() {
     assert!(
         with_tonal_range * 4 >= sampled * 3,
         "only {with_tonal_range}/{sampled} sampled frames had a natural tonal range"
+    );
+}
+
+/// Full demux→pixels path through the public `AmvDemuxer`: open the real
+/// fixture, pull the first video [`oxideav_core::Packet`], and decode it
+/// to RGB via `AmvDemuxer::decode_video_packet` — the one-call convenience
+/// that binds the demuxer's parsed §2 geometry to the raw `00dc` payload.
+/// No external binary; this is the end-to-end public surface a consumer
+/// uses to get pixels out of an AMV file.
+#[test]
+fn demuxer_decode_video_packet_yields_pixels() {
+    use oxideav_amv::AmvDemuxer;
+    use oxideav_core::Demuxer;
+
+    let Some(path) = comedian_fixture() else {
+        eprintln!("skipping demuxer decode: comedian.amv not staged");
+        return;
+    };
+    let file = std::fs::File::open(&path).expect("open fixture");
+    let mut demuxer = AmvDemuxer::open(std::io::BufReader::new(file)).expect("amv opens");
+    assert_eq!((demuxer.header().width, demuxer.header().height), (128, 96));
+
+    // Pull packets until the first video packet (stream 0).
+    let mut decoded = None;
+    for _ in 0..8 {
+        let pkt = demuxer.next_packet().expect("packet");
+        if pkt.stream_index == 0 {
+            let frame = demuxer
+                .decode_video_packet(&pkt)
+                .expect("first video packet decodes to pixels");
+            decoded = Some(frame);
+            break;
+        }
+    }
+    let frame = decoded.expect("a video packet within the first few chunks");
+    assert_eq!((frame.width, frame.height), (128, 96));
+    assert_eq!(frame.rgb.len(), 128 * 96 * 3);
+
+    // Coherent natural image: a real tonal range, not flat.
+    let n = (frame.width * frame.height) as usize;
+    let lumas: Vec<f64> = (0..n).map(|k| frame.luma_at(k % 128, k / 128)).collect();
+    let (_m, std) = mean_std(&lumas);
+    assert!(std > 10.0, "first decoded frame luma std {std:.1} too flat");
+
+    // A non-video packet is rejected by decode_video_packet.
+    let audio = loop {
+        let pkt = demuxer.next_packet().expect("packet");
+        if pkt.stream_index == 1 {
+            break pkt;
+        }
+    };
+    assert!(
+        demuxer.decode_video_packet(&audio).is_err(),
+        "decode_video_packet must reject an audio packet"
     );
 }
