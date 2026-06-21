@@ -17,7 +17,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use oxideav_amv::{decode_audio_payload, MoviPayload, MoviPayloadIter, AMV_END_TRAILER};
+use oxideav_amv::{
+    decode_audio_payload, AmvDemuxer, MoviPayload, MoviPayloadIter, AMV_END_TRAILER,
+};
+use std::fs::File;
+use std::io::BufReader;
 
 fn comedian_fixture() -> Option<PathBuf> {
     let crate_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");
@@ -147,5 +151,65 @@ fn comedian_audio_decodes_to_pcm_validated_by_ffprobe() {
     assert!(
         (secs - 93.0).abs() < 0.05,
         "ffprobe duration {secs:.3}s should match the §2 container 1:33"
+    );
+}
+
+/// Demux→PCM via the one-call convenience `AmvDemuxer::decode_audio_packet`
+/// — the audio mirror of the video side's
+/// `demuxer_decode_video_packet_yields_pixels`. Drives every audio
+/// `Packet` the demuxer emits through the convenience and confirms the
+/// concatenated PCM is byte-identical to the free-function
+/// `decode_audio_payload` path, and that a non-audio packet is rejected.
+#[test]
+fn demuxer_decode_audio_packet_yields_pcm() {
+    use oxideav_core::Demuxer;
+
+    let Some(path) = comedian_fixture() else {
+        eprintln!("skipping demuxer decode_audio_packet: comedian.amv not staged");
+        return;
+    };
+
+    // Ground truth: the free-function whole-track decode.
+    let want = decode_full_audio(&path);
+    assert_eq!(want.len(), 2_050_650, "§4b total decoded sample count");
+
+    // Drive the demuxer, decoding each audio packet through the
+    // convenience and concatenating the PCM.
+    let f = File::open(&path).expect("open comedian fixture");
+    let mut demuxer = AmvDemuxer::open(BufReader::new(f)).expect("open AMV demuxer");
+    assert_eq!(demuxer.audio_format().samples_per_sec, 22_050);
+
+    let mut got: Vec<i16> = Vec::with_capacity(want.len());
+    let mut first_video: Option<oxideav_core::Packet> = None;
+    let mut audio_blocks = 0u32;
+    loop {
+        let pkt = match demuxer.next_packet() {
+            Ok(p) => p,
+            Err(oxideav_core::Error::Eof) => break,
+            Err(e) => panic!("unexpected demux error: {e}"),
+        };
+        if pkt.stream_index == 1 {
+            got.extend(
+                demuxer
+                    .decode_audio_packet(&pkt)
+                    .expect("audio packet decodes"),
+            );
+            audio_blocks += 1;
+        } else if first_video.is_none() {
+            first_video = Some(pkt);
+        }
+    }
+
+    assert_eq!(audio_blocks, 1116, "§4 1116 audio blocks");
+    assert_eq!(
+        got, want,
+        "demux→PCM convenience matches the free-function decode byte-for-byte"
+    );
+
+    // A non-audio (video) packet is rejected by decode_audio_packet.
+    let video = first_video.expect("at least one video packet");
+    assert!(
+        demuxer.decode_audio_packet(&video).is_err(),
+        "decode_audio_packet must reject a video packet"
     );
 }

@@ -8,6 +8,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4b demux→PCM one-call convenience — new
+  `AmvDemuxer::decode_audio_packet(&packet)`, the audio mirror of the
+  existing `decode_video_packet`: it runs the in-crate AMV-IMA-ADPCM
+  decoder (`decode_audio_payload`) over an audio `Packet`'s raw `01wb`
+  payload (the 8-byte §4b preamble plus the nibble body) and returns the
+  decoded mono 16-bit samples, rejecting a non-audio packet. This
+  completes the symmetric demux→pixels / demux→PCM public surface a
+  consumer drives to get media out of an AMV file without touching the
+  free functions. A new integration test
+  (`demuxer_decode_audio_packet_yields_pcm` in `tests/decode_audio_pcm.rs`)
+  drives the whole `comedian.amv` audio track through the demuxer and the
+  convenience, asserting the 1116-block / 2 050 650-sample result is
+  byte-identical to the free-function `decode_audio_payload` path and that
+  a video packet is rejected.
+
 - §4a end-to-end **decode-to-pixels** validation — a new integration test
   (`tests/decode_to_pixels.rs`) proves the milestone the §4a JPEG-marker
   reconstruction was built for: a real `comedian.amv` `00dc` frame, run

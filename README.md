@@ -165,7 +165,11 @@ prescribes — feeding `+0x02` in instead inflates the clip rate ~27×.
 `decode_audio_payload(payload)` is the whole-payload convenience (the
 audio counterpart of `reconstruct_jpeg_from_payload`): it takes a full
 `01wb` leaf-chunk body — the 8-byte §4b preamble plus the compressed
-nibbles — parses the preamble and decodes the rest in one call. An
+nibbles — parses the preamble and decodes the rest in one call.
+`AmvDemuxer::decode_audio_packet(&packet)` is the demux→PCM one-call
+convenience and the audio mirror of `decode_video_packet`: it runs that
+decode over an audio `Packet`'s raw `01wb` payload and returns the
+mono 16-bit samples (rejecting a non-audio packet). An
 **end-to-end PCM** integration test (`tests/decode_audio_pcm.rs`) drives
 the whole `comedian.amv` audio track through it into one 2 050 650-sample
 mono buffer, wraps it in a standard WAV, and cross-checks it with a

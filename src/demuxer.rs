@@ -337,6 +337,37 @@ impl AmvDemuxer {
         crate::decode_frame_from_payload(&self.header, &packet.data).map_err(Error::from)
     }
 
+    /// Decode an audio [`Packet`] emitted by this demuxer straight to
+    /// 16-bit mono PCM samples.
+    ///
+    /// This is the demux→PCM one-call convenience and the audio mirror
+    /// of [`decode_video_packet`](Self::decode_video_packet): it runs
+    /// the in-crate §4b AMV-IMA-ADPCM decoder
+    /// ([`crate::decode_audio_payload`]) over the packet's full `01wb`
+    /// payload — the 8-byte §4b preamble (predictor seed + decoded
+    /// sample count) plus the nibble-packed body — and returns the
+    /// `decoded_sample_count` 16-bit samples the §3b `WAVEFORMATEX`
+    /// declares. Each block is self-contained (predictor re-seeded from
+    /// the preamble, step index reset to 0), so no demuxer-side state
+    /// carries across calls.
+    ///
+    /// The samples are mono at [`audio_format().samples_per_sec`](AmvWaveFormat)
+    /// (22 050 Hz on the observed device profile).
+    ///
+    /// Returns [`Error::invalid`] if `packet` is not an audio packet
+    /// (stream index `1`), or surfaces the decode error if the payload
+    /// is shorter than the 8-byte preamble.
+    pub fn decode_audio_packet(&self, packet: &Packet) -> Result<Vec<i16>> {
+        if packet.stream_index != STREAM_INDEX_AUDIO {
+            return Err(Error::invalid(format!(
+                "amv: decode_audio_packet expects an audio packet (stream {STREAM_INDEX_AUDIO}), \
+                 got stream {}",
+                packet.stream_index
+            )));
+        }
+        crate::decode_audio_payload(&packet.data).map_err(Error::from)
+    }
+
     /// Convenience: current `movi`-walk cursor (file offset of the
     /// next chunk header). Exposed for tests + audit; not part of the
     /// stable contract.
