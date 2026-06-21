@@ -8,6 +8,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Audio stream `CodecParameters` now describe the decode output —
+  `sample_format = SampleFormat::S16` and `channel_layout` (mono) are
+  set on the audio `StreamInfo`, matching the 16-bit signed mono PCM the
+  in-crate §4b decode (`decode_audio_packet` / `decode_audio_payload`)
+  emits and the §3b `WAVEFORMATEX` `wBitsPerSample = 16` declares. A
+  downstream consumer sizing an output buffer no longer special-cases a
+  `None` sample format. (The on-disk `01wb` payload is 4-bit ADPCM
+  nibbles, but the params describe the decoded stream they front.)
+
 - §4b demux→PCM one-call convenience — new
   `AmvDemuxer::decode_audio_packet(&packet)`, the audio mirror of the
   existing `decode_video_packet`: it runs the in-crate AMV-IMA-ADPCM

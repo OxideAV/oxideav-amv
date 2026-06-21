@@ -19,8 +19,8 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use oxideav_core::{
-    CodecId, CodecParameters, Demuxer, Error, MediaType, Packet, PixelFormat, Rational, ReadSeek,
-    Result, StreamInfo, TimeBase,
+    ChannelLayout, CodecId, CodecParameters, Demuxer, Error, MediaType, Packet, PixelFormat,
+    Rational, ReadSeek, Result, SampleFormat, StreamInfo, TimeBase,
 };
 
 use crate::parse::{
@@ -274,6 +274,16 @@ impl AmvDemuxer {
         audio_params.media_type = MediaType::Audio;
         audio_params.sample_rate = Some(audio_format.samples_per_sec);
         audio_params.channels = Some(audio_format.channels);
+        // The in-crate §4b AMV-IMA-ADPCM decode
+        // (`decode_audio_packet` / `decode_audio_payload`) emits the
+        // 16-bit signed mono PCM the §3b `WAVEFORMATEX`'s
+        // `wBitsPerSample = 16` declares — surface that decoded sample
+        // format and the mono speaker layout so a downstream consumer
+        // sizing an output buffer doesn't have to special-case a `None`
+        // (the on-disk nibble payload is *not* this format, but the
+        // decoded stream these params describe is).
+        audio_params.sample_format = Some(SampleFormat::S16);
+        audio_params.channel_layout = Some(ChannelLayout::from_count(audio_format.channels));
         let audio_time_base = TimeBase::new(1, audio_format.samples_per_sec as i64);
         let audio_stream = StreamInfo {
             index: STREAM_INDEX_AUDIO,
@@ -1185,6 +1195,16 @@ mod tests {
         assert_eq!(d.streams()[0].params.height, Some(96));
         assert_eq!(d.streams()[1].params.sample_rate, Some(22_050));
         assert_eq!(d.streams()[1].params.channels, Some(1));
+        // The decoded §4b PCM is 16-bit signed mono — the audio stream
+        // params describe the decode output, not the on-disk nibbles.
+        assert_eq!(
+            d.streams()[1].params.sample_format,
+            Some(oxideav_core::SampleFormat::S16)
+        );
+        assert_eq!(
+            d.streams()[1].params.channel_layout,
+            Some(oxideav_core::ChannelLayout::from_count(1))
+        );
         assert_eq!(d.cursor(), 0x13C);
         assert_eq!(d.duration_micros(), Some(93_000_000));
     }

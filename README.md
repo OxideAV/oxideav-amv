@@ -38,7 +38,12 @@ pure trace-derived realisations of the device profile.
 - Parses the `amvh` main header (resolution, fps, packed duration) and
   the audio `WAVEFORMATEX`, walks the `movi` payload, and emits one
   `oxideav_core::Packet` per `00dc` (video) / `01wb` (audio) leaf chunk,
-  terminating cleanly at the `AMV_END_` trailer.
+  terminating cleanly at the `AMV_END_` trailer. The stream
+  `CodecParameters` describe the *decode output*: the video stream is
+  `Yuv420P` at the `amvh` resolution, and the audio stream is 16-bit
+  signed (`SampleFormat::S16`) mono — what the in-crate `decode_*`
+  paths emit — even though the on-disk video JPEG is table-stripped and
+  the on-disk audio payload is 4-bit ADPCM nibbles.
 - **Seeking** via `Demuxer::seek_to` — rewinds and walks forward,
   skipping chunk bodies via `Seek` (video JPEGs are never allocated on
   the seek path); intra-only video lands exactly at the requested PTS,
