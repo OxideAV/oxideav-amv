@@ -8,6 +8,26 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- §4a **non-multiple-of-16 frame-geometry coverage** — a self-contained
+  synthetic-entropy unit harness in `src/jpeg_decode.rs` closes the trace
+  §4a gap *"behaviour for non-multiple-of-16 dimensions is untested
+  here"*. With no external fixture or JPEG encoder it hand-builds a bare
+  `00dc` entropy stream from the public Annex K Huffman codes the decoder
+  already uses (an MSB-first bit writer that re-applies JPEG `FF`→`FF 00`
+  stuffing, the inverse of the decoder's `BitReader`) and decodes it back
+  through `decode_frame_from_payload`. Two tests:
+  `synthetic_decode_crops_correctly_at_non_mod16_geometry` decodes a
+  uniform-DC stream at 17×17 / 20×12 / 33×9 / 1×1 / 96×64 / 96×65 and
+  asserts the cropped raster is flat everywhere (no 16×16-MCU padding
+  leaks into the W×H crop), and
+  `synthetic_per_mcu_ramp_pins_crop_position_and_flip_non_mod16` decodes a
+  per-MCU DC ramp (each MCU bumps the luma predictor `+1`, fingerprinting
+  its raster index into a flat tile) and checks every pixel against the
+  expected MCU→pixel mapping, pinning the crop *position* and the §4a
+  bottom-up flip at widths/heights that cross MCU boundaries mid-tile.
+  The comedian fixture (128×96, both mod-16) cannot exercise this path.
+  (+3 lib tests, 232 → 235.)
+
 - Audio stream `CodecParameters` now describe the decode output —
   `sample_format = SampleFormat::S16` and `channel_layout` (mono) are
   set on the audio `StreamInfo`, matching the 16-bit signed mono PCM the

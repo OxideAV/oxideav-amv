@@ -624,4 +624,294 @@ mod tests {
         // Y=128, Cb=Cr=128 → R=G=B=128.
         assert!(frame.rgb.iter().all(|&b| b == 128));
     }
+
+    // ------------------------------------------------------------------
+    // Synthetic-entropy geometry harness (trace §4a "non-multiple-of-16
+    // dimensions are untested here" gap).
+    //
+    // No external fixture or JPEG encoder is involved: this hand-builds a
+    // bare AMV `00dc` entropy stream from the public T.81 Annex K Huffman
+    // codes the decoder already uses, then decodes it back through the
+    // crate's own `decode_frame_from_payload`. It proves the 4:2:0 MCU
+    // layout, the DC-predictor accumulation, the crop of the W×H window
+    // out of the 16×16-MCU-padded planes, and the §4a bottom-up flip are
+    // all correct at resolutions that are NOT a multiple of 16 — the one
+    // geometry case the comedian fixture (128×96) cannot exercise.
+    // ------------------------------------------------------------------
+
+    /// MSB-first bit writer that re-applies JPEG `FF`→`FF 00` byte
+    /// stuffing, the inverse of [`BitReader`]'s de-stuffing. Pads the
+    /// final partial byte with 1-bits (the T.81 §F.1.2.3 convention) so a
+    /// decoder reading past the last real bit sees marker-free fill.
+    struct BitWriter {
+        out: Vec<u8>,
+        acc: u32,
+        nbits: u32,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            BitWriter {
+                out: Vec::new(),
+                acc: 0,
+                nbits: 0,
+            }
+        }
+
+        /// Emit the low `len` bits of `code`, MSB-first.
+        fn put(&mut self, code: u32, len: u32) {
+            for i in (0..len).rev() {
+                self.acc = (self.acc << 1) | ((code >> i) & 1);
+                self.nbits += 1;
+                if self.nbits == 8 {
+                    let b = (self.acc & 0xFF) as u8;
+                    self.out.push(b);
+                    if b == 0xFF {
+                        self.out.push(0x00); // byte stuffing
+                    }
+                    self.nbits = 0;
+                    self.acc = 0;
+                }
+            }
+        }
+
+        /// Flush a partial trailing byte and return the stuffed entropy
+        /// bytes. The trailing partial byte is **zero**-padded: a run of
+        /// `0` bits decodes as the canonical-Huffman EOB symbol (`00`,
+        /// the shortest AC code in both Annex K tables), so any decoder
+        /// over-read past the last real coefficient lands on harmless
+        /// end-of-blocks rather than a spurious AC run (T.81's 1-bit
+        /// "fill" is a real AC symbol in these tables and would inject
+        /// ringing into the final MCU of a hand-built stream).
+        fn finish(mut self) -> Vec<u8> {
+            if self.nbits > 0 {
+                let pad = 8 - self.nbits;
+                self.acc <<= pad;
+                let b = (self.acc & 0xFF) as u8;
+                self.out.push(b);
+                if b == 0xFF {
+                    self.out.push(0x00);
+                }
+            }
+            self.out
+        }
+    }
+
+    /// Annex K luma-DC Huffman code for magnitude category `size`
+    /// (`code`, `len`), derived above from K.3:
+    /// size 0 → `00`/2; sizes 1..=5 → `010,011,100,101,110`/3.
+    fn dc_luma_code(size: u32) -> (u32, u32) {
+        match size {
+            0 => (0b00, 2),
+            1 => (0b010, 3),
+            2 => (0b011, 3),
+            3 => (0b100, 3),
+            4 => (0b101, 3),
+            5 => (0b110, 3),
+            _ => panic!("test only uses small DC categories"),
+        }
+    }
+
+    /// Annex K chroma-DC Huffman code (K.4): size 0 → `00`/2.
+    fn dc_chroma_zero() -> (u32, u32) {
+        (0b00, 2)
+    }
+
+    /// Luma AC end-of-block code. The EOB symbol is HUFFVAL `0x00`, which
+    /// in the K.3 luma AC table sits at HUFFVAL index 3 (the values
+    /// `01,02,03` precede it), so its canonical code is `1010` (len 4) —
+    /// **not** the first length-2 code (that is run/size `0x01`).
+    fn ac_eob_luma() -> (u32, u32) {
+        (0b1010, 4)
+    }
+
+    /// Chroma AC end-of-block code. In the K.4 chroma AC table HUFFVAL
+    /// `0x00` is the first entry, so the EOB code is the first length-2
+    /// code, `00`.
+    fn ac_eob_chroma() -> (u32, u32) {
+        (0b00, 2)
+    }
+
+    /// Emit one DC-only luma block carrying DC *difference* `diff` (the
+    /// AC part is a single EOB). T.81 RECEIVE/EXTEND: a positive `diff`
+    /// of category `size = bitlen(diff)` is written as its low `size`
+    /// bits (high bit already set); `diff == 0` is category 0, no
+    /// magnitude bits.
+    fn emit_luma_dc_block(w: &mut BitWriter, diff: u32) {
+        let size = if diff == 0 {
+            0
+        } else {
+            32 - diff.leading_zeros()
+        };
+        let (c, l) = dc_luma_code(size);
+        w.put(c, l);
+        if size > 0 {
+            w.put(diff, size); // positive: magnitude bits as-is
+        }
+        let (ec, el) = ac_eob_luma();
+        w.put(ec, el);
+    }
+
+    /// Emit one all-zero chroma block (DC diff 0 + EOB).
+    fn emit_chroma_zero_block(w: &mut BitWriter) {
+        let (c, l) = dc_chroma_zero();
+        w.put(c, l);
+        let (ec, el) = ac_eob_chroma();
+        w.put(ec, el);
+    }
+
+    /// Build a bare AMV `00dc` payload (SOI + stuffed entropy + EOI)
+    /// whose decode is a uniform luma plane: the running luma DC
+    /// predictor is bumped to `+1` on the very first block and held there
+    /// (diff 0 thereafter), so every luma sample is `round(1·16/8)+128 =
+    /// 130`; chroma is flat 128. `mcus` is the MCU count for the target
+    /// geometry (`mcus_x · mcus_y`), each MCU being 4 luma + 1 Cb + 1 Cr.
+    fn synth_uniform_payload(mcus: usize) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        let mut first = true;
+        for _ in 0..mcus {
+            for _ in 0..4 {
+                emit_luma_dc_block(&mut w, if first { 1 } else { 0 });
+                first = false;
+            }
+            emit_chroma_zero_block(&mut w); // Cb
+            emit_chroma_zero_block(&mut w); // Cr
+        }
+        let entropy = w.finish();
+        let mut body = vec![0xFF, 0xD8];
+        body.extend_from_slice(&entropy);
+        body.extend_from_slice(&[0xFF, 0xD9]);
+        body
+    }
+
+    fn header_wh(width: u32, height: u32) -> AmvHeader {
+        AmvHeader {
+            micros_per_frame: 83_333,
+            width,
+            height,
+            fps: 12,
+            flag_one: 1,
+            reserved_30: 0,
+            duration_packed: 0,
+        }
+    }
+
+    #[test]
+    fn synthetic_dc_block_decode_round_trips_at_mod16_geometry() {
+        // Self-check the synthetic encoder against the well-understood
+        // 16×16 (single-MCU) case before relying on it for non-mod-16
+        // geometry: the whole raster must be the uniform luma 130.
+        let payload = synth_uniform_payload(1);
+        let frame = decode_frame_from_payload(&header_wh(16, 16), &payload)
+            .expect("synthetic 16×16 decodes");
+        assert_eq!((frame.width, frame.height), (16, 16));
+        assert_eq!(frame.rgb.len(), 16 * 16 * 3);
+        assert!(
+            frame.rgb.iter().all(|&b| b == 130),
+            "uniform luma-130 expected from a single +1 DC bump"
+        );
+    }
+
+    /// Decode the synthetic uniform stream at a range of **non-multiple-
+    /// of-16** geometries and assert the cropped, flipped raster is the
+    /// uniform 130 everywhere — proving the W×H crop out of the padded
+    /// 16×16-MCU planes is correct (trace §4a gap). A wrong crop (reading
+    /// the padded stride, or off-by-an-MCU) would leak 0-init padding
+    /// (→ samples ≠ 130) or panic on an out-of-range index.
+    #[test]
+    fn synthetic_decode_crops_correctly_at_non_mod16_geometry() {
+        for (w, h) in [
+            (17u32, 17u32), // just over one MCU each axis → 2×2 MCUs
+            (20, 12),       // width > 16, height < 16
+            (33, 9),        // width crosses 3 MCUs, height < 16
+            (1, 1),         // degenerate single pixel
+            (96, 64),       // the noel-son-lumiere device profile (both mod-16)
+            (96, 65),       // height one past a 16-multiple
+        ] {
+            let mcus = (w.div_ceil(16) * h.div_ceil(16)) as usize;
+            let payload = synth_uniform_payload(mcus);
+            let frame = decode_frame_from_payload(&header_wh(w, h), &payload)
+                .unwrap_or_else(|e| panic!("synthetic {w}×{h} decode failed: {e:?}"));
+            assert_eq!(
+                (frame.width, frame.height),
+                (w, h),
+                "decoded geometry must equal the §2 header geometry"
+            );
+            assert_eq!(frame.rgb.len(), (w * h * 3) as usize);
+            assert!(
+                frame.rgb.iter().all(|&b| b == 130),
+                "{w}×{h}: every cropped sample must be the uniform luma 130 \
+                 (padding from the 16×16-MCU planes must not leak into the W×H crop)"
+            );
+        }
+    }
+
+    /// Build a payload whose MCUs each bump the luma DC predictor by `+1`
+    /// (first luma block only), so MCU `n` in raster decode order carries
+    /// cumulative luma DC `n+1` → a uniform-within-tile sample of
+    /// `((n+1)·16 / 8) + 128 = 2·(n+1) + 130 − 2`. Each 16×16 MCU tile is
+    /// therefore a flat plateau whose value encodes its raster index — a
+    /// spatial fingerprint that pins the MCU→pixel mapping, the W×H crop
+    /// position, and the §4a bottom-up flip.
+    fn synth_per_mcu_ramp_payload(mcus: usize) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        for _ in 0..mcus {
+            // First luma block of every MCU bumps DC by +1; the other
+            // three hold it (diff 0).
+            emit_luma_dc_block(&mut w, 1);
+            emit_luma_dc_block(&mut w, 0);
+            emit_luma_dc_block(&mut w, 0);
+            emit_luma_dc_block(&mut w, 0);
+            emit_chroma_zero_block(&mut w);
+            emit_chroma_zero_block(&mut w);
+        }
+        let entropy = w.finish();
+        let mut body = vec![0xFF, 0xD8];
+        body.extend_from_slice(&entropy);
+        body.extend_from_slice(&[0xFF, 0xD9]);
+        body
+    }
+
+    /// The expected upright luma at output pixel `(x, y)` for the per-MCU
+    /// ramp, given full geometry `w × h`. Decoding builds the plane
+    /// **bottom-up** (DIB) then [`decode_frame`] flips it, so the upright
+    /// pixel row `y` came from decoded plane row `h − 1 − y`. The MCU that
+    /// produced it is `(plane_row / 16, x / 16)` with raster index
+    /// `mcu_row · mcus_x + mcu_col`; its cumulative luma DC is that index
+    /// `+ 1`, giving sample `((idx + 1) · 16 / 8) + 128`, clamped to 255.
+    fn expected_ramp_luma(x: u32, y: u32, w: u32, h: u32) -> u8 {
+        let mcus_x = w.div_ceil(16);
+        let plane_row = h - 1 - y; // undo the bottom-up flip
+        let mcu_row = plane_row / 16;
+        let mcu_col = x / 16;
+        let idx = mcu_row * mcus_x + mcu_col;
+        let sample = ((idx as i32 + 1) * 16 / 8) + 128;
+        sample.clamp(0, 255) as u8
+    }
+
+    #[test]
+    fn synthetic_per_mcu_ramp_pins_crop_position_and_flip_non_mod16() {
+        // A width that crosses three MCU columns but keeps only part of
+        // the third, and a height that crosses two MCU rows keeping only
+        // part of the second — the hardest crop case for the §4a gap.
+        for (w, h) in [(40u32, 20u32), (17, 17), (33, 9), (20, 12)] {
+            let mcus = (w.div_ceil(16) * h.div_ceil(16)) as usize;
+            let payload = synth_per_mcu_ramp_payload(mcus);
+            let frame = decode_frame_from_payload(&header_wh(w, h), &payload)
+                .unwrap_or_else(|e| panic!("ramp {w}×{h} decode failed: {e:?}"));
+            assert_eq!((frame.width, frame.height), (w, h));
+
+            for y in 0..h {
+                for x in 0..w {
+                    let got = frame.rgb[((y * w + x) * 3) as usize];
+                    let want = expected_ramp_luma(x, y, w, h);
+                    assert_eq!(
+                        got, want,
+                        "{w}×{h} pixel ({x},{y}): MCU-index luma mismatch \
+                         (crop position / bottom-up flip wrong)"
+                    );
+                }
+            }
+        }
+    }
 }

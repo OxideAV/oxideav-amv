@@ -133,6 +133,22 @@ near-perfectly uniform, never noisy). The reference tests skip when no
 decoder binary is on `PATH`; no decoder *source* is ever read — the
 validator is an opaque process.
 
+A **synthetic-geometry** unit harness hardens the trace §4a *"behaviour
+for non-multiple-of-16 dimensions is untested here"* gap without any
+external fixture or JPEG encoder: it hand-builds a bare `00dc` entropy
+stream from the public Annex K Huffman codes the decoder already uses
+(MSB-first bit writer with `FF`→`FF 00` re-stuffing) and decodes it back
+through `decode_frame_from_payload`. A uniform-DC stream must crop to a
+flat raster at a spread of non-mod-16 geometries (17×17, 20×12, 33×9,
+1×1, 96×65) — proving no padding leaks from the 16×16-MCU-aligned planes
+into the W×H crop — and a per-MCU DC ramp (each MCU bumps the luma
+predictor `+1`, fingerprinting its raster index into a flat tile) is
+checked pixel-for-pixel against the expected MCU→pixel mapping, pinning
+the crop *position* and the §4a bottom-up flip at widths/heights that
+cross MCU boundaries mid-tile. The comedian fixture (128×96, both mod-16)
+cannot exercise this path; the synthetic harness is the geometry-coverage
+complement to the real-frame reference cross-check.
+
 `flip_rows_vertical(pixels, height, bytes_per_row)` is the §4a blit-time
 **orientation** correction: the baseline-JPEG decode comes out vertically
 mirrored (the `dc` "DIB" bottom-up row convention), and a single in-place
