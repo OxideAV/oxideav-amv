@@ -26,7 +26,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   expected MCU→pixel mapping, pinning the crop *position* and the §4a
   bottom-up flip at widths/heights that cross MCU boundaries mid-tile.
   The comedian fixture (128×96, both mod-16) cannot exercise this path.
-  (+3 lib tests, 232 → 235.)
+  A third test, `synthetic_truncated_entropy_decodes_without_panic_at_non_mod16`,
+  cuts a valid synthetic entropy stream at a spread of points and re-caps
+  it with EOI, asserting the §4a decoder still yields a full-geometry
+  raster without panic or error — the `BitReader` zero-pads the partial
+  final MCU past end-of-data — robustness for real, possibly damaged,
+  device files at a non-mod-16 geometry. (+4 lib tests, 232 → 236.)
 
 - Audio stream `CodecParameters` now describe the decode output —
   `sample_format = SampleFormat::S16` and `channel_layout` (mono) are

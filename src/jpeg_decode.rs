@@ -914,4 +914,40 @@ mod tests {
             }
         }
     }
+
+    /// A corrupt / truncated entropy stream must decode without panicking
+    /// or erroring (the §4a in-crate decoder is a black box fed
+    /// device-origin bytes that can be cut mid-MCU). The `BitReader`
+    /// zero-pads any partial final MCU past end-of-data (matching a
+    /// baseline decoder), so every truncation of a valid stream still
+    /// yields a full-geometry raster — robustness for real, possibly
+    /// damaged, device files. Exercised at a non-mod-16 geometry where the
+    /// padded-plane crop is also in play.
+    #[test]
+    fn synthetic_truncated_entropy_decodes_without_panic_at_non_mod16() {
+        let (w, h) = (33u32, 17u32); // 3×2 MCUs, both axes non-mod-16
+        let mcus = (w.div_ceil(16) * h.div_ceil(16)) as usize;
+        let full = synth_per_mcu_ramp_payload(mcus);
+        // The entropy window is everything between SOI (2 bytes) and EOI
+        // (2 bytes). Truncate it at a spread of cut points, re-cap with
+        // EOI, and require a clean full-geometry decode each time.
+        let entropy_len = full.len() - 4;
+        for cut in [
+            0usize,
+            1,
+            3,
+            7,
+            entropy_len / 2,
+            entropy_len.saturating_sub(1),
+        ] {
+            let cut = cut.min(entropy_len);
+            let mut body = vec![0xFF, 0xD8];
+            body.extend_from_slice(&full[2..2 + cut]);
+            body.extend_from_slice(&[0xFF, 0xD9]);
+            let frame = decode_frame_from_payload(&header_wh(w, h), &body)
+                .unwrap_or_else(|e| panic!("truncated@{cut} decode errored: {e:?}"));
+            assert_eq!((frame.width, frame.height), (w, h));
+            assert_eq!(frame.rgb.len(), (w * h * 3) as usize);
+        }
+    }
 }
