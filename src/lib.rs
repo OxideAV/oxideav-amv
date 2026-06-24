@@ -40,6 +40,14 @@
 //! and the §4c `AMV_END_` ASCII trailer. Mux → demux round-trips
 //! exactly.
 //!
+//! The device's intrinsic codecs are also **encoded** here, the
+//! byte-inverse of the decode paths: [`encode_frame_rgb`] turns an
+//! upright RGB raster into a bare `00dc` baseline-JPEG payload
+//! (§4a device tables, 4:2:0, table-stripped) and [`encode_audio_payload`]
+//! turns 16-bit mono PCM into an `01wb` IMA-ADPCM block (§4b). Feeding
+//! their output to [`AmvMuxer`] produces a complete AMV file, so a real
+//! `.amv` round-trips decode → encode → mux → demux → decode.
+//!
 //! ## Provenance
 //!
 //! Every byte-format fact in this crate is derived from

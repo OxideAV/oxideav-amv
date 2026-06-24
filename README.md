@@ -18,18 +18,22 @@ length. See the
 [trace document](https://github.com/OxideAV/oxideav-workspace/blob/master/docs/container/amv/amv-container-trace.md)
 in the workspace for the full byte-by-byte layout.
 
-This is a **container** crate that additionally decodes the AMV device's
-intrinsic, fixed video and audio profiles end-to-end. AMV's video is a
-table-*stripped* JPEG whose quant / Huffman tables, geometry and scan
-parameters live nowhere on the wire — they are hardcoded in the player —
-so every AMV file shares one fixed device profile; decoding it is
+This is a **container** crate that additionally **encodes and decodes** the
+AMV device's intrinsic, fixed video and audio profiles end-to-end. AMV's
+video is a table-*stripped* JPEG whose quant / Huffman tables, geometry and
+scan parameters live nowhere on the wire — they are hardcoded in the
+player — so every AMV file shares one fixed device profile; coding it is
 intrinsic to the format, not a generic codec carried in a generic
 container. The crate therefore provides `decode_frame` (bare `00dc`
 payload → upright RGB pixels) and `decode_audio_block` (nibble-packed
-`01wb` body → 16-bit PCM), alongside the wire-format helper
-`reconstruct_jpeg` (which splices the stripped JPEG markers back to a
-conforming JFIF/JPEG for a generic downstream decoder). All three are
-pure trace-derived realisations of the device profile.
+`01wb` body → 16-bit PCM) on the read side, their byte-inverses
+`encode_frame_rgb` (RGB → bare `00dc` baseline JPEG) and
+`encode_audio_payload` (16-bit PCM → `01wb` IMA-ADPCM block) on the write
+side, and the wire-format helper `reconstruct_jpeg` (which splices the
+stripped JPEG markers back to a conforming JFIF/JPEG for a generic
+downstream decoder). All are pure trace-derived realisations of the device
+profile; a real AMV file round-trips decode → encode → mux → demux →
+decode.
 
 ## Capabilities
 
@@ -197,6 +201,44 @@ mono buffer, wraps it in a standard WAV, and cross-checks it with a
 **black-box `ffprobe`**, which independently reads back 22 050 Hz, mono,
 93.000 s. The probe is opaque (no audio-tool source read); the test skips
 when `ffprobe` is absent.
+
+### Encoder (video + audio)
+
+The crate is also the device-table-locked **write side**, the byte-inverse
+of the two decode paths. `encode_frame_rgb(width, height, rgb)` (and the
+`encode_frame(&DecodedFrame)` convenience) turns an upright RGB raster into
+a bare `00dc` payload — `FF D8` + byte-stuffed entropy + `FF D9`,
+table-stripped per §4a. It is a from-scratch baseline-JPEG encoder over the
+§4a device profile: BT.601 RGB→YCbCr, the §4a bottom-up DIB coded order
+(inverse of the decoder's flip), 4:2:0 chroma box-averaging, a forward 8×8
+DCT (the transpose of the decoder's IDCT), round-to-nearest quant against
+Annex K K.1/K.2, and canonical T.81 Huffman *encode* tables built from the
+same K.3/K.4 `BITS`/`HUFFVAL` lists the decoder walks (shared from
+`jpeg_reconstruct`, not duplicated). Edge pixels replicate into the 16×16
+MCU pad so non-multiple-of-16 geometry codes cleanly. The output passes the
+decoder's strict §4a no-internal-markers bind, and encode∘decode is a
+stable JPEG fixed point.
+
+`encode_audio_payload(samples)` (and the `encode_audio_nibbles(samples)`
+split that returns the predictor seed + nibble body) turns 16-bit mono PCM
+into a complete `01wb` payload — the 8-byte §4b preamble plus the
+nibble-packed IMA-ADPCM body, the inverse of `decode_audio_payload`. The
+standard IMA/DVI forward step tracks the decoder's *reconstructed*
+predictor so the two never drift; per §4b the first sample becomes the
+header `int16` seed, the `+0x02` `initialStepIndex` is emitted as `0` (the
+decode-verified reset value), and nibbles pack low-first. Decode∘encode is
+the canonical IMA fixed point — byte-idempotent on real device blocks.
+
+An **end-to-end encoder round-trip** (`tests/encode_roundtrip.rs`) proves
+the full loop the encoder was built for: a real `comedian.amv` is decoded,
+each frame / block re-encoded, re-muxed through `AmvMuxer`, then re-demuxed
+and re-decoded entirely through the crate's public surface (no external
+binary). The re-muxed file is a valid AMV (zeroed RIFF sizes, no-padding
+chunk walk, `AMV_END_` trailer, §2 1:33 duration), the re-demux recovers
+1116/1116 paired chunks under the §4 strict interleave, video tracks the
+source decode at MAE < 3/channel (globally stable — the float DCT is not
+bit-exact on real high-frequency content), audio re-decode is byte-exact,
+and the loop converges across generations.
 
 ### Standalone byte parsers
 

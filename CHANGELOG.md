@@ -8,6 +8,56 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **AMV encoder subsystem** — the device-table-locked write side that
+  makes an AMV file round-trip decode → encode → mux → demux → decode.
+  Three pieces, each the byte-inverse of an existing decode path:
+  - §4a **video encode** — `encode_frame_rgb(width, height, rgb)` /
+    `encode_frame(&DecodedFrame)` (re-exported at the crate root) turn an
+    upright RGB raster into a bare `00dc` payload (`FF D8` + byte-stuffed
+    entropy + `FF D9`), the inverse of `decode_frame`. The device profile
+    is locked to §4a: Annex K K.1/K.2 quant + K.3/K.4 Huffman (shared from
+    `jpeg_reconstruct`, not duplicated), 4:2:0 sampling (4 luma + Cb + Cr
+    per 16×16 MCU, chroma box-averaged 2×2), a single interleaved scan,
+    bottom-up DIB coded order (inverse of the decoder's vertical flip),
+    BT.601 RGB→YCbCr (inverse of the decoder's `ycbcr_to_rgb`), a forward
+    8×8 DCT (transpose of the decoder's IDCT), round-to-nearest quant, and
+    canonical T.81 Huffman *encode* tables built from the same
+    `BITS`/`HUFFVAL` lists the decoder walks. Edge pixels replicate into
+    the MCU pad so non-mod-16 geometry codes cleanly. The output passes the
+    decoder's strict §4a no-internal-markers bind; a smooth image
+    round-trips at MAE < 8/channel; encode∘decode is a stable JPEG fixed
+    point on synthetic content (re-encoding the decoded raster reproduces
+    identical bytes). Nine new unit tests (canonical Huffman codes, EXTEND
+    magnitude round-trip, fDCT∘IDCT identity, flat-frame colour,
+    fixed-point stability, structure-preservation MAE, strict-bind
+    acceptance, non-mod16 geometry, geometry/length rejection).
+  - §4b **audio encode** — `encode_audio_payload(samples)` /
+    `encode_audio_nibbles(samples)` (re-exported at the crate root) turn
+    16-bit mono PCM into a complete `01wb` payload (8-byte §4b preamble +
+    nibble body), the inverse of `decode_audio_payload`. Standard IMA/DVI
+    forward step: the encoder tracks the decoder's *reconstructed*
+    predictor (not the original PCM) so the two never drift; the first
+    sample is written as the §4b header `int16` predictor seed, the `+0x02`
+    `initialStepIndex` is emitted as `0` (the decode-verified reset value),
+    and nibbles pack low-first. Decode∘encode is the canonical IMA fixed
+    point — re-encoding decoded output reproduces identical bytes — and on
+    real frames is **byte-idempotent for all 1116 blocks**. Ten new unit
+    tests (table parity, seed round-trip, low-first packing, ceil-half body
+    length, odd-count length preservation, fixed-point stability,
+    slow-sine MAE bound, manual-split parity, empty input).
+  - **End-to-end round-trip** (`tests/encode_roundtrip.rs`) — a real
+    `comedian.amv` decoded, re-encoded with both encoders, re-muxed through
+    `AmvMuxer`, then re-demuxed and re-decoded entirely through the crate's
+    public surface (no external binary). Asserts the re-muxed file is a
+    valid AMV (RIFF `AMV `, zeroed sizes, `AMV_END_` trailer, §2 duration
+    patched to 1:33), the re-demux recovers 1116/1116 paired chunks with a
+    balanced §4 interleave, video re-decode tracks the source decode at
+    MAE < 3/channel (globally stable — the float forward DCT is not
+    bit-exact on high-frequency content), audio re-decode is byte-identical
+    to the source decode for every block, and the loop converges
+    (second-generation video MAE does not exceed the first; aggregate coded
+    size stays within 1 %). (+19 lib tests, 236 → 255; +1 integration test.)
+
 - §4a **non-multiple-of-16 frame-geometry coverage** — a self-contained
   synthetic-entropy unit harness in `src/jpeg_decode.rs` closes the trace
   §4a gap *"behaviour for non-multiple-of-16 dimensions is untested
