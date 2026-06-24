@@ -72,6 +72,7 @@
 #![warn(missing_docs)]
 
 mod adpcm;
+mod adpcm_encode;
 mod demuxer;
 mod jpeg_decode;
 mod jpeg_reconstruct;
@@ -80,6 +81,7 @@ mod parse;
 mod video;
 
 pub use adpcm::{decode_audio_block, decode_audio_payload};
+pub use adpcm_encode::{encode_audio_nibbles, encode_audio_payload};
 pub use demuxer::{AmvDemuxer, AmvDemuxerError, ChunkIndexEntry};
 pub use jpeg_decode::{decode_frame, decode_frame_from_payload, DecodedFrame};
 pub use jpeg_reconstruct::{reconstruct_jpeg, reconstruct_jpeg_from_payload};
