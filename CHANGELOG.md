@@ -6,6 +6,38 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-amv/compare/v0.0.9...v0.0.10) - 2026-06-27
+
+### Other
+
+- amv_video encoder emits frame-rate-aware packet time base
+- demuxer declares amv_video so the pipeline auto-resolves the decoder
+- registry-driven end-to-end codec validation on real comedian.amv
+- §4a wire amv_video into the oxideav-core Decoder/Encoder registry
+- §4a native YUV420P plane decode + encode (no RGB round-trip)
+- §3b/§4b wire adpcm_amv into the oxideav-core Decoder/Encoder registry
+- document the encoder subsystem in README + CHANGELOG + lib docs
+- end-to-end encoder round-trip — decode→encode→mux→demux→decode on comedian.amv
+- §4a RGB→00dc baseline-JPEG video encoder (device-table-locked, fixed-point round-trip)
+- §4b PCM→01wb IMA-ADPCM audio encoder (decode-inverse, fixed-point round-trip)
+- §4a decoder truncated-entropy robustness test at non-mod-16
+- synthetic-entropy harness closes §4a non-mod-16 geometry gap
+- declare decoded audio sample format (S16 mono) on the audio stream params
+- §4b demux→PCM convenience AmvDemuxer::decode_audio_packet + end-to-end test
+- demux→pixels convenience AmvDemuxer::decode_video_packet + end-to-end test
+- §4a validate in-crate decoder vs black-box reference + all-frame sweep
+- §4a in-crate baseline-JPEG decode of 00dc frames to RGB pixels
+- §4b decode_audio_payload convenience + PCM end-to-end ffprobe validation
+- §4a bottom-up orientation helper flip_rows_vertical + real-raster orientation pin
+- §4a end-to-end decode-to-pixels validation via black-box JPEG decoder
+- §4b AMV-IMA-ADPCM audio decode (standard IMA tables) + step-index-0 erratum
+- §4b refined audio-preamble predictor/step-index split
+- §4a reconstruct device-stripped JPEG header segments
+- §4 demuxer-level 1:1 video:audio interleave cross-check
+- §2 amvh reserved-span strict validation
+- refresh to current status, drop per-round changelog cruft
+- §4b audio-block padding-slack accessor
+
 ### Changed
 
 - **Demuxer now declares the directly-decodable codec ids.** The video
