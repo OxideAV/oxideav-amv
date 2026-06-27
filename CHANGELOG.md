@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`adpcm_amv` registry codec surface** — the AMV intrinsic audio codec
+  (trace §3b / §4b) is now driveable through `oxideav-core`'s
+  `Decoder` / `Encoder` trait contract, not just the direct
+  `decode_audio_payload` / `encode_audio_payload` functions.
+  `register_codecs` installs a real `adpcm_amv` `CodecInfo` with both
+  decoder and encoder factories (previously a no-op placeholder), so the
+  audio stream the demuxer emits resolves through the registry /
+  pipeline `make_decoder` path. New `AmvAudioDecoder` (one `01wb`
+  payload → one mono S16 `AudioFrame`, stateless per §4b block re-seed,
+  `reset` drains) and `AmvAudioEncoder` (one S16 frame → one `01wb`
+  payload, output params declare mono / 22 050 Hz / S16 for the muxer),
+  re-exported as `make_audio_decoder` / `make_audio_encoder`. Capability
+  record is `audio + decode + encode + lossy`, mono, 22 050 Hz max.
+  Eight new unit tests (mono/format gating, trait decode == direct
+  decode, encode∘decode∘encode byte-stable fixed point, EOF / NeedMore
+  drain semantics) plus a registry round-trip test that builds both
+  factories through `RuntimeContext`.
+
 - **AMV encoder subsystem** — the device-table-locked write side that
   makes an AMV file round-trip decode → encode → mux → demux → decode.
   Three pieces, each the byte-inverse of an existing decode path:

@@ -81,6 +81,7 @@
 
 mod adpcm;
 mod adpcm_encode;
+mod codec_audio;
 mod demuxer;
 mod jpeg_decode;
 mod jpeg_encode;
@@ -91,6 +92,10 @@ mod video;
 
 pub use adpcm::{decode_audio_block, decode_audio_payload};
 pub use adpcm_encode::{encode_audio_nibbles, encode_audio_payload};
+pub use codec_audio::{
+    make_decoder as make_audio_decoder, make_encoder as make_audio_encoder, AmvAudioDecoder,
+    AmvAudioEncoder, AMV_AUDIO_CHANNELS, AMV_AUDIO_SAMPLE_RATE,
+};
 pub use demuxer::{AmvDemuxer, AmvDemuxerError, ChunkIndexEntry};
 pub use jpeg_decode::{decode_frame, decode_frame_from_payload, DecodedFrame};
 pub use jpeg_encode::{encode_frame, encode_frame_rgb};
@@ -106,8 +111,8 @@ pub use parse::{
 pub use video::{flip_rows_vertical, AmvVideoFrame};
 
 use oxideav_core::{
-    CodecRegistry, CodecResolver, ContainerRegistry, Demuxer, Error, ProbeData, ProbeScore,
-    ReadSeek, Result, RuntimeContext,
+    CodecCapabilities, CodecId, CodecInfo, CodecRegistry, CodecResolver, ContainerRegistry,
+    Demuxer, Error, ProbeData, ProbeScore, ReadSeek, Result, RuntimeContext,
 };
 
 /// Codec id string declared for the AMV video stream. Maps to the
@@ -174,20 +179,29 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
     reg.register_probe(CONTAINER_NAME, probe);
 }
 
-/// Register the AMV stream-codec placeholder ids into a
-/// [`CodecRegistry`].
+/// Register the AMV stream codecs into a [`CodecRegistry`].
 ///
-/// Neither id installs a factory — AMV is a container, not a codec.
-/// The registration exists so that downstream codec crates can later
-/// attach decoders / encoders against `mjpeg` (already wired by
-/// `oxideav-mjpeg`) and `adpcm_amv` (reserved for a future
-/// AMV-IMA-ADPCM variant) without an extra mapping step.
+/// The **audio** side (`adpcm_amv`) installs real decoder + encoder
+/// factories — AMV's IMA-ADPCM-with-an-8-byte-preamble audio is
+/// intrinsic to the device profile (trace §3b / §4b) and has no other
+/// home, so it is owned here. The **video** side is the `mjpeg` codec
+/// id, which the dedicated `oxideav-mjpeg` crate owns; it is *not*
+/// re-registered here. AMV's in-crate baseline-JPEG decode / encode
+/// (`decode_frame` / `encode_frame_rgb`) over the §4a device tables
+/// remain available as direct functions for callers wiring the
+/// table-stripped bitstream by hand.
 pub fn register_codecs(reg: &mut CodecRegistry) {
-    // The video tag is the `mjpeg` codec id; do not re-register the
-    // codec itself here (the dedicated `oxideav-mjpeg` crate owns
-    // that). Only the audio side gets a placeholder entry so a future
-    // ADPCM-AMV crate can register against it.
-    let _ = reg;
+    let caps = CodecCapabilities::audio("adpcm_amv")
+        .with_decode()
+        .with_encode()
+        .with_lossy(true)
+        .with_max_channels(AMV_AUDIO_CHANNELS)
+        .with_max_sample_rate(AMV_AUDIO_SAMPLE_RATE);
+    let info = CodecInfo::new(CodecId::new(AUDIO_CODEC_ID))
+        .capabilities(caps)
+        .decoder(codec_audio::make_decoder)
+        .encoder(codec_audio::make_encoder);
+    reg.register(info);
 }
 
 /// Crate-local error mirror for the framework's `Error`.
@@ -233,6 +247,30 @@ mod register_tests {
             ctx.containers.muxer_names().any(|n| n == CONTAINER_NAME),
             "amv muxer should be installed"
         );
+    }
+
+    #[test]
+    fn register_installs_adpcm_amv_codec() {
+        use oxideav_core::{CodecId, CodecParameters, SampleFormat};
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(AUDIO_CODEC_ID);
+        assert!(
+            ctx.codecs.has_decoder(&id),
+            "adpcm_amv decoder should be installed"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&id),
+            "adpcm_amv encoder should be installed"
+        );
+        // The registry factories build through the same path as the
+        // direct `make_audio_*` entry points.
+        let mut params = CodecParameters::audio(id);
+        params.channels = Some(1);
+        params.sample_format = Some(SampleFormat::S16);
+        params.sample_rate = Some(AMV_AUDIO_SAMPLE_RATE);
+        assert!(ctx.codecs.first_decoder(&params).is_ok());
+        assert!(ctx.codecs.first_encoder(&params).is_ok());
     }
 
     #[test]
