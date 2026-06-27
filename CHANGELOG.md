@@ -8,6 +8,39 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Registry-driven end-to-end codec validation** — a
+  `registry_codec_path` integration test opens the real device-origin
+  `comedian.amv` with the `AmvDemuxer`, resolves the `adpcm_amv` /
+  `amv_video` decoder factories out of a `RuntimeContext`, and confirms
+  the trait path produces the same YUV planes / PCM the direct free
+  functions do on the same bytes — across a frame/block sweep and a
+  bounded full demux→registry-decode walk of the interleaved stream.
+
+- **`amv_video` registry codec surface** — the §4a table-stripped
+  baseline-JPEG video codec is now driveable through `oxideav-core`'s
+  `Decoder` / `Encoder` trait contract. A generic `mjpeg` decoder cannot
+  consume a bare `00dc` payload (its quant / Huffman tables and scan
+  geometry are stripped from the wire), so this registers under a
+  dedicated `amv_video` id (`VIDEO_DIRECT_CODEC_ID`) rather than
+  colliding with the `mjpeg` id `oxideav-mjpeg` owns. `AmvVideoDecoder`
+  (one bare `00dc` payload → one YUV420P `VideoFrame`, geometry from the
+  stream `CodecParameters`, intra-only / stateless) and `AmvVideoEncoder`
+  (one YUV420P `VideoFrame` → one bare `00dc` payload, de-strides padded
+  planes, flags every packet keyframe), re-exported as
+  `make_video_decoder` / `make_video_encoder`. Capability record is
+  `video + decode + encode + intra-only + lossy`, YUV420P. Backed by a
+  new **native planar YUV420P path** — `decode_frame_yuv420p` /
+  `encode_frame_yuv420p` (`DecodedYuv420p`) — that skips the lossy
+  YCbCr↔RGB hop of the existing RGB front door; the shared
+  entropy-coding loop is factored out so RGB and YUV encode reach the
+  same §4a fixed point byte-for-byte. Twelve new unit tests (YUV planes →
+  RGB equals the RGB path at mod-16 / non-mod-16 geometry; native-YUV
+  re-encode == RGB-path payload; `amv_video` payload → frame shape;
+  encode∘decode∘encode byte-stable with the keyframe flag; padded-stride
+  == tight-stride encode; geometry / plane-count / length rejection;
+  EOF / NeedMore) plus a registry round-trip test through
+  `RuntimeContext`.
+
 - **`adpcm_amv` registry codec surface** — the AMV intrinsic audio codec
   (trace §3b / §4b) is now driveable through `oxideav-core`'s
   `Decoder` / `Encoder` trait contract, not just the direct

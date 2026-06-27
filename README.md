@@ -257,8 +257,9 @@ nibble-budget / sample-interval cross-checks for recovery tooling. The §4b
 fields it actually carries — `initial_predictor()` (the per-block ADPCM seed at
 `+0x00`) and `initial_step_index()` (`+0x02`, always 0 in both fixtures) — with
 `step_index_in_ima_range()` range-checking the step index against the canonical
-IMA `[0, 88]` table bound (`IMA_STEP_INDEX_MAX`); the nibble-to-PCM decode
-itself stays the downstream `adpcm_amv` codec's job.
+IMA `[0, 88]` table bound (`IMA_STEP_INDEX_MAX`). The nibble-to-PCM decode
+itself is the in-crate `adpcm_amv` codec (`decode_audio_payload` /
+`AmvAudioDecoder`).
 
 ### Fuzz + bench
 
@@ -283,10 +284,27 @@ println!("{}×{} @ {} fps", demuxer.header().width, demuxer.header().height,
 println!("audio: {} Hz", demuxer.audio_format().samples_per_sec);
 ```
 
-When wired into a `RuntimeContext` via `oxideav_amv::register`, both the
+When wired into a `RuntimeContext` via `oxideav_amv::register`, the
 demuxer and muxer register under the container name `amv` — FORM-type
 probing + `.amv` extension hint for reads, `open_muxer("amv", …)` for
-writes.
+writes — **and** both intrinsic device codecs register as real
+`oxideav-core` `Decoder` / `Encoder` factories:
+
+- **`adpcm_amv`** (audio) — the §3b/§4b IMA-ADPCM codec, mono /
+  22 050 Hz / S16. `AmvAudioDecoder` turns one `01wb` payload into one
+  mono `AudioFrame`; `AmvAudioEncoder` is the byte-inverse.
+- **`amv_video`** (video) — the §4a table-stripped baseline JPEG,
+  decoded / encoded directly to and from YUV420P. This is a *distinct*
+  codec id from the `mjpeg` id the demuxer also declares: a generic
+  `mjpeg` decoder cannot consume a bare `00dc` payload (its tables are
+  stripped from the wire), so the direct decode registers under
+  `amv_video` while `mjpeg` is left for the reconstruct-then-decode
+  route (`reconstruct_jpeg`). `AmvVideoDecoder` takes its geometry from
+  the stream `CodecParameters` (the bitstream carries none) and emits a
+  3-plane YUV420P `VideoFrame`; `AmvVideoEncoder` is the byte-inverse.
+
+A `RuntimeContext`-resolved decode of the real `comedian.amv` matches
+the direct free-function decode byte-for-byte (integration-tested).
 
 ## Provenance
 
