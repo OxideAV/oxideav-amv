@@ -97,8 +97,11 @@ pub use codec_audio::{
     AmvAudioEncoder, AMV_AUDIO_CHANNELS, AMV_AUDIO_SAMPLE_RATE,
 };
 pub use demuxer::{AmvDemuxer, AmvDemuxerError, ChunkIndexEntry};
-pub use jpeg_decode::{decode_frame, decode_frame_from_payload, DecodedFrame};
-pub use jpeg_encode::{encode_frame, encode_frame_rgb};
+pub use jpeg_decode::{
+    decode_frame, decode_frame_from_payload, decode_frame_yuv420p,
+    decode_frame_yuv420p_from_payload, DecodedFrame, DecodedYuv420p,
+};
+pub use jpeg_encode::{encode_frame, encode_frame_rgb, encode_frame_yuv420p};
 pub use jpeg_reconstruct::{reconstruct_jpeg, reconstruct_jpeg_from_payload};
 pub use muxer::AmvMuxer;
 pub use parse::{

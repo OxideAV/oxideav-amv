@@ -366,6 +366,28 @@ pub fn encode_frame_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, 
         }
     }
 
+    Ok(encode_planes_to_payload(
+        &y_plane, luma_w, mcus_x, mcus_y, &cb_plane, &cr_plane, chroma_w,
+    ))
+}
+
+/// Entropy-code the MCU grid of three already-prepared, MCU-pad-aligned
+/// sample planes (luma at `luma_w`-stride, chroma at `chroma_w`-stride,
+/// both holding §4a JFIF-range 0..255 values) into a bare `00dc`
+/// payload. Shared by [`encode_frame_rgb`] and
+/// [`encode_frame_yuv420p`]: only the plane-fill stage differs between
+/// the RGB and native-YUV front doors; the DCT / quant / Huffman walk is
+/// identical.
+#[allow(clippy::too_many_arguments)]
+fn encode_planes_to_payload(
+    y_plane: &[f32],
+    luma_w: usize,
+    mcus_x: usize,
+    mcus_y: usize,
+    cb_plane: &[f32],
+    cr_plane: &[f32],
+    chroma_w: usize,
+) -> Vec<u8> {
     // Build the four Annex K Huffman encode tables once.
     let dc_luma = HuffEncTable::build(&DC_LUMA_BITS, &DC_LUMA_VALS);
     let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
@@ -384,7 +406,7 @@ pub fn encode_frame_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, 
                 for bx in 0..2usize {
                     let ox = mx * 16 + bx * 8;
                     let oy = my * 16 + by * 8;
-                    let mut blk = gather_block(&y_plane, luma_w, ox, oy);
+                    let mut blk = gather_block(y_plane, luma_w, ox, oy);
                     fdct_8x8(&mut blk);
                     encode_block(&mut bw, &blk, &QUANT_LUMA, &dc_luma, &ac_luma, &mut pred_y);
                 }
@@ -392,7 +414,7 @@ pub fn encode_frame_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, 
             // One Cb, one Cr block.
             let cox = mx * 8;
             let coy = my * 8;
-            let mut cb_blk = gather_block(&cb_plane, chroma_w, cox, coy);
+            let mut cb_blk = gather_block(cb_plane, chroma_w, cox, coy);
             fdct_8x8(&mut cb_blk);
             encode_block(
                 &mut bw,
@@ -402,7 +424,7 @@ pub fn encode_frame_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, 
                 &ac_chroma,
                 &mut pred_cb,
             );
-            let mut cr_blk = gather_block(&cr_plane, chroma_w, cox, coy);
+            let mut cr_blk = gather_block(cr_plane, chroma_w, cox, coy);
             fdct_8x8(&mut cr_blk);
             encode_block(
                 &mut bw,
@@ -420,7 +442,90 @@ pub fn encode_frame_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, 
     payload.extend_from_slice(&[0xFF, 0xD8]); // SOI
     payload.extend_from_slice(&entropy);
     payload.extend_from_slice(&[0xFF, 0xD9]); // EOI
-    Ok(payload)
+    payload
+}
+
+/// Encode native planar **YUV420P** (the [`crate::DecodedYuv420p`] shape)
+/// straight into a bare AMV `00dc` payload — the exact byte-inverse of
+/// [`crate::decode_frame_yuv420p`], with no YCbCr↔RGB round-trip.
+///
+/// `y` is `width * height` bytes; `cb` / `cr` are each
+/// `ceil(width/2) * ceil(height/2)` bytes (4:2:0). All three are
+/// **upright** (the §4a bottom-up flip is applied here on the way in,
+/// per plane). Edge samples replicate into the 16×16-MCU pad so a
+/// partial final MCU codes cleanly, matching the decoder's crop. Both
+/// chroma planes are nearest-upsampled to luma resolution then
+/// box-averaged back, so encode∘decode is the same fixed point the RGB
+/// path reaches.
+///
+/// Returns `InvalidData` for a zero dimension or a plane length that
+/// does not match the 4:2:0 geometry.
+pub fn encode_frame_yuv420p(
+    width: u32,
+    height: u32,
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+) -> Result<Vec<u8>, AmvDemuxerError> {
+    if width == 0 || height == 0 {
+        return Err(AmvDemuxerError::InvalidData(
+            "AMV frame geometry must be non-zero".into(),
+        ));
+    }
+    let w = width as usize;
+    let h = height as usize;
+    let cw = w.div_ceil(2);
+    let ch = h.div_ceil(2);
+    if y.len() != w * h {
+        return Err(AmvDemuxerError::InvalidData(format!(
+            "y length {} must equal width*height = {}",
+            y.len(),
+            w * h
+        )));
+    }
+    if cb.len() != cw * ch || cr.len() != cw * ch {
+        return Err(AmvDemuxerError::InvalidData(format!(
+            "chroma length must equal ceil(w/2)*ceil(h/2) = {} (cb={}, cr={})",
+            cw * ch,
+            cb.len(),
+            cr.len()
+        )));
+    }
+
+    let mcus_x = w.div_ceil(16);
+    let mcus_y = h.div_ceil(16);
+    let luma_w = mcus_x * 16;
+    let luma_h = mcus_y * 16;
+    let chroma_w = mcus_x * 8;
+    let chroma_h = mcus_y * 8;
+
+    let mut y_plane = vec![0f32; luma_w * luma_h];
+    let mut cb_plane = vec![0f32; chroma_w * chroma_h];
+    let mut cr_plane = vec![0f32; chroma_w * chroma_h];
+
+    // §4a inverse orientation: code bottom-up. The source planes are
+    // upright, so plane row `py` (top-down, bottom-up coded) samples
+    // upright source row `h - 1 - py` (luma) / `ch - 1 - cy` (chroma),
+    // clamped + edge-replicated into the MCU pad.
+    for py in 0..luma_h {
+        let up = (h - 1).saturating_sub(py.min(h - 1));
+        for px in 0..luma_w {
+            let sx = px.min(w - 1);
+            y_plane[py * luma_w + px] = y[up * w + sx] as f32;
+        }
+    }
+    for cy in 0..chroma_h {
+        let up = (ch - 1).saturating_sub(cy.min(ch - 1));
+        for cx in 0..chroma_w {
+            let sx = cx.min(cw - 1);
+            cb_plane[cy * chroma_w + cx] = cb[up * cw + sx] as f32;
+            cr_plane[cy * chroma_w + cx] = cr[up * cw + sx] as f32;
+        }
+    }
+
+    Ok(encode_planes_to_payload(
+        &y_plane, luma_w, mcus_x, mcus_y, &cb_plane, &cr_plane, chroma_w,
+    ))
 }
 
 /// Gather an 8×8 block from `plane` (width `plane_w`) at top-left
@@ -643,5 +748,62 @@ mod tests {
                 "{w}×{h}: flat non-mod16 frame round-trips"
             );
         }
+    }
+
+    #[test]
+    fn yuv420p_encode_matches_rgb_encode_byte_for_byte() {
+        // Decode the RGB-path output of a flat frame to native YUV planes,
+        // then re-encode via the YUV front door: it must produce the
+        // identical bare payload the RGB path does on the same content
+        // (both reach the §4a fixed point). This proves the native-YUV
+        // encode and the RGB encode share one quantized representation.
+        use crate::jpeg_decode::decode_frame_yuv420p_from_payload;
+        for (w, h) in [(16u32, 16u32), (17, 17), (33, 9), (32, 32)] {
+            let rgb = vec![123u8; (w * h * 3) as usize];
+            let rgb_payload = encode_frame_rgb(w, h, &rgb).expect("rgb encode");
+            let yuv = decode_frame_yuv420p_from_payload(&header_wh(w, h), &rgb_payload)
+                .expect("decode to yuv");
+            let yuv_payload =
+                encode_frame_yuv420p(w, h, &yuv.y, &yuv.cb, &yuv.cr).expect("yuv encode");
+            // Re-encoding the decoded planes is a fixed point with the RGB
+            // path: decode(rgb_payload) → planes → encode == rgb_payload.
+            assert_eq!(
+                yuv_payload, rgb_payload,
+                "{w}×{h}: native-YUV re-encode must equal the RGB-path payload"
+            );
+        }
+    }
+
+    #[test]
+    fn yuv420p_encode_decode_is_a_stable_fixed_point() {
+        // encode_yuv → decode_yuv → encode_yuv must be byte-stable on a
+        // structured (non-flat) frame: a per-MCU luma gradient with
+        // mid-level chroma.
+        let (w, h) = (33u32, 17u32);
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let mut y = vec![0u8; (w * h) as usize];
+        for yy in 0..h as usize {
+            for xx in 0..w as usize {
+                y[yy * w as usize + xx] = (((xx / 16 + yy / 16) * 40 + 40) % 256) as u8;
+            }
+        }
+        let cb = vec![128u8; cw * ch];
+        let cr = vec![140u8; cw * ch];
+
+        let p1 = encode_frame_yuv420p(w, h, &y, &cb, &cr).expect("encode 1");
+        let dec = crate::jpeg_decode::decode_frame_yuv420p_from_payload(&header_wh(w, h), &p1)
+            .expect("decode");
+        let p2 = encode_frame_yuv420p(w, h, &dec.y, &dec.cb, &dec.cr).expect("re-encode");
+        assert_eq!(p1, p2, "encode∘decode∘encode must be a stable fixed point");
+    }
+
+    #[test]
+    fn yuv420p_encode_rejects_bad_lengths() {
+        assert!(encode_frame_yuv420p(0, 16, &[], &[], &[]).is_err());
+        // y too short
+        assert!(encode_frame_yuv420p(16, 16, &[0u8; 100], &[0u8; 64], &[0u8; 64]).is_err());
+        // chroma wrong
+        assert!(encode_frame_yuv420p(16, 16, &[0u8; 256], &[0u8; 10], &[0u8; 64]).is_err());
     }
 }

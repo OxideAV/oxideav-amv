@@ -530,6 +530,98 @@ pub fn decode_frame_from_payload(
     decode_frame(&frame)
 }
 
+/// A decoded AMV video frame in native planar **YUV420P** — the §4a
+/// device pixel format (the form the demuxer declares on the video
+/// stream's `CodecParameters`).
+///
+/// Three planes, each upright (the §4a bottom-up flip already applied)
+/// and cropped to the displayed geometry: a `width × height` luma plane
+/// and two `ceil(width/2) × ceil(height/2)` chroma planes. This is the
+/// pre-RGB representation [`decode_frame`] converts — exposing it
+/// directly avoids a lossy YCbCr→RGB round-trip when the consumer wants
+/// the native planes (e.g. building an `oxideav_core::VideoFrame`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodedYuv420p {
+    /// Displayed frame width in pixels (§2 `amvh` +0x20).
+    pub width: u32,
+    /// Displayed frame height in pixels (§2 `amvh` +0x24).
+    pub height: u32,
+    /// Luma plane, `width * height` bytes, row-major top-to-bottom.
+    pub y: Vec<u8>,
+    /// Cb (blue-difference) chroma plane, half-resolution:
+    /// `ceil(width/2) * ceil(height/2)` bytes.
+    pub cb: Vec<u8>,
+    /// Cr (red-difference) chroma plane, half-resolution.
+    pub cr: Vec<u8>,
+    /// Row stride of the chroma planes (`ceil(width/2)`), so a consumer
+    /// can index `cb[row * chroma_width + col]` without recomputing it.
+    pub chroma_width: u32,
+    /// Number of chroma plane rows (`ceil(height/2)`).
+    pub chroma_height: u32,
+}
+
+/// Decode a §4a-bound AMV video frame to native planar [`DecodedYuv420p`].
+///
+/// Runs the same baseline-JPEG decode as [`decode_frame`] but stops at
+/// the Y/Cb/Cr planes: each plane is cropped out of the 16×16-MCU-padded
+/// decode buffer to the displayed geometry (luma at full resolution,
+/// chroma at 4:2:0 half resolution) and the §4a bottom-up DIB row order
+/// is undone with one per-plane vertical flip, so the result is upright.
+/// No YCbCr→RGB conversion happens here.
+pub fn decode_frame_yuv420p(frame: &AmvVideoFrame<'_>) -> Result<DecodedYuv420p, AmvDemuxerError> {
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let (yp, cbp, crp) = decode_planes(frame.entropy_coded(), width, height)?;
+
+    // 4:2:0 chroma is sampled at ceil(W/2) × ceil(H/2).
+    let cw = width.div_ceil(2);
+    let ch = height.div_ceil(2);
+
+    let mut y = crop_plane(&yp, width, height);
+    let mut cb = crop_plane(&cbp, cw, ch);
+    let mut cr = crop_plane(&crp, cw, ch);
+
+    // §4a bottom-up orientation: flip each plane to upright. Luma and
+    // chroma are independent rasters so each flips against its own row
+    // stride / height.
+    flip_rows_vertical(&mut y, height, width);
+    flip_rows_vertical(&mut cb, ch, cw);
+    flip_rows_vertical(&mut cr, ch, cw);
+
+    Ok(DecodedYuv420p {
+        width: width as u32,
+        height: height as u32,
+        y,
+        cb,
+        cr,
+        chroma_width: cw as u32,
+        chroma_height: ch as u32,
+    })
+}
+
+/// Crop the top-left `out_w × out_h` window out of a `plane` whose row
+/// stride is `plane.width` (which is ≥ `out_w`, the 16×16-MCU pad).
+fn crop_plane(plane: &Plane, out_w: usize, out_h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; out_w * out_h];
+    for row in 0..out_h {
+        let src = row * plane.width;
+        let dst = row * out_w;
+        out[dst..dst + out_w].copy_from_slice(&plane.samples[src..src + out_w]);
+    }
+    out
+}
+
+/// Convenience: bind §2 `header` geometry to a raw `00dc` `payload`
+/// (strict §4a no-internal-markers check) and decode it to native
+/// planar YUV420P in one step.
+pub fn decode_frame_yuv420p_from_payload(
+    header: &AmvHeader,
+    payload: &[u8],
+) -> Result<DecodedYuv420p, AmvDemuxerError> {
+    let frame = AmvVideoFrame::bind_strict(header, payload)?;
+    decode_frame_yuv420p(&frame)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,6 +1015,59 @@ mod tests {
     /// yields a full-geometry raster — robustness for real, possibly
     /// damaged, device files. Exercised at a non-mod-16 geometry where the
     /// padded-plane crop is also in play.
+    #[test]
+    fn yuv420p_planes_match_the_rgb_path() {
+        // Decoding the per-MCU ramp two ways — native YUV planes vs the
+        // RGB path — must agree pixel-for-pixel after the same BT.601
+        // upsample + conversion the RGB path applies internally. This
+        // pins that the YUV plane crop + per-plane flip line up with the
+        // RGB crop + whole-frame flip at non-mod-16 geometry.
+        for (w, h) in [(40u32, 20u32), (17, 17), (33, 9), (128, 96)] {
+            let mcus = (w.div_ceil(16) * h.div_ceil(16)) as usize;
+            let payload = synth_per_mcu_ramp_payload(mcus);
+            let rgb = decode_frame_from_payload(&header_wh(w, h), &payload).unwrap();
+            let yuv = decode_frame_yuv420p_from_payload(&header_wh(w, h), &payload).unwrap();
+
+            assert_eq!((yuv.width, yuv.height), (w, h));
+            assert_eq!(yuv.y.len(), (w * h) as usize);
+            assert_eq!(yuv.chroma_width, w.div_ceil(2));
+            assert_eq!(yuv.chroma_height, h.div_ceil(2));
+            assert_eq!(
+                yuv.cb.len(),
+                (yuv.chroma_width * yuv.chroma_height) as usize
+            );
+
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let yv = yuv.y[y * w as usize + x] as f32;
+                    let cx = x / 2;
+                    let cy = y / 2;
+                    let cb = yuv.cb[cy * yuv.chroma_width as usize + cx] as f32;
+                    let cr = yuv.cr[cy * yuv.chroma_width as usize + cx] as f32;
+                    let [r, g, b] = ycbcr_to_rgb(yv, cb, cr);
+                    let k = (y * w as usize + x) * 3;
+                    assert_eq!(
+                        [rgb.rgb[k], rgb.rgb[k + 1], rgb.rgb[k + 2]],
+                        [r, g, b],
+                        "{w}×{h} pixel ({x},{y}): YUV-plane → RGB must equal the RGB path"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yuv420p_empty_scan_is_mid_level() {
+        // Empty entropy → every Y sample 128, chroma 128 (the JFIF
+        // neutral). Geometry must still be the §2 header geometry.
+        let payload = [0xFF, 0xD8, 0xFF, 0xD9];
+        let yuv = decode_frame_yuv420p_from_payload(&comedian_header(), &payload).unwrap();
+        assert_eq!((yuv.width, yuv.height), (128, 96));
+        assert!(yuv.y.iter().all(|&b| b == 128));
+        assert!(yuv.cb.iter().all(|&b| b == 128));
+        assert!(yuv.cr.iter().all(|&b| b == 128));
+    }
+
     #[test]
     fn synthetic_truncated_entropy_decodes_without_panic_at_non_mod16() {
         let (w, h) = (33u32, 17u32); // 3×2 MCUs, both axes non-mod-16
