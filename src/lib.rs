@@ -82,6 +82,7 @@
 mod adpcm;
 mod adpcm_encode;
 mod codec_audio;
+mod codec_video;
 mod demuxer;
 mod jpeg_decode;
 mod jpeg_encode;
@@ -95,6 +96,10 @@ pub use adpcm_encode::{encode_audio_nibbles, encode_audio_payload};
 pub use codec_audio::{
     make_decoder as make_audio_decoder, make_encoder as make_audio_encoder, AmvAudioDecoder,
     AmvAudioEncoder, AMV_AUDIO_CHANNELS, AMV_AUDIO_SAMPLE_RATE,
+};
+pub use codec_video::{
+    make_decoder as make_video_decoder, make_encoder as make_video_encoder, AmvVideoDecoder,
+    AmvVideoEncoder,
 };
 pub use demuxer::{AmvDemuxer, AmvDemuxerError, ChunkIndexEntry};
 pub use jpeg_decode::{
@@ -128,6 +133,22 @@ use oxideav_core::{
 /// `mjpeg` here lets downstream consumers route the packet to MJPEG
 /// machinery once an AMV-aware preprocessor is wired up.
 pub const VIDEO_CODEC_ID: &str = "mjpeg";
+
+/// Codec id string for the AMV **direct** video codec — the
+/// table-stripped baseline-JPEG decoder/encoder this crate registers
+/// for the bare `00dc` bitstream (trace §4a).
+///
+/// Distinct from [`VIDEO_CODEC_ID`] (`mjpeg`): the generic `mjpeg`
+/// decoder cannot consume a `00dc` payload because its quant / Huffman
+/// tables and scan geometry are stripped from the wire and hardcoded in
+/// the device — they have to be spliced back in (the
+/// [`reconstruct_jpeg`] path) before a standard JPEG decoder accepts the
+/// stream. `amv_video` decodes the bare bitstream directly against the
+/// §4a device profile, so it is registered under its own id rather than
+/// colliding with the `mjpeg` id `oxideav-mjpeg` owns. A consumer that
+/// wants the reconstruct-then-mjpeg route still uses `mjpeg`; a consumer
+/// that wants the one-step native decode uses `amv_video`.
+pub const VIDEO_DIRECT_CODEC_ID: &str = "amv_video";
 
 /// Codec id string declared for the AMV audio stream. Reserved for a
 /// future ADPCM variant — AMV's audio is a 4-bit nibble codec with an
@@ -184,27 +205,54 @@ pub fn register_containers(reg: &mut ContainerRegistry) {
 
 /// Register the AMV stream codecs into a [`CodecRegistry`].
 ///
-/// The **audio** side (`adpcm_amv`) installs real decoder + encoder
-/// factories — AMV's IMA-ADPCM-with-an-8-byte-preamble audio is
-/// intrinsic to the device profile (trace §3b / §4b) and has no other
-/// home, so it is owned here. The **video** side is the `mjpeg` codec
-/// id, which the dedicated `oxideav-mjpeg` crate owns; it is *not*
-/// re-registered here. AMV's in-crate baseline-JPEG decode / encode
-/// (`decode_frame` / `encode_frame_rgb`) over the §4a device tables
-/// remain available as direct functions for callers wiring the
-/// table-stripped bitstream by hand.
+/// Both intrinsic device codecs install real decoder + encoder
+/// factories:
+///
+/// * **`adpcm_amv`** (audio) — AMV's IMA-ADPCM-with-an-8-byte-preamble
+///   audio (trace §3b / §4b), mono / 22 050 Hz / S16.
+/// * **`amv_video`** (video) — the table-stripped §4a baseline JPEG,
+///   decoded / encoded directly to / from YUV420P. This is *distinct*
+///   from the `mjpeg` id ([`VIDEO_CODEC_ID`]) the demuxer also declares:
+///   a generic `mjpeg` decoder cannot consume a bare `00dc` payload (its
+///   tables are stripped), so `amv_video` is registered under its own id
+///   and the `mjpeg` id is left to `oxideav-mjpeg` for the
+///   reconstruct-then-decode route. See [`VIDEO_DIRECT_CODEC_ID`].
+///
+/// Both are intrinsic to the AMV device profile and have no other home,
+/// so they are owned here (crate-purpose discipline: codecs with
+/// dedicated native containers). The lower-level free functions
+/// (`decode_frame` / `encode_frame_rgb`, `decode_audio_payload` /
+/// `encode_audio_payload`) remain available for callers driving the
+/// bitstream by hand.
 pub fn register_codecs(reg: &mut CodecRegistry) {
-    let caps = CodecCapabilities::audio("adpcm_amv")
+    // Audio: adpcm_amv (trace §3b/§4b).
+    let audio_caps = CodecCapabilities::audio("adpcm_amv")
         .with_decode()
         .with_encode()
         .with_lossy(true)
         .with_max_channels(AMV_AUDIO_CHANNELS)
         .with_max_sample_rate(AMV_AUDIO_SAMPLE_RATE);
-    let info = CodecInfo::new(CodecId::new(AUDIO_CODEC_ID))
-        .capabilities(caps)
-        .decoder(codec_audio::make_decoder)
-        .encoder(codec_audio::make_encoder);
-    reg.register(info);
+    reg.register(
+        CodecInfo::new(CodecId::new(AUDIO_CODEC_ID))
+            .capabilities(audio_caps)
+            .decoder(codec_audio::make_decoder)
+            .encoder(codec_audio::make_encoder),
+    );
+
+    // Video: amv_video — the table-stripped §4a baseline JPEG, decoded
+    // / encoded directly (not via the generic `mjpeg` reconstruct path).
+    let video_caps = CodecCapabilities::video("amv_video")
+        .with_decode()
+        .with_encode()
+        .with_intra_only(true)
+        .with_lossy(true)
+        .with_pixel_format(oxideav_core::PixelFormat::Yuv420P);
+    reg.register(
+        CodecInfo::new(CodecId::new(VIDEO_DIRECT_CODEC_ID))
+            .capabilities(video_caps)
+            .decoder(codec_video::make_decoder)
+            .encoder(codec_video::make_encoder),
+    );
 }
 
 /// Crate-local error mirror for the framework's `Error`.
@@ -272,6 +320,28 @@ mod register_tests {
         params.channels = Some(1);
         params.sample_format = Some(SampleFormat::S16);
         params.sample_rate = Some(AMV_AUDIO_SAMPLE_RATE);
+        assert!(ctx.codecs.first_decoder(&params).is_ok());
+        assert!(ctx.codecs.first_encoder(&params).is_ok());
+    }
+
+    #[test]
+    fn register_installs_amv_video_codec() {
+        use oxideav_core::{CodecId, CodecParameters, PixelFormat};
+        let mut ctx = RuntimeContext::new();
+        register(&mut ctx);
+        let id = CodecId::new(VIDEO_DIRECT_CODEC_ID);
+        assert!(
+            ctx.codecs.has_decoder(&id),
+            "amv_video decoder should be installed"
+        );
+        assert!(
+            ctx.codecs.has_encoder(&id),
+            "amv_video encoder should be installed"
+        );
+        let mut params = CodecParameters::video(id);
+        params.width = Some(128);
+        params.height = Some(96);
+        params.pixel_format = Some(PixelFormat::Yuv420P);
         assert!(ctx.codecs.first_decoder(&params).is_ok());
         assert!(ctx.codecs.first_encoder(&params).is_ok());
     }
