@@ -172,8 +172,14 @@ fn registry_full_stream_decodes_through_demuxer_and_codecs() {
 
     let mut ctx = RuntimeContext::new();
     register(&mut ctx);
-    let vparams = video_params(&header);
-    let aparams = audio_params();
+    // Zero-config path: the demuxer's own StreamInfo params carry the
+    // direct `amv_video` / `adpcm_amv` codec ids, so a registered
+    // RuntimeContext resolves a working decoder for each stream with no
+    // hand-built CodecParameters.
+    let vparams = demuxer.streams()[0].params.clone();
+    let aparams = demuxer.streams()[1].params.clone();
+    assert_eq!(vparams.codec_id.as_str(), VIDEO_DIRECT_CODEC_ID);
+    assert_eq!(aparams.codec_id.as_str(), AUDIO_CODEC_ID);
 
     let mut video_frames = 0usize;
     let mut audio_frames = 0usize;

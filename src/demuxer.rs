@@ -26,7 +26,7 @@ use oxideav_core::{
 use crate::parse::{
     AmvHeader, AmvPrelude, AmvWaveFormat, ChunkHeader, ChunkKind, AMV_END_TRAILER, PRELUDE_MIN_LEN,
 };
-use crate::{AUDIO_CODEC_ID, VIDEO_CODEC_ID};
+use crate::AUDIO_CODEC_ID;
 
 /// Stream indices used by the demuxer. Trace §3a (video) and §3b
 /// (audio) define the in-file order; we preserve it 1:1 so callers
@@ -239,11 +239,20 @@ impl AmvDemuxer {
         let audio_format = parsed.audio_format;
         let movi_start = parsed.movi_payload_start;
 
-        // Video stream: 1/fps clock, MJPEG codec id, width/height
-        // from amvh. Frame-rate exposed as a Rational so re-muxers
-        // (or PTS-aware codec wrappers) can recover the exact cadence
-        // without rounding through micros_per_frame.
-        let mut video_params = CodecParameters::video(CodecId::new(VIDEO_CODEC_ID));
+        // Video stream: 1/fps clock, the `amv_video` direct codec id,
+        // width/height from amvh. Frame-rate exposed as a Rational so
+        // re-muxers (or PTS-aware codec wrappers) can recover the exact
+        // cadence without rounding through micros_per_frame.
+        //
+        // The id is `amv_video` (`VIDEO_DIRECT_CODEC_ID`), **not** the
+        // generic `mjpeg` (`VIDEO_CODEC_ID`): a `00dc` payload is a
+        // table-stripped baseline JPEG (§4a) that a generic `mjpeg`
+        // decoder cannot consume, so a pipeline resolving this stream
+        // must route to the in-crate direct decoder this crate registers
+        // under `amv_video`. The reconstruct-then-mjpeg route remains
+        // reachable via the free `reconstruct_jpeg` splice for callers
+        // that want a conforming JFIF for a generic decoder.
+        let mut video_params = CodecParameters::video(CodecId::new(crate::VIDEO_DIRECT_CODEC_ID));
         video_params.media_type = MediaType::Video;
         video_params.width = Some(header.width);
         video_params.height = Some(header.height);
@@ -1207,6 +1216,32 @@ mod tests {
         );
         assert_eq!(d.cursor(), 0x13C);
         assert_eq!(d.duration_micros(), Some(93_000_000));
+    }
+
+    #[test]
+    fn demuxer_declares_direct_codec_ids_resolvable_through_registry() {
+        // The video stream must declare `amv_video` (not generic `mjpeg`)
+        // and the audio stream `adpcm_amv`, so a RuntimeContext that has
+        // `register`-ed this crate resolves a working decoder for each
+        // stream straight from the demuxer's StreamInfo.
+        let buf = build_synthetic_file(3);
+        let d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        assert_eq!(
+            d.streams()[0].params.codec_id.as_str(),
+            crate::VIDEO_DIRECT_CODEC_ID
+        );
+        assert_eq!(d.streams()[1].params.codec_id.as_str(), AUDIO_CODEC_ID);
+
+        let mut ctx = oxideav_core::RuntimeContext::new();
+        crate::register(&mut ctx);
+        assert!(
+            ctx.codecs.first_decoder(&d.streams()[0].params).is_ok(),
+            "video stream params resolve a registered decoder"
+        );
+        assert!(
+            ctx.codecs.first_decoder(&d.streams()[1].params).is_ok(),
+            "audio stream params resolve a registered decoder"
+        );
     }
 
     #[test]

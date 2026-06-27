@@ -6,6 +6,21 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Demuxer now declares the directly-decodable codec ids.** The video
+  stream's `CodecParameters::codec_id` is the `amv_video`
+  (`VIDEO_DIRECT_CODEC_ID`) direct codec rather than the generic `mjpeg`
+  (`VIDEO_CODEC_ID`) pointer, so a `RuntimeContext` that has `register`-ed
+  this crate resolves a working decoder for every stream straight from
+  `demuxer.streams()` — the zero-config pipeline path. A generic `mjpeg`
+  decoder cannot consume a bare `00dc` payload (its §4a tables are
+  stripped), so the `mjpeg` id is reserved for the reconstruct-then-mjpeg
+  route via `reconstruct_jpeg`. The muxer round-trip is unaffected (it
+  routes by stream index and never reads the codec id), and the wire
+  bytes are unchanged. New demuxer test asserts both stream ids resolve a
+  registered decoder.
+
 ### Added
 
 - **Registry-driven end-to-end codec validation** — a

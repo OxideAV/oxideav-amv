@@ -17,17 +17,28 @@
 //!
 //! ## What this crate decodes
 //!
-//! This is a **container-only** crate: it identifies AMV files, parses
-//! the `amvh` main header (resolution, fps, packed duration) and audio
-//! `WAVEFORMATEX`, walks the `movi` payload, and emits one
-//! [`Packet`](oxideav_core::Packet) per `00dc` (video) / `01wb` (audio)
-//! leaf chunk. The video stream is declared as `mjpeg` and the audio
-//! stream as `adpcm_amv`; actual frame / sample decoding lives in
-//! sibling codec crates and is invoked downstream of the demuxer.
-//! [`AmvVideoFrame`] is the typed hand-off surface for that future
-//! video decoder: it binds the `amvh` geometry (the only place the
-//! resolution exists — the `00dc` bitstream carries no frame header)
-//! to a validated `00dc` payload and exposes the entropy-coded window.
+//! It identifies AMV files, parses the `amvh` main header (resolution,
+//! fps, packed duration) and audio `WAVEFORMATEX`, walks the `movi`
+//! payload, and emits one [`Packet`](oxideav_core::Packet) per `00dc`
+//! (video) / `01wb` (audio) leaf chunk. Because AMV's video and audio
+//! profiles are **intrinsic to the device** (the table-stripped JPEG and
+//! the IMA-ADPCM-with-an-8-byte-preamble block both have no other home —
+//! every AMV file shares the one fixed profile), the crate also **owns
+//! the codecs**: it registers real `oxideav-core` `Decoder` / `Encoder`
+//! factories under the `amv_video` (video) and `adpcm_amv` (audio) ids,
+//! and the demuxer declares those ids on its streams so a registered
+//! `RuntimeContext` resolves a working decoder straight from the demuxer
+//! output. [`AmvVideoFrame`] is the typed geometry-binding surface those
+//! decoders consume: it binds the `amvh` geometry (the only place the
+//! resolution exists — the `00dc` bitstream carries no frame header) to a
+//! validated `00dc` payload and exposes the entropy-coded window.
+//!
+//! The container also still declares the [`VIDEO_CODEC_ID`] (`mjpeg`)
+//! convenience id for the *reconstruct-then-mjpeg* route — splice the
+//! §4a tables back with [`reconstruct_jpeg`] and hand the conforming
+//! JFIF to a generic decoder — but a pipeline opening an `.amv` resolves
+//! the [`VIDEO_DIRECT_CODEC_ID`] (`amv_video`) stream id to the in-crate
+//! direct decoder, which a generic `mjpeg` decoder cannot replace.
 //!
 //! ## What this crate writes
 //!
