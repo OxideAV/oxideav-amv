@@ -172,10 +172,20 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     output.width = Some(width);
     output.height = Some(height);
     output.pixel_format = Some(PixelFormat::Yuv420P);
+
+    // Packet time base is the frame interval `1/fps` when the caller set
+    // a frame rate (the AMV stream clock the demuxer/muxer use), else a
+    // neutral `1/1` so a frame's pts passes through as a raw frame index.
+    let time_base = match params.frame_rate {
+        Some(r) if r.num > 0 && r.den > 0 => TimeBase::new(r.den, r.num),
+        _ => TimeBase::new(1, 1),
+    };
+
     Ok(Box::new(AmvVideoEncoder {
         output,
         width,
         height,
+        time_base,
         queue: VecDeque::new(),
     }))
 }
@@ -187,6 +197,7 @@ pub struct AmvVideoEncoder {
     output: CodecParameters,
     width: u32,
     height: u32,
+    time_base: TimeBase,
     queue: VecDeque<Packet>,
 }
 
@@ -223,7 +234,7 @@ impl Encoder for AmvVideoEncoder {
 
         let payload =
             encode_frame_yuv420p(self.width, self.height, &y, &cb, &cr).map_err(Error::from)?;
-        let mut pkt = Packet::new(0, TimeBase::new(1, 1), payload);
+        let mut pkt = Packet::new(0, self.time_base, payload);
         pkt.pts = v.pts;
         pkt.dts = v.pts;
         pkt.flags.keyframe = true; // intra-only: every frame is a keyframe
@@ -406,6 +417,48 @@ mod tests {
         assert_eq!(
             pkt.data, tight,
             "padded-stride encode must equal the tight-stride encode"
+        );
+    }
+
+    #[test]
+    fn encoder_packet_time_base_follows_frame_rate() {
+        use oxideav_core::Rational;
+        let (w, h) = (16u32, 16u32);
+        let (y, cb, cr) = synth_yuv(w, h);
+        let frame = Frame::Video(VideoFrame {
+            pts: Some(7),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize,
+                    data: y,
+                },
+                VideoPlane {
+                    stride: (w.div_ceil(2)) as usize,
+                    data: cb,
+                },
+                VideoPlane {
+                    stride: (w.div_ceil(2)) as usize,
+                    data: cr,
+                },
+            ],
+        });
+
+        // With a 12 fps frame rate the packet base is 1/12.
+        let mut params = video_params(w, h);
+        params.frame_rate = Some(Rational::new(12, 1));
+        let mut enc = make_encoder(&params).expect("encoder");
+        enc.send_frame(&frame).unwrap();
+        let pkt = enc.receive_packet().unwrap();
+        assert_eq!(pkt.time_base, TimeBase::new(1, 12));
+        assert_eq!(pkt.pts, Some(7));
+        assert_eq!(pkt.dts, Some(7));
+
+        // With no frame rate the base falls back to 1/1.
+        let mut enc2 = make_encoder(&video_params(w, h)).expect("encoder");
+        enc2.send_frame(&frame).unwrap();
+        assert_eq!(
+            enc2.receive_packet().unwrap().time_base,
+            TimeBase::new(1, 1)
         );
     }
 

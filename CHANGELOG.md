@@ -23,6 +23,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`amv_video` encoder emits frame-rate-aware packet timing.** The
+  encoder's output packets now carry the `1/fps` time base derived from
+  `CodecParameters::frame_rate` (the AMV stream clock the demuxer/muxer
+  use) instead of a placeholder `1/1`, falling back to `1/1` only when no
+  frame rate is set. New unit test pins the `1/12` base + pts/dts
+  passthrough and the no-frame-rate fallback.
+
 - **Registry-driven end-to-end codec validation** — a
   `registry_codec_path` integration test opens the real device-origin
   `comedian.amv` with the `AmvDemuxer`, resolves the `adpcm_amv` /
