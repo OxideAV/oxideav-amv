@@ -1,5 +1,7 @@
 # oxideav-amv
 
+[![CI](https://github.com/OxideAV/oxideav-amv/actions/workflows/ci.yml/badge.svg)](https://github.com/OxideAV/oxideav-amv/actions/workflows/ci.yml) [![crates.io](https://img.shields.io/crates/v/oxideav-amv.svg)](https://crates.io/crates/oxideav-amv) [![docs.rs](https://docs.rs/oxideav-amv/badge.svg)](https://docs.rs/oxideav-amv) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A pure-Rust demuxer **and** muxer for the **AMV** ("Actions Media
 Video") container — the non-standard AVI variant used by inexpensive
 portable media players (S1 / Actions / ALi-chip devices) — built on the
