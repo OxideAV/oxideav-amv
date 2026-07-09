@@ -71,6 +71,14 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   muxer's output passes the **strict** demuxer open (every §2/§3
   sentinel), not just the permissive one.
 
+- **`rate_control_encode` bench** — Criterion A/B of the budgeted vs
+  unconstrained frame encode on a textured 128×96 frame (the comedian
+  geometry). Measured on the dev machine: unconstrained ≈ 644 µs,
+  unbinding budget ≈ 661 µs (one extra entropy pass), fully binding
+  budgets ≈ 798–861 µs — the whole ≤ 12-probe binary search costs
+  ≈ 35 % of a plain encode because the DCT + quantization stage runs
+  once and only the entropy pass repeats.
+
 ### Changed
 
 - **Encoder internals split into quantize → entropy stages** (no wire

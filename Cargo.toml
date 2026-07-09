@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "mux_write"
 harness = false
+
+[[bench]]
+name = "rate_control_encode"
+harness = false
