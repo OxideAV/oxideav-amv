@@ -55,7 +55,12 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   (measured: device 2275 B/frame → target 1365 → delivered ~1290,
   worst sampled MAE ≈ 6.9/channel vs the source decode); at a 2× target
   rate control is byte-for-byte the unconstrained encode. Skips when
-  the fixture is not staged.
+  the fixture is not staged. A third, fixture-free test proves the full
+  registry pipeline: `bit_rate` on `CodecParameters` → registry-resolved
+  `amv_video` encoder → registry-opened `amv` muxer → strict demux —
+  the written file holds the stream target (75–100 % utilisation),
+  keeps the §4 1:1 interleave and the §2 packed duration, and every
+  rate-controlled frame decodes through the registry decoder.
 
 - **Muxer validates the §2 / §3b device-profile envelope at `open`** —
   zero video geometry (undecodable: the `00dc` bitstream carries no
