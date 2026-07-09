@@ -202,23 +202,65 @@ fn rgb_to_ycbcr(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
 // Block encode.
 // ---------------------------------------------------------------------
 
-/// Quantize the natural-order coefficients in `coeffs` by `quant` (round
-/// to nearest) and Huffman-encode the block (DC difference + AC run/size)
-/// into `w`. `pred` carries the running DC predictor for the component.
+/// Natural-order index for each zig-zag position: `NATURAL_FROM_ZZ[k]`
+/// is the natural 8×8 index whose zig-zag position (per [`ZIGZAG`]) is
+/// `k`. Precomputed inverse of `ZIGZAG` so the per-coefficient entropy
+/// walk does not re-scan the table for every coefficient.
+const NATURAL_FROM_ZZ: [u8; 64] = {
+    let mut out = [0u8; 64];
+    let mut n = 0;
+    while n < 64 {
+        out[ZIGZAG[n] as usize] = n as u8;
+        n += 1;
+    }
+    out
+};
+
+/// Quantize one natural-order coefficient block by `quant`
+/// (round-to-nearest), producing the integer levels the fixed §4a
+/// device dequant multiplies back out.
+fn quantize_block(coeffs: &[f32; 64], quant: &[u8; 64]) -> [i32; 64] {
+    let mut q = [0i32; 64];
+    for (o, (&c, &qv)) in q.iter_mut().zip(coeffs.iter().zip(quant.iter())) {
+        *o = (c / qv as f32).round() as i32;
+    }
+    q
+}
+
+/// Rate-control coefficient-trim rule: at trim level `trim`, the
+/// quantized AC coefficient at zig-zag position `zz` is dropped (coded
+/// as zero) when `64·|q| ≤ trim·(zz + 16)`.
+///
+/// The §4a device profile pins the quant tables on the player side, so
+/// an AMV encoder cannot scale quantization to spend fewer bits the way
+/// a generic JPEG encoder would — the only rate lever that keeps the
+/// output decodable by the fixed tables is choosing *which quantized
+/// coefficients to spend bits on*. This rule is a zig-zag-ramped
+/// dead-zone: higher frequencies (larger `zz`) are dropped first, and a
+/// larger `trim` drops progressively larger magnitudes at progressively
+/// lower frequencies. Because the threshold is monotone in `trim` for
+/// every position, the dropped-coefficient sets are **nested** across
+/// trim levels, which keeps payload size near-monotone in `trim` and
+/// makes the budget search in [`entropy_encode_with_budget`] safe.
+/// `trim == 0` drops nothing (the unconstrained encode); DC is never
+/// trimmed (the DC predictor chain always survives).
+#[inline]
+fn trimmed_to_zero(q_abs: u32, zz: usize, trim: u32) -> bool {
+    64 * q_abs as u64 <= trim as u64 * (zz as u64 + 16)
+}
+
+/// Huffman-encode one already-quantized natural-order block (DC
+/// difference + AC run/size) into `w`. `pred` carries the running DC
+/// predictor for the component; `trim` is the [`trimmed_to_zero`]
+/// rate-control level (`0` = encode every nonzero coefficient).
 fn encode_block(
     w: &mut BitWriter,
-    coeffs: &[f32; 64],
-    quant: &[u8; 64],
+    q: &[i32; 64],
     dc_tbl: &HuffEncTable,
     ac_tbl: &HuffEncTable,
     pred: &mut i32,
+    trim: u32,
 ) {
-    // Quantize into natural order, then read out in zig-zag order.
-    let mut q = [0i32; 64];
-    for (i, (&c, &qv)) in coeffs.iter().zip(quant.iter()).enumerate() {
-        q[i] = (c / qv as f32).round() as i32;
-    }
-
     // DC: difference against the predictor, encoded as category + bits.
     let dc = q[0];
     let diff = dc - *pred;
@@ -234,11 +276,10 @@ fn encode_block(
 
     // AC: walk zig-zag positions 1..=63, run-length encoding zeros.
     let mut run = 0u32;
-    for zz in 1..64usize {
-        // Natural index whose zig-zag position is `zz`.
-        let natural = ZIGZAG.iter().position(|&z| z as usize == zz).unwrap();
-        let coeff = q[natural];
-        if coeff == 0 {
+    for (zz, &natural) in NATURAL_FROM_ZZ.iter().enumerate().skip(1) {
+        // `natural`: the natural index whose zig-zag position is `zz`.
+        let coeff = q[natural as usize];
+        if coeff == 0 || (trim > 0 && trimmed_to_zero(coeff.unsigned_abs(), zz, trim)) {
             run += 1;
             continue;
         }
@@ -295,6 +336,37 @@ fn magnitude_category(value: i32) -> (u32, u32) {
 /// Returns `InvalidData` for a zero dimension or a `rgb` length that does
 /// not equal `width * height * 3`.
 pub fn encode_frame_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, AmvDemuxerError> {
+    let planes = prepare_planes_rgb(width, height, rgb)?;
+    Ok(entropy_encode_blocks(
+        &quantize_mcu_blocks(&planes),
+        planes.mcus_x,
+        planes.mcus_y,
+        0,
+    ))
+}
+
+/// MCU-pad-aligned float sample planes ready for the DCT stage — the
+/// output of the RGB / native-YUV plane-fill front doors and the input
+/// to [`quantize_mcu_blocks`]. Luma is `mcus_x·16 × mcus_y·16`, chroma
+/// `mcus_x·8 × mcus_y·8` (4:2:0), all §4a bottom-up coded order with
+/// edge replication into the pad.
+struct PreparedPlanes {
+    y_plane: Vec<f32>,
+    luma_w: usize,
+    mcus_x: usize,
+    mcus_y: usize,
+    cb_plane: Vec<f32>,
+    cr_plane: Vec<f32>,
+    chroma_w: usize,
+}
+
+/// RGB front door of the plane-fill stage (see [`encode_frame_rgb`] for
+/// the profile description).
+fn prepare_planes_rgb(
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+) -> Result<PreparedPlanes, AmvDemuxerError> {
     if width == 0 || height == 0 {
         return Err(AmvDemuxerError::InvalidData(
             "AMV frame geometry must be non-zero".into(),
@@ -366,28 +438,61 @@ pub fn encode_frame_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, 
         }
     }
 
-    Ok(encode_planes_to_payload(
-        &y_plane, luma_w, mcus_x, mcus_y, &cb_plane, &cr_plane, chroma_w,
-    ))
+    Ok(PreparedPlanes {
+        y_plane,
+        luma_w,
+        mcus_x,
+        mcus_y,
+        cb_plane,
+        cr_plane,
+        chroma_w,
+    })
 }
 
-/// Entropy-code the MCU grid of three already-prepared, MCU-pad-aligned
-/// sample planes (luma at `luma_w`-stride, chroma at `chroma_w`-stride,
-/// both holding §4a JFIF-range 0..255 values) into a bare `00dc`
-/// payload. Shared by [`encode_frame_rgb`] and
-/// [`encode_frame_yuv420p`]: only the plane-fill stage differs between
-/// the RGB and native-YUV front doors; the DCT / quant / Huffman walk is
-/// identical.
-#[allow(clippy::too_many_arguments)]
-fn encode_planes_to_payload(
-    y_plane: &[f32],
-    luma_w: usize,
-    mcus_x: usize,
-    mcus_y: usize,
-    cb_plane: &[f32],
-    cr_plane: &[f32],
-    chroma_w: usize,
-) -> Vec<u8> {
+/// DCT + quantize the MCU grid of three prepared planes into the flat
+/// quantized-block sequence the entropy stage consumes: 6 natural-order
+/// blocks per MCU, MCU raster order, `[Y0, Y1, Y2, Y3, Cb, Cr]` within
+/// each MCU (the §4a interleaved-scan order). Shared by
+/// [`encode_frame_rgb`] and [`encode_frame_yuv420p`]: only the
+/// plane-fill stage differs between the RGB and native-YUV front doors;
+/// the DCT / quant walk is identical. Splitting quantization from the
+/// entropy pass lets the budgeted encode re-run only the (cheap)
+/// entropy stage per rate-search probe.
+fn quantize_mcu_blocks(p: &PreparedPlanes) -> Vec<[i32; 64]> {
+    let mut blocks = Vec::with_capacity(p.mcus_x * p.mcus_y * 6);
+    for my in 0..p.mcus_y {
+        for mx in 0..p.mcus_x {
+            // Four luma blocks (raster order within the MCU).
+            for by in 0..2usize {
+                for bx in 0..2usize {
+                    let ox = mx * 16 + bx * 8;
+                    let oy = my * 16 + by * 8;
+                    let mut blk = gather_block(&p.y_plane, p.luma_w, ox, oy);
+                    fdct_8x8(&mut blk);
+                    blocks.push(quantize_block(&blk, &QUANT_LUMA));
+                }
+            }
+            // One Cb, one Cr block.
+            let cox = mx * 8;
+            let coy = my * 8;
+            let mut cb_blk = gather_block(&p.cb_plane, p.chroma_w, cox, coy);
+            fdct_8x8(&mut cb_blk);
+            blocks.push(quantize_block(&cb_blk, &QUANT_CHROMA));
+            let mut cr_blk = gather_block(&p.cr_plane, p.chroma_w, cox, coy);
+            fdct_8x8(&mut cr_blk);
+            blocks.push(quantize_block(&cr_blk, &QUANT_CHROMA));
+        }
+    }
+    blocks
+}
+
+/// Entropy-code an already-quantized [`quantize_mcu_blocks`] sequence
+/// into a bare `00dc` payload (`FF D8` + stuffed entropy + `FF D9`),
+/// dropping coefficients per the [`trimmed_to_zero`] rate-control rule
+/// at level `trim` (`0` = unconstrained; byte-identical to the historic
+/// single-stage encode).
+fn entropy_encode_blocks(blocks: &[[i32; 64]], mcus_x: usize, mcus_y: usize, trim: u32) -> Vec<u8> {
+    debug_assert_eq!(blocks.len(), mcus_x * mcus_y * 6);
     // Build the four Annex K Huffman encode tables once.
     let dc_luma = HuffEncTable::build(&DC_LUMA_BITS, &DC_LUMA_VALS);
     let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
@@ -399,42 +504,12 @@ fn encode_planes_to_payload(
     let mut pred_cb = 0i32;
     let mut pred_cr = 0i32;
 
-    for my in 0..mcus_y {
-        for mx in 0..mcus_x {
-            // Four luma blocks (raster order within the MCU).
-            for by in 0..2usize {
-                for bx in 0..2usize {
-                    let ox = mx * 16 + bx * 8;
-                    let oy = my * 16 + by * 8;
-                    let mut blk = gather_block(y_plane, luma_w, ox, oy);
-                    fdct_8x8(&mut blk);
-                    encode_block(&mut bw, &blk, &QUANT_LUMA, &dc_luma, &ac_luma, &mut pred_y);
-                }
-            }
-            // One Cb, one Cr block.
-            let cox = mx * 8;
-            let coy = my * 8;
-            let mut cb_blk = gather_block(cb_plane, chroma_w, cox, coy);
-            fdct_8x8(&mut cb_blk);
-            encode_block(
-                &mut bw,
-                &cb_blk,
-                &QUANT_CHROMA,
-                &dc_chroma,
-                &ac_chroma,
-                &mut pred_cb,
-            );
-            let mut cr_blk = gather_block(cr_plane, chroma_w, cox, coy);
-            fdct_8x8(&mut cr_blk);
-            encode_block(
-                &mut bw,
-                &cr_blk,
-                &QUANT_CHROMA,
-                &dc_chroma,
-                &ac_chroma,
-                &mut pred_cr,
-            );
+    for mcu in blocks.chunks_exact(6) {
+        for luma in &mcu[..4] {
+            encode_block(&mut bw, luma, &dc_luma, &ac_luma, &mut pred_y, trim);
         }
+        encode_block(&mut bw, &mcu[4], &dc_chroma, &ac_chroma, &mut pred_cb, trim);
+        encode_block(&mut bw, &mcu[5], &dc_chroma, &ac_chroma, &mut pred_cr, trim);
     }
 
     let entropy = bw.finish();
@@ -443,6 +518,143 @@ fn encode_planes_to_payload(
     payload.extend_from_slice(&entropy);
     payload.extend_from_slice(&[0xFF, 0xD9]); // EOI
     payload
+}
+
+// ---------------------------------------------------------------------
+// Rate-controlled (budgeted) frame encode.
+// ---------------------------------------------------------------------
+
+/// Trim level at which every AC coefficient any §4a frame can produce
+/// is dropped, leaving the DC-only floor payload. The forward 8×8 DCT
+/// of level-shifted 8-bit samples is bounded by `|c| ≤ 2048`, and the
+/// smallest Annex K AC quantizer is 10, so `|q| ≤ 205`; the tightest
+/// [`trimmed_to_zero`] threshold (zig-zag position 1) then needs
+/// `trim ≥ 64·205/17 ≈ 772`. 2048 covers that with a wide margin.
+const TRIM_MAX: u32 = 2048;
+
+/// Result of a rate-controlled frame encode
+/// ([`encode_frame_rgb_with_budget`] /
+/// [`encode_frame_yuv420p_with_budget`]).
+#[derive(Debug, Clone)]
+pub struct BudgetedFrame {
+    /// The bare `00dc` payload (`FF D8` + stuffed entropy + `FF D9`),
+    /// always a fully conforming §4a frame regardless of how hard the
+    /// budget squeezed — the fixed device tables decode it unchanged.
+    pub payload: Vec<u8>,
+    /// `true` when `payload.len() <= max_payload_bytes`. `false` only
+    /// when the budget was below the frame's DC-only floor — the
+    /// returned payload is then that floor (the smallest §4a encode of
+    /// this content), so a stream-level rate controller can absorb the
+    /// overshoot on later frames instead of failing the frame.
+    pub within_budget: bool,
+}
+
+/// Binary-search the smallest-trim entropy encode that fits
+/// `max_payload_bytes`, over blocks quantized once up front.
+///
+/// The dropped-coefficient sets are nested across trim levels (see
+/// [`trimmed_to_zero`]), so payload size is near-monotone in `trim`;
+/// the search keeps the invariant "`hi` fits, `lo` does not" and only
+/// ever returns a payload whose measured size actually fit, so the
+/// rare non-monotone blip (a dropped coefficient stretching a zero run
+/// across a ZRL boundary) can cost a slightly-less-optimal trim pick
+/// but never a budget violation.
+fn entropy_encode_with_budget(
+    blocks: &[[i32; 64]],
+    mcus_x: usize,
+    mcus_y: usize,
+    max_payload_bytes: usize,
+) -> BudgetedFrame {
+    let full = entropy_encode_blocks(blocks, mcus_x, mcus_y, 0);
+    if full.len() <= max_payload_bytes {
+        return BudgetedFrame {
+            payload: full,
+            within_budget: true,
+        };
+    }
+    let floor = entropy_encode_blocks(blocks, mcus_x, mcus_y, TRIM_MAX);
+    if floor.len() > max_payload_bytes {
+        return BudgetedFrame {
+            payload: floor,
+            within_budget: false,
+        };
+    }
+    // Invariant: size(lo) > budget ≥ size(hi); `best` is the payload
+    // measured at the current `hi`.
+    let mut lo = 0u32;
+    let mut hi = TRIM_MAX;
+    let mut best = floor;
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        let probe = entropy_encode_blocks(blocks, mcus_x, mcus_y, mid);
+        if probe.len() <= max_payload_bytes {
+            hi = mid;
+            best = probe;
+        } else {
+            lo = mid;
+        }
+    }
+    BudgetedFrame {
+        payload: best,
+        within_budget: true,
+    }
+}
+
+/// Rate-controlled variant of [`encode_frame_rgb`]: encode an upright
+/// RGB raster into a bare `00dc` payload of **at most
+/// `max_payload_bytes`** when that budget is achievable.
+///
+/// The §4a device profile hardcodes the quant / Huffman tables in the
+/// player, so an AMV encoder cannot trade quality for bits by scaling
+/// quantization the way a generic JPEG encoder would. The only lever
+/// that keeps the payload decodable by the fixed tables is choosing
+/// which quantized coefficients to spend bits on: this encode drops
+/// low-magnitude, high-frequency coefficients first (a zig-zag-ramped
+/// dead-zone with nested drop-sets — see the module's rate-control
+/// notes) and binary-searches the lightest trim that fits the budget.
+/// The DCT + quantization run once; only the cheap entropy pass is
+/// repeated per search probe (≤ 12 passes).
+///
+/// A budget at or above the unconstrained encode size returns the
+/// byte-identical unconstrained payload. A budget below the frame's
+/// DC-only floor returns that floor with
+/// [`BudgetedFrame::within_budget`] `== false` rather than failing, so
+/// stream-level controllers can carry the debt. Geometry / length
+/// validation matches [`encode_frame_rgb`].
+pub fn encode_frame_rgb_with_budget(
+    width: u32,
+    height: u32,
+    rgb: &[u8],
+    max_payload_bytes: usize,
+) -> Result<BudgetedFrame, AmvDemuxerError> {
+    let planes = prepare_planes_rgb(width, height, rgb)?;
+    Ok(entropy_encode_with_budget(
+        &quantize_mcu_blocks(&planes),
+        planes.mcus_x,
+        planes.mcus_y,
+        max_payload_bytes,
+    ))
+}
+
+/// Rate-controlled variant of [`encode_frame_yuv420p`] — the native
+/// planar front door of [`encode_frame_rgb_with_budget`], with the same
+/// budget semantics and the same plane-geometry validation as
+/// [`encode_frame_yuv420p`].
+pub fn encode_frame_yuv420p_with_budget(
+    width: u32,
+    height: u32,
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    max_payload_bytes: usize,
+) -> Result<BudgetedFrame, AmvDemuxerError> {
+    let planes = prepare_planes_yuv420p(width, height, y, cb, cr)?;
+    Ok(entropy_encode_with_budget(
+        &quantize_mcu_blocks(&planes),
+        planes.mcus_x,
+        planes.mcus_y,
+        max_payload_bytes,
+    ))
 }
 
 /// Encode native planar **YUV420P** (the [`crate::DecodedYuv420p`] shape)
@@ -467,6 +679,24 @@ pub fn encode_frame_yuv420p(
     cb: &[u8],
     cr: &[u8],
 ) -> Result<Vec<u8>, AmvDemuxerError> {
+    let planes = prepare_planes_yuv420p(width, height, y, cb, cr)?;
+    Ok(entropy_encode_blocks(
+        &quantize_mcu_blocks(&planes),
+        planes.mcus_x,
+        planes.mcus_y,
+        0,
+    ))
+}
+
+/// Native-YUV420P front door of the plane-fill stage (see
+/// [`encode_frame_yuv420p`] for the profile description).
+fn prepare_planes_yuv420p(
+    width: u32,
+    height: u32,
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+) -> Result<PreparedPlanes, AmvDemuxerError> {
     if width == 0 || height == 0 {
         return Err(AmvDemuxerError::InvalidData(
             "AMV frame geometry must be non-zero".into(),
@@ -523,9 +753,15 @@ pub fn encode_frame_yuv420p(
         }
     }
 
-    Ok(encode_planes_to_payload(
-        &y_plane, luma_w, mcus_x, mcus_y, &cb_plane, &cr_plane, chroma_w,
-    ))
+    Ok(PreparedPlanes {
+        y_plane,
+        luma_w,
+        mcus_x,
+        mcus_y,
+        cb_plane,
+        cr_plane,
+        chroma_w,
+    })
 }
 
 /// Gather an 8×8 block from `plane` (width `plane_w`) at top-left
@@ -796,6 +1032,159 @@ mod tests {
             .expect("decode");
         let p2 = encode_frame_yuv420p(w, h, &dec.y, &dec.cb, &dec.cr).expect("re-encode");
         assert_eq!(p1, p2, "encode∘decode∘encode must be a stable fixed point");
+    }
+
+    #[test]
+    fn natural_from_zz_is_the_inverse_of_zigzag() {
+        // NATURAL_FROM_ZZ[k] must be the natural index whose ZIGZAG
+        // entry is k — the precompute must match the linear scan the
+        // encoder historically performed.
+        for (zz, &natural) in NATURAL_FROM_ZZ.iter().enumerate() {
+            let scanned = ZIGZAG.iter().position(|&z| z as usize == zz).unwrap();
+            assert_eq!(natural as usize, scanned, "zz={zz}");
+        }
+    }
+
+    /// Deterministic structured-noise RGB test frame: smooth gradients
+    /// plus a pseudo-random texture so the unconstrained encode spends
+    /// real AC bits (a flat frame would leave nothing to trim).
+    fn textured_rgb(w: u32, h: u32) -> Vec<u8> {
+        let mut rgb = vec![0u8; (w * h * 3) as usize];
+        let mut lcg: u32 = 0x1234_5678;
+        for y in 0..h {
+            for x in 0..w {
+                lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = (lcg >> 24) as i32 - 128;
+                let k = ((y * w + x) * 3) as usize;
+                let base = (x * 2 + y * 3) as i32;
+                rgb[k] = (base % 200 + 28 + noise / 4).clamp(0, 255) as u8;
+                rgb[k + 1] = ((base * 2) % 180 + 40 + noise / 6).clamp(0, 255) as u8;
+                rgb[k + 2] = ((x + y) as i32 % 160 + 48 + noise / 8).clamp(0, 255) as u8;
+            }
+        }
+        rgb
+    }
+
+    fn mae(a: &[u8], b: &[u8]) -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| (x as f64 - y as f64).abs())
+            .sum::<f64>()
+            / a.len() as f64
+    }
+
+    #[test]
+    fn budgeted_encode_with_generous_budget_is_the_unconstrained_encode() {
+        let (w, h) = (64u32, 48u32);
+        let rgb = textured_rgb(w, h);
+        let unconstrained = encode_frame_rgb(w, h, &rgb).expect("encode");
+        let budgeted =
+            encode_frame_rgb_with_budget(w, h, &rgb, unconstrained.len()).expect("budgeted encode");
+        assert!(budgeted.within_budget);
+        assert_eq!(
+            budgeted.payload, unconstrained,
+            "a budget equal to the unconstrained size must return the unconstrained bytes"
+        );
+    }
+
+    #[test]
+    fn budgeted_encode_meets_shrinking_budgets_and_degrades_gracefully() {
+        let (w, h) = (64u32, 48u32);
+        let rgb = textured_rgb(w, h);
+        let unconstrained = encode_frame_rgb(w, h, &rgb).expect("encode");
+        let full_len = unconstrained.len();
+        let reference =
+            decode_frame_from_payload(&header_wh(w, h), &unconstrained).expect("decode full");
+        let full_mae = mae(&rgb, &reference.rgb);
+
+        let mut last_len = full_len + 1;
+        for frac in [3usize, 4, 6, 10] {
+            let budget = full_len * 2 / frac; // 2/3, 1/2, 1/3, 1/5
+            let b = encode_frame_rgb_with_budget(w, h, &rgb, budget).expect("budgeted");
+            assert!(b.within_budget, "budget {budget} should be achievable");
+            assert!(
+                b.payload.len() <= budget,
+                "payload {} exceeds budget {budget}",
+                b.payload.len()
+            );
+            assert!(
+                b.payload.len() <= last_len,
+                "smaller budget must not grow the payload"
+            );
+            last_len = b.payload.len();
+            // Every budgeted payload stays a conforming §4a frame the
+            // fixed device tables decode.
+            let frame = crate::video::AmvVideoFrame::bind_strict(&header_wh(w, h), &b.payload)
+                .expect("budgeted payload passes the strict §4a bind");
+            assert_eq!((frame.width(), frame.height()), (w, h));
+            let decoded = decode_frame_from_payload(&header_wh(w, h), &b.payload).expect("decode");
+            let m = mae(&rgb, &decoded.rgb);
+            assert!(
+                m >= full_mae - 0.05,
+                "trimming cannot beat the unconstrained encode: {m} < {full_mae}"
+            );
+            assert!(
+                m < 40.0,
+                "budget {budget} ({}/{} of full): degradation must stay graceful, MAE {m}",
+                2,
+                frac
+            );
+        }
+    }
+
+    #[test]
+    fn budgeted_encode_below_floor_returns_floor_not_error() {
+        let (w, h) = (32u32, 32u32);
+        let rgb = textured_rgb(w, h);
+        // 4 bytes can never hold SOI + any entropy + EOI.
+        let b = encode_frame_rgb_with_budget(w, h, &rgb, 4).expect("floor encode");
+        assert!(!b.within_budget, "4-byte budget is below the DC-only floor");
+        assert!(b.payload.len() > 4);
+        // The floor payload is still a valid, decodable §4a frame.
+        let decoded =
+            decode_frame_from_payload(&header_wh(w, h), &b.payload).expect("floor decodes");
+        assert_eq!((decoded.width, decoded.height), (w, h));
+        // And it is the DC-only encode: much smaller than unconstrained
+        // on textured content.
+        let full = encode_frame_rgb(w, h, &rgb).expect("full");
+        assert!(
+            b.payload.len() * 2 < full.len(),
+            "DC-only floor {} should be far below the full encode {}",
+            b.payload.len(),
+            full.len()
+        );
+    }
+
+    #[test]
+    fn budgeted_encode_rejects_bad_geometry_like_the_unbudgeted_path() {
+        assert!(encode_frame_rgb_with_budget(0, 8, &[], 100).is_err());
+        assert!(encode_frame_rgb_with_budget(8, 8, &[0u8; 10], 100).is_err());
+        assert!(
+            encode_frame_yuv420p_with_budget(16, 16, &[0u8; 100], &[0u8; 64], &[0u8; 64], 100)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn budgeted_yuv420p_matches_budgeted_rgb_on_shared_content() {
+        // The two front doors share one quantized representation, so at
+        // the same budget they must pick the same trim and produce the
+        // same bytes when fed the §4a fixed-point planes.
+        use crate::jpeg_decode::decode_frame_yuv420p_from_payload;
+        let (w, h) = (48u32, 32u32);
+        let rgb = textured_rgb(w, h);
+        let full = encode_frame_rgb(w, h, &rgb).expect("full");
+        let yuv = decode_frame_yuv420p_from_payload(&header_wh(w, h), &full).expect("yuv");
+        let budget = full.len() / 2;
+        let via_yuv = encode_frame_yuv420p_with_budget(w, h, &yuv.y, &yuv.cb, &yuv.cr, budget)
+            .expect("yuv budgeted");
+        assert!(via_yuv.within_budget);
+        assert!(via_yuv.payload.len() <= budget);
+        // Same planes through the unbudgeted YUV encode must reproduce
+        // `full` (fixed point) — pin that the budget path diverges only
+        // by trimming.
+        let unbudgeted = encode_frame_yuv420p(w, h, &yuv.y, &yuv.cb, &yuv.cr).expect("yuv full");
+        assert_eq!(unbudgeted, full);
     }
 
     #[test]

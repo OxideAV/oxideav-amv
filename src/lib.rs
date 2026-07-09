@@ -117,7 +117,10 @@ pub use jpeg_decode::{
     decode_frame, decode_frame_from_payload, decode_frame_yuv420p,
     decode_frame_yuv420p_from_payload, DecodedFrame, DecodedYuv420p,
 };
-pub use jpeg_encode::{encode_frame, encode_frame_rgb, encode_frame_yuv420p};
+pub use jpeg_encode::{
+    encode_frame, encode_frame_rgb, encode_frame_rgb_with_budget, encode_frame_yuv420p,
+    encode_frame_yuv420p_with_budget, BudgetedFrame,
+};
 pub use jpeg_reconstruct::{reconstruct_jpeg, reconstruct_jpeg_from_payload};
 pub use muxer::AmvMuxer;
 pub use parse::{

@@ -6,7 +6,32 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Rate-controlled video frame encode** — `encode_frame_rgb_with_budget`
+  / `encode_frame_yuv420p_with_budget` (returning the new
+  `BudgetedFrame`) encode a frame into a bare `00dc` payload of at most
+  `max_payload_bytes`. The §4a device profile pins the quant / Huffman
+  tables in the player, so the only rate lever that keeps the output
+  decodable by the fixed tables is coefficient selection: the encoder
+  drops low-magnitude, high-frequency quantized coefficients first (a
+  zig-zag-ramped dead-zone whose drop-sets are nested across trim
+  levels) and binary-searches the lightest trim that fits the budget.
+  The DCT + quantization run once per frame; only the cheap entropy pass
+  repeats per search probe. A budget at or above the unconstrained size
+  returns the byte-identical unconstrained payload; a budget below the
+  frame's DC-only floor returns that floor with `within_budget == false`
+  so stream-level controllers can carry the debt. Every budgeted payload
+  remains a fully conforming §4a frame (strict-bind + decode covered by
+  unit tests).
+
 ### Changed
+
+- **Encoder internals split into quantize → entropy stages** (no wire
+  change: the unconstrained encode is byte-identical, pinned by the
+  existing fixed-point and fixture round-trip tests). The zig-zag
+  position scan in the AC walk now uses a precomputed inverse table
+  instead of an O(64) linear search per coefficient.
 
 - **Demuxer now declares the directly-decodable codec ids.** The video
   stream's `CodecParameters::codec_id` is the `amv_video`
