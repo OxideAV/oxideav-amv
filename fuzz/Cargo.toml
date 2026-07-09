@@ -63,3 +63,14 @@ name = "demuxer_open"
 path = "fuzz_targets/demuxer_open.rs"
 test = false
 doc = false
+
+# Target 3: the §4a frame decode (both front doors), the §4b audio
+# block decode, and the budgeted §4a encode + its always-decodable
+# round-trip, all on attacker-controlled bytes / geometry / budget.
+# Covers the entropy-level machinery the container layers hand
+# payloads to.
+[[bin]]
+name = "codec_decode"
+path = "fuzz_targets/codec_decode.rs"
+test = false
+doc = false

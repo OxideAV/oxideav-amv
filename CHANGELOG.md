@@ -79,6 +79,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   ≈ 35 % of a plain encode because the DCT + quantization stage runs
   once and only the entropy pass repeats.
 
+- **`codec_decode` fuzz target** — third `cargo-fuzz` harness covering
+  the entropy-level machinery the container layers hand payloads to:
+  both §4a frame-decode front doors under attacker-chosen geometry,
+  the §4b audio decode (whose `decoded_sample_count` dword is fully
+  attacker-controlled), and the budgeted §4a encode + its
+  always-decodable round-trip at an attacker-chosen budget. 450 k+
+  executions locally with zero findings; the two existing targets
+  re-ran clean against the round's changes.
+
 ### Changed
 
 - **Encoder internals split into quantize → entropy stages** (no wire
