@@ -36,8 +36,9 @@ use oxideav_core::{
 };
 
 use crate::jpeg_decode::decode_frame_yuv420p_from_payload;
-use crate::jpeg_encode::encode_frame_yuv420p;
+use crate::jpeg_encode::{encode_frame_yuv420p, encode_frame_yuv420p_with_budget};
 use crate::parse::AmvHeader;
+use crate::rate::AmvRateController;
 
 /// Build the parse-level [`AmvHeader`] geometry binding the decode /
 /// encode functions need, from a width/height pair. Only `width` /
@@ -164,6 +165,19 @@ impl Decoder for AmvVideoDecoder {
 /// `params.height` set the §2 geometry every input frame must match.
 /// [`Encoder::output_params`] declare YUV420P at that geometry so a
 /// downstream [`crate::AmvMuxer`] sizes the `amvh` header correctly.
+///
+/// # Rate control
+///
+/// When `params.bit_rate` is set, the encoder holds the emitted `00dc`
+/// payload stream to that many bits per second of video via an
+/// [`AmvRateController`] driving the §4a budgeted encode — the
+/// device-fixed tables leave coefficient selection as the only rate
+/// lever, so each frame is coefficient-trimmed to its per-frame byte
+/// budget (`bit_rate / 8 / fps`, with a ±4-frame carry account).
+/// `bit_rate` therefore also requires `params.frame_rate`: without the
+/// §2 fps there is no per-frame budget to derive, and the factory
+/// rejects the combination. The budget covers the bare payload bytes;
+/// the container adds a constant 8-byte chunk header per frame on top.
 pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     let (width, height) = dims_of(params)?;
     let mut output = params.clone();
@@ -181,23 +195,48 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         _ => TimeBase::new(1, 1),
     };
 
+    // Optional rate control from `bit_rate` (+ mandatory frame_rate).
+    let rate = match params.bit_rate {
+        None | Some(0) => None,
+        Some(bps) => {
+            let Some(r) = params.frame_rate.filter(|r| r.num > 0 && r.den > 0) else {
+                return Err(Error::unsupported(
+                    "amv_video: bit_rate rate control requires a positive frame_rate \
+                     (the §2 fps the per-frame byte budget derives from)",
+                ));
+            };
+            // bytes/frame = bits/s ÷ 8 × (den/num); u128 guards the
+            // intermediate product against caller-controlled overflow.
+            let target = (bps as u128 * r.den as u128 / (8u128 * r.num as u128))
+                .min(u64::MAX as u128) as u64;
+            Some(
+                AmvRateController::from_bytes_per_frame(target)
+                    .map_err(|e| Error::unsupported(format!("amv_video: {e}")))?,
+            )
+        }
+    };
+
     Ok(Box::new(AmvVideoEncoder {
         output,
         width,
         height,
         time_base,
+        rate,
         queue: VecDeque::new(),
     }))
 }
 
 /// AMV `amv_video` encoder: one YUV420P [`VideoFrame`] in, one bare
-/// `00dc` payload out.
+/// `00dc` payload out. With `CodecParameters::bit_rate` set, payloads
+/// are §4a coefficient-trimmed to the per-frame byte budgets an
+/// [`AmvRateController`] hands out (see [`make_encoder`]).
 #[derive(Debug)]
 pub struct AmvVideoEncoder {
     output: CodecParameters,
     width: u32,
     height: u32,
     time_base: TimeBase,
+    rate: Option<AmvRateController>,
     queue: VecDeque<Packet>,
 }
 
@@ -232,8 +271,19 @@ impl Encoder for AmvVideoEncoder {
         let cb = pack_plane(&v.planes[1], cw, ch)?;
         let cr = pack_plane(&v.planes[2], cw, ch)?;
 
-        let payload =
-            encode_frame_yuv420p(self.width, self.height, &y, &cb, &cr).map_err(Error::from)?;
+        let payload = match &mut self.rate {
+            Some(rc) => {
+                let budget = rc.frame_budget();
+                let budgeted =
+                    encode_frame_yuv420p_with_budget(self.width, self.height, &y, &cb, &cr, budget)
+                        .map_err(Error::from)?;
+                rc.note_frame(budgeted.payload.len());
+                budgeted.payload
+            }
+            None => {
+                encode_frame_yuv420p(self.width, self.height, &y, &cb, &cr).map_err(Error::from)?
+            }
+        };
         let mut pkt = Packet::new(0, self.time_base, payload);
         pkt.pts = v.pts;
         pkt.dts = v.pts;
@@ -459,6 +509,172 @@ mod tests {
         assert_eq!(
             enc2.receive_packet().unwrap().time_base,
             TimeBase::new(1, 1)
+        );
+    }
+
+    /// Deterministic noisy YUV420P frame (per-frame seed) with enough
+    /// AC energy that a byte budget actually binds.
+    fn noisy_yuv(w: u32, h: u32, seed: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let cw = w.div_ceil(2) as usize;
+        let ch = h.div_ceil(2) as usize;
+        let mut lcg = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let mut next = || {
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (lcg >> 24) as u8
+        };
+        let mut y = vec![0u8; (w * h) as usize];
+        for (i, s) in y.iter_mut().enumerate() {
+            let base = ((i as u32 % w) * 2) as i32 % 160 + 48;
+            *s = (base + (next() as i32 - 128) / 3).clamp(0, 255) as u8;
+        }
+        let mut cb = vec![0u8; cw * ch];
+        let mut cr = vec![0u8; cw * ch];
+        for s in cb.iter_mut() {
+            *s = 100 + next() % 56;
+        }
+        for s in cr.iter_mut() {
+            *s = 100 + next() % 56;
+        }
+        (y, cb, cr)
+    }
+
+    fn frame_of(w: u32, _h: u32, planes: (Vec<u8>, Vec<u8>, Vec<u8>), pts: i64) -> Frame {
+        let cw = w.div_ceil(2) as usize;
+        Frame::Video(VideoFrame {
+            pts: Some(pts),
+            planes: vec![
+                VideoPlane {
+                    stride: w as usize,
+                    data: planes.0,
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: planes.1,
+                },
+                VideoPlane {
+                    stride: cw,
+                    data: planes.2,
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn encoder_bit_rate_requires_frame_rate() {
+        let mut p = video_params(128, 96);
+        p.bit_rate = Some(96_000);
+        let err = match make_encoder(&p) {
+            Ok(_) => panic!("bit_rate without frame_rate must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("frame_rate"),
+            "error should name the missing frame_rate: {err}"
+        );
+    }
+
+    #[test]
+    fn encoder_zero_bit_rate_is_unconstrained() {
+        use oxideav_core::Rational;
+        let (w, h) = (48u32, 32u32);
+        let mut p = video_params(w, h);
+        p.frame_rate = Some(Rational::new(12, 1));
+        p.bit_rate = Some(0);
+        let mut enc = make_encoder(&p).expect("bit_rate 0 builds an unconstrained encoder");
+        let mut p2 = video_params(w, h);
+        p2.frame_rate = Some(Rational::new(12, 1));
+        let mut plain = make_encoder(&p2).expect("plain encoder");
+
+        let planes = noisy_yuv(w, h, 7);
+        enc.send_frame(&frame_of(w, h, planes.clone(), 0)).unwrap();
+        plain.send_frame(&frame_of(w, h, planes, 0)).unwrap();
+        assert_eq!(
+            enc.receive_packet().unwrap().data,
+            plain.receive_packet().unwrap().data,
+            "bit_rate = 0 must not engage rate control"
+        );
+    }
+
+    #[test]
+    fn encoder_generous_bit_rate_matches_unconstrained_bytes() {
+        use oxideav_core::Rational;
+        let (w, h) = (48u32, 32u32);
+        let mut p = video_params(w, h);
+        p.frame_rate = Some(Rational::new(12, 1));
+        p.bit_rate = Some(50_000_000); // ~520 KB/frame: never binds
+        let mut enc = make_encoder(&p).expect("encoder");
+        let mut p2 = video_params(w, h);
+        p2.frame_rate = Some(Rational::new(12, 1));
+        let mut plain = make_encoder(&p2).expect("plain encoder");
+
+        for i in 0..4u32 {
+            let planes = noisy_yuv(w, h, i);
+            enc.send_frame(&frame_of(w, h, planes.clone(), i as i64))
+                .unwrap();
+            plain.send_frame(&frame_of(w, h, planes, i as i64)).unwrap();
+            assert_eq!(
+                enc.receive_packet().unwrap().data,
+                plain.receive_packet().unwrap().data,
+                "an unbinding budget must return the unconstrained bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn encoder_bit_rate_holds_the_stream_to_the_target() {
+        use oxideav_core::Rational;
+        let (w, h) = (128u32, 96u32);
+        let fps = 12u32;
+
+        // Measure the natural (unconstrained) rate of the noisy content
+        // first, then ask for roughly half of it.
+        let mut p2 = video_params(w, h);
+        p2.frame_rate = Some(Rational::new(fps as i64, 1));
+        let mut plain = make_encoder(&p2).expect("plain encoder");
+        let mut natural_total = 0usize;
+        let n_frames = 24u32;
+        for i in 0..n_frames {
+            plain
+                .send_frame(&frame_of(w, h, noisy_yuv(w, h, i), i as i64))
+                .unwrap();
+            natural_total += plain.receive_packet().unwrap().data.len();
+        }
+        let natural_per_frame = natural_total / n_frames as usize;
+        let target_per_frame = natural_per_frame / 2;
+        let bit_rate = (target_per_frame * 8 * fps as usize) as u64;
+
+        let mut p = video_params(w, h);
+        p.frame_rate = Some(Rational::new(fps as i64, 1));
+        p.bit_rate = Some(bit_rate);
+        let mut enc = make_encoder(&p).expect("rate-controlled encoder");
+
+        let dec_params = video_params(w, h);
+        let mut dec = make_decoder(&dec_params).expect("decoder");
+        let mut total = 0usize;
+        for i in 0..n_frames {
+            enc.send_frame(&frame_of(w, h, noisy_yuv(w, h, i), i as i64))
+                .unwrap();
+            let pkt = enc.receive_packet().unwrap();
+            total += pkt.data.len();
+            // Every rate-controlled payload stays decodable §4a.
+            dec.send_packet(&pkt).unwrap();
+            let Frame::Video(f) = dec.receive_frame().unwrap() else {
+                panic!("expected video frame");
+            };
+            assert_eq!(f.planes[0].data.len(), (w * h) as usize);
+        }
+        let avg = total as f64 / n_frames as f64;
+        assert!(
+            avg <= target_per_frame as f64,
+            "average payload {avg} must hold the {target_per_frame}-byte/frame target"
+        );
+        assert!(
+            avg > target_per_frame as f64 * 0.75,
+            "average payload {avg} should use most of the {target_per_frame}-byte budget"
+        );
+        assert!(
+            (total as f64) < natural_total as f64 * 0.6,
+            "rate control must actually shrink the stream ({total} vs natural {natural_total})"
         );
     }
 

@@ -36,6 +36,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   bits/sample + the 8-byte preamble, so AMV rate control is video-only
   by construction.
 
+- **`amv_video` registry encoder honors `CodecParameters::bit_rate`** —
+  setting `bit_rate` (with a positive `frame_rate`, which the per-frame
+  budget derives from; the factory rejects `bit_rate` without it) makes
+  the trait-surface encoder drive every frame through the budgeted §4a
+  encode under an `AmvRateController`, holding the emitted `00dc`
+  payload stream to the requested bits/second. `bit_rate = 0` or unset
+  keeps the historical unconstrained encode byte-for-byte. New unit
+  tests pin the missing-frame-rate rejection, the zero/generous-budget
+  unconstrained identity, and a measured half-natural-rate run whose
+  average packet size holds the target while every packet stays
+  decodable.
+
 ### Changed
 
 - **Encoder internals split into quantize → entropy stages** (no wire
