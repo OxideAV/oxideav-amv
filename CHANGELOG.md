@@ -57,6 +57,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   rate control is byte-for-byte the unconstrained encode. Skips when
   the fixture is not staged.
 
+- **Muxer validates the §2 / §3b device-profile envelope at `open`** —
+  zero video geometry (undecodable: the `00dc` bitstream carries no
+  frame header), non-integer frame rates (the `amvh` body stores an
+  integer fps + `1e6/fps` µs/frame; the old behaviour silently floored
+  25/2 → 12, desyncing the written timing from the caller's clock),
+  zero audio sample rates, and non-mono channel counts (the written
+  `WAVEFORMATEX` derivations `nBlockAlign = 2` /
+  `nAvgBytesPerSec = rate × 2` describe decoded 16-bit **mono** PCM,
+  and the §4b codec is mono-only — a stereo count produced an
+  internally inconsistent header) are now rejected with explanatory
+  errors instead of being written. A new test also pins that the
+  muxer's output passes the **strict** demuxer open (every §2/§3
+  sentinel), not just the permissive one.
+
 ### Changed
 
 - **Encoder internals split into quantize → entropy stages** (no wire

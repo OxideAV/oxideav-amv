@@ -22,10 +22,14 @@
 //! ## Inputs the writer needs
 //!
 //! From the supplied `&[StreamInfo]`:
-//! - stream 0 must be video with `params.width`, `params.height`,
-//!   `params.frame_rate` populated;
-//! - stream 1 must be audio with `params.sample_rate` and
-//!   `params.channels` populated.
+//! - stream 0 must be video with `params.width`, `params.height`
+//!   (non-zero) and `params.frame_rate` (a positive exact integer)
+//!   populated;
+//! - stream 1 must be audio with `params.sample_rate` (non-zero) and
+//!   `params.channels` (mono) populated.
+//!
+//! See [`AmvMuxer::open`] for why each device-profile bound is
+//! enforced at construction.
 //!
 //! The packed-byte duration (`amvh +0x34`) is initialised to zero in
 //! `write_header` and patched in `write_trailer` from the observed
@@ -69,8 +73,9 @@ pub struct AmvMuxer {
     width: u32,
     height: u32,
     /// Frames-per-second declared in `amvh`. Lifted from the video
-    /// stream's `params.frame_rate` (numerator over denominator → integer
-    /// floor; AMV's `amvh` carries an integer fps only).
+    /// stream's `params.frame_rate`, which must reduce to an exact
+    /// integer (AMV's `amvh` carries an integer fps only; `open`
+    /// rejects non-integer cadences).
     fps: u32,
     /// Sample rate / channel count declared in the audio `strf`.
     samples_per_sec: u32,
@@ -101,7 +106,23 @@ impl std::fmt::Debug for AmvMuxer {
 impl AmvMuxer {
     /// Build an `AmvMuxer` from a seekable writer + the two streams
     /// (video first, audio second). Returns `Error::InvalidData` if the
-    /// stream layout does not match AMV's two-stream contract.
+    /// stream layout does not match AMV's two-stream contract, or if a
+    /// parameter falls outside what the §2 / §3b device profile can
+    /// carry:
+    ///
+    /// * **geometry** must be non-zero — the `00dc` bitstream carries no
+    ///   frame header, so a zero `amvh` dimension makes every video
+    ///   payload undecodable;
+    /// * **frame rate** must be a positive *integer* — `amvh` stores an
+    ///   integer `fps` plus `dwMicroSecPerFrame = 1e6/fps` (§2), so a
+    ///   non-integer cadence is not representable (silently flooring it
+    ///   would desync the written timing from the caller's clock);
+    /// * **audio** must be mono with a non-zero sample rate — the §3b
+    ///   `WAVEFORMATEX` derivations this muxer writes
+    ///   (`nBlockAlign = 2`, `nAvgBytesPerSec = rate × 2`) describe the
+    ///   decoded 16-bit **mono** PCM, and the §4b in-crate codec is
+    ///   mono-only; a multi-channel count would produce an internally
+    ///   inconsistent header.
     pub fn open(writer: Box<dyn WriteSeek>, streams: &[StreamInfo]) -> Result<Self> {
         if streams.len() != 2 {
             return Err(Error::invalid(format!(
@@ -131,16 +152,30 @@ impl AmvMuxer {
             .params
             .height
             .ok_or_else(|| Error::invalid("amv: video stream missing params.height".to_string()))?;
-        // frame_rate is a Rational; AMV's `amvh` only carries an integer
-        // fps so we use the floor of num/den. The trace examples (12 and
-        // 16 fps) are both exact integers; non-integer cadences are not
-        // representable in AMV's `amvh` body.
+        if width == 0 || height == 0 {
+            return Err(Error::invalid(format!(
+                "amv: video geometry must be non-zero (got {width}×{height}); the 00dc \
+                 bitstream carries no frame header, so a zero amvh dimension is undecodable"
+            )));
+        }
+        // frame_rate is a Rational; AMV's `amvh` carries an integer fps
+        // plus dwMicroSecPerFrame = 1e6/fps (§2), so only an exact
+        // integer cadence is representable. The trace examples (12 and
+        // 16 fps) are both integers.
         let fr = video.params.frame_rate.ok_or_else(|| {
             Error::invalid("amv: video stream missing params.frame_rate".to_string())
         })?;
         if fr.num <= 0 || fr.den <= 0 {
             return Err(Error::invalid(format!(
                 "amv: video frame_rate must be positive, got {}/{}",
+                fr.num, fr.den
+            )));
+        }
+        if fr.num % fr.den != 0 {
+            return Err(Error::invalid(format!(
+                "amv: video frame_rate {}/{} is not an integer; the §2 amvh body stores an \
+                 integer fps (+ 1e6/fps µs/frame), so a non-integer cadence cannot be written \
+                 without desyncing the container timing",
                 fr.num, fr.den
             )));
         }
@@ -156,9 +191,23 @@ impl AmvMuxer {
         let samples_per_sec = audio.params.sample_rate.ok_or_else(|| {
             Error::invalid("amv: audio stream missing params.sample_rate".to_string())
         })?;
+        if samples_per_sec == 0 {
+            return Err(Error::invalid(
+                "amv: audio sample_rate must be non-zero (the §3b WAVEFORMATEX byte-rate \
+                 derivation nAvgBytesPerSec = rate × 2 would degenerate)"
+                    .to_string(),
+            ));
+        }
         let channels = audio.params.channels.ok_or_else(|| {
             Error::invalid("amv: audio stream missing params.channels".to_string())
         })?;
+        if channels != 1 {
+            return Err(Error::invalid(format!(
+                "amv: audio must be mono (got {channels} channels); the §3b WAVEFORMATEX \
+                 derivations written here (nBlockAlign = 2, nAvgBytesPerSec = rate × 2) \
+                 describe decoded 16-bit mono PCM and the §4b device codec is mono-only"
+            )));
+        }
 
         Ok(Self {
             writer,
@@ -496,6 +545,92 @@ mod tests {
         streams[1].params.sample_rate = None;
         let writer: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
         assert!(AmvMuxer::open(writer, &streams).is_err());
+    }
+
+    #[test]
+    fn open_rejects_zero_video_geometry() {
+        let mut streams = comedian_streams();
+        streams[0].params.width = Some(0);
+        let writer: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let err = AmvMuxer::open(writer, &streams).unwrap_err();
+        assert!(
+            err.to_string().contains("non-zero"),
+            "error should explain the zero geometry: {err}"
+        );
+        let mut streams = comedian_streams();
+        streams[0].params.height = Some(0);
+        let writer: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        assert!(AmvMuxer::open(writer, &streams).is_err());
+    }
+
+    #[test]
+    fn open_rejects_non_integer_frame_rate() {
+        // 25/2 = 12.5 fps: silently flooring to 12 would desync the
+        // written µs/frame + fps from the caller's clock, so the muxer
+        // refuses (§2: amvh stores an integer fps only).
+        let mut streams = comedian_streams();
+        streams[0].params.frame_rate = Some(Rational::new(25, 2));
+        let writer: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let err = AmvMuxer::open(writer, &streams).unwrap_err();
+        assert!(
+            err.to_string().contains("integer"),
+            "error should explain the non-integer cadence: {err}"
+        );
+        // A reducible-but-integer rational (24/2 = 12) is fine.
+        let mut streams = comedian_streams();
+        streams[0].params.frame_rate = Some(Rational::new(24, 2));
+        let writer: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        assert!(AmvMuxer::open(writer, &streams).is_ok());
+    }
+
+    #[test]
+    fn open_rejects_zero_sample_rate() {
+        let mut streams = comedian_streams();
+        streams[1].params.sample_rate = Some(0);
+        let writer: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        assert!(AmvMuxer::open(writer, &streams).is_err());
+    }
+
+    #[test]
+    fn open_rejects_non_mono_audio() {
+        let mut streams = comedian_streams();
+        streams[1].params.channels = Some(2);
+        let writer: Box<dyn WriteSeek> = Box::new(Cursor::new(Vec::<u8>::new()));
+        let err = AmvMuxer::open(writer, &streams).unwrap_err();
+        assert!(
+            err.to_string().contains("mono"),
+            "error should explain the mono-only §3b profile: {err}"
+        );
+    }
+
+    #[test]
+    fn muxer_output_passes_the_strict_demuxer_open() {
+        // The muxer writes every §2 / §3 sentinel the strict demuxer
+        // gates on (µs/frame = 1e6/fps, flag_one, zeroed reserved spans,
+        // all-zero strh/strf bodies, the §3b WAVEFORMATEX derivations) —
+        // pin the round-trip at the strict level, not just the
+        // permissive one.
+        let streams = comedian_streams();
+        let videos: Vec<Vec<u8>> = (0..3u32)
+            .map(|_| vec![0xFF, 0xD8, 0x00, 0xFF, 0xD9])
+            .collect();
+        let audios: Vec<Vec<u8>> = (0..3u32)
+            .map(|_| {
+                let mut a = Vec::with_capacity(12);
+                a.extend_from_slice(&0u32.to_le_bytes());
+                a.extend_from_slice(&8u32.to_le_bytes());
+                a.extend_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+                a
+            })
+            .collect();
+        let buf = build_via_no_box_muxer(&streams, &videos, &audios);
+        let mut d = crate::demuxer::AmvDemuxer::open_strict(Cursor::new(buf))
+            .expect("muxer output must satisfy the strict §2/§3 sentinel checks");
+        let mut n = 0;
+        while d.next_packet().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 6);
     }
 
     #[test]
