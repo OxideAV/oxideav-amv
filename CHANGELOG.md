@@ -25,6 +25,17 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   remains a fully conforming §4a frame (strict-bind + decode covered by
   unit tests).
 
+- **`AmvRateController`** — stream-level video rate control: turns a
+  target payload bitrate (`from_video_bitrate(bits_per_sec, fps)`) or a
+  mean bytes/frame target (`from_bytes_per_frame`) into per-frame byte
+  budgets for the budgeted encode, with a ±4-frame carry account
+  (undershoot donates to later frames, forced overshoot borrows), a
+  hard budget floor, and delivered-rate stats
+  (`average_bytes_per_frame` / `achieved_bits_per_sec`). Audio needs no
+  controller: the §4b IMA-ADPCM profile is format-fixed at 4
+  bits/sample + the 8-byte preamble, so AMV rate control is video-only
+  by construction.
+
 ### Changed
 
 - **Encoder internals split into quantize → entropy stages** (no wire

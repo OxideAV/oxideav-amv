@@ -100,6 +100,7 @@ mod jpeg_encode;
 mod jpeg_reconstruct;
 mod muxer;
 mod parse;
+mod rate;
 mod video;
 
 pub use adpcm::{decode_audio_block, decode_audio_payload};
@@ -130,6 +131,7 @@ pub use parse::{
     AMV_END_TRAILER, AMV_FORM_TYPE, AUDIO_CHUNK_TAG, IMA_STEP_INDEX_MAX, JPEG_EOI, JPEG_SOI,
     VIDEO_CHUNK_TAG,
 };
+pub use rate::AmvRateController;
 pub use video::{flip_rows_vertical, AmvVideoFrame};
 
 use oxideav_core::{
