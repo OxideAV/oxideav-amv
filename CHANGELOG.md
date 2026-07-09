@@ -95,6 +95,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **DCT/IDCT cosine basis precomputed** — both the decoder's `idct_8x8`
+  and the encoder's `fdct_8x8` evaluated `cos()` inside their innermost
+  loops; the basis is now a shared 64-entry table built from the exact
+  same f32 expression, so every entry (and therefore every output byte)
+  is bit-identical — pinned by a `to_bits` equality unit test plus the
+  existing fixed-point and fixture suites. Measured on the
+  `rate_control_encode` bench: the unconstrained 128×96 encode drops
+  ~89 % (≈ 644 µs → ≈ 71 µs); binding budgeted encodes drop ~68–70 %.
+
 - **Encoder internals split into quantize → entropy stages** (no wire
   change: the unconstrained encode is byte-identical, pinned by the
   existing fixed-point and fixture round-trip tests). The zig-zag

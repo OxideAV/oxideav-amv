@@ -281,9 +281,10 @@ impl<'a> BitReader<'a> {
 /// on output it holds the spatial-domain samples (still centered around
 /// 0; the +128 level shift is applied by the caller).
 fn idct_8x8(block: &mut [f32; 64]) {
-    // Precomputed cosine basis: c[u][x] = cos((2x+1)·u·π/16) · alpha(u),
-    // where alpha(0) = 1/√2, alpha(u>0) = 1.
-    use std::f32::consts::PI;
+    // Cosine basis from the shared precomputed table:
+    // cos((2x+1)·u·π/16) = dct_cos_table()[u·8+x]; alpha(0) = 1/√2,
+    // alpha(u>0) = 1 applied per term exactly as before.
+    let cos = dct_cos_table();
     // Rows, then columns (separable).
     let mut tmp = [0f32; 64];
     for (y, row) in tmp.chunks_exact_mut(8).enumerate() {
@@ -295,7 +296,7 @@ fn idct_8x8(block: &mut [f32; 64]) {
                 } else {
                     1.0
                 };
-                s += cu * block[y * 8 + u] * ((2 * x + 1) as f32 * u as f32 * PI / 16.0).cos();
+                s += cu * block[y * 8 + u] * cos[u * 8 + x];
             }
             *out = s * 0.5;
         }
@@ -309,11 +310,37 @@ fn idct_8x8(block: &mut [f32; 64]) {
                 } else {
                     1.0
                 };
-                s += cv * tmp[v * 8 + x] * ((2 * y + 1) as f32 * v as f32 * PI / 16.0).cos();
+                s += cv * tmp[v * 8 + x] * cos[v * 8 + y];
             }
             block[y * 8 + x] = s * 0.5;
         }
     }
+}
+
+/// Precomputed separable DCT cosine basis shared by this decoder's
+/// [`idct_8x8`] and the encoder's forward transform:
+/// `dct_cos_table()[u * 8 + x] = cos((2x+1)·u·π/16)`.
+///
+/// Each entry is produced by the **exact same f32 expression** the
+/// transform loops historically evaluated inline, so the entries are
+/// bit-identical to the old per-sample `cos()` results and every
+/// decode / encode output byte is unchanged — the hoist only removes
+/// the transcendental call from the innermost loops, which dominated
+/// the whole transform profile (pinned by a bit-equality unit test and
+/// the existing fixed-point / fixture suites).
+pub(crate) fn dct_cos_table() -> &'static [f32; 64] {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<[f32; 64]> = OnceLock::new();
+    TABLE.get_or_init(|| {
+        use std::f32::consts::PI;
+        let mut t = [0f32; 64];
+        for u in 0..8usize {
+            for x in 0..8usize {
+                t[u * 8 + x] = ((2 * x + 1) as f32 * u as f32 * PI / 16.0).cos();
+            }
+        }
+        t
+    })
 }
 
 // ---------------------------------------------------------------------
@@ -625,6 +652,26 @@ pub fn decode_frame_yuv420p_from_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dct_cos_table_is_bit_identical_to_the_inline_formula() {
+        // The hoisted table must reproduce the exact f32 bits of the
+        // expression the transform loops historically evaluated inline
+        // — bit equality is what guarantees the decode / encode output
+        // bytes are unchanged by the optimization.
+        use std::f32::consts::PI;
+        let t = dct_cos_table();
+        for u in 0..8usize {
+            for x in 0..8usize {
+                let inline = ((2 * x + 1) as f32 * u as f32 * PI / 16.0).cos();
+                assert_eq!(
+                    t[u * 8 + x].to_bits(),
+                    inline.to_bits(),
+                    "table entry (u={u}, x={x}) diverges from the inline formula"
+                );
+            }
+        }
+    }
 
     /// §2 comedian device profile (128×96 @ 12 fps).
     fn comedian_header() -> AmvHeader {

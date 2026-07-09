@@ -39,7 +39,7 @@
 //! duplicated). No JPEG/AMV **encoder** source was read — only the public
 //! T.81 baseline algorithm and the public Annex K tables.
 
-use crate::jpeg_decode::DecodedFrame;
+use crate::jpeg_decode::{dct_cos_table, DecodedFrame};
 use crate::jpeg_reconstruct::{
     AC_CHROMA_BITS, AC_CHROMA_VALS, AC_LUMA_BITS, AC_LUMA_VALS, DC_CHROMA_BITS, DC_CHROMA_VALS,
     DC_LUMA_BITS, DC_LUMA_VALS, QUANT_CHROMA, QUANT_LUMA, ZIGZAG,
@@ -150,7 +150,11 @@ impl BitWriter {
 /// natural order on input; on output it holds the DCT coefficients
 /// (natural order).
 fn fdct_8x8(block: &mut [f32; 64]) {
-    use std::f32::consts::PI;
+    // Cosine basis from the decoder's shared precomputed table:
+    // cos((2y+1)·v·π/16) = dct_cos_table()[v·8+y]. Entries are
+    // bit-identical to the inline `cos()` calls this loop historically
+    // made, so the encode output bytes are unchanged.
+    let cos = dct_cos_table();
     let mut tmp = [0f32; 64];
     // Columns: for each output frequency v, sum over spatial y.
     for x in 0..8usize {
@@ -162,7 +166,7 @@ fn fdct_8x8(block: &mut [f32; 64]) {
             };
             let mut s = 0f32;
             for y in 0..8usize {
-                s += block[y * 8 + x] * ((2 * y + 1) as f32 * v as f32 * PI / 16.0).cos();
+                s += block[y * 8 + x] * cos[v * 8 + y];
             }
             tmp[v * 8 + x] = cv * s * 0.5;
         }
@@ -177,7 +181,7 @@ fn fdct_8x8(block: &mut [f32; 64]) {
             };
             let mut s = 0f32;
             for x in 0..8usize {
-                s += tmp[v * 8 + x] * ((2 * x + 1) as f32 * u as f32 * PI / 16.0).cos();
+                s += tmp[v * 8 + x] * cos[u * 8 + x];
             }
             block[v * 8 + u] = cu * s * 0.5;
         }
