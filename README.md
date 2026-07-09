@@ -84,7 +84,15 @@ decode.
 `amvh` duration (patched in `write_trailer` from the observed frame
 count), the all-zero stream-header bodies plus the 20-byte audio
 `WAVEFORMATEX`, the no-byte-padding chunk walk, and the `AMV_END_`
-trailer. Mux → demux round-trips byte-identically.
+trailer. Mux → demux round-trips byte-identically, and the output
+passes the **strict** demuxer open (every §2/§3 sentinel). `open`
+validates the device-profile envelope up front: non-zero geometry
+(the `00dc` bitstream carries no frame header, so a zero `amvh`
+dimension is undecodable), an exact-integer frame rate (`amvh` stores
+integer fps + `1e6/fps` µs/frame — flooring 12.5 to 12 would desync
+the timing), a non-zero sample rate, and mono audio (the §3b
+`nBlockAlign`/`nAvgBytesPerSec` derivations describe decoded 16-bit
+mono PCM and the §4b codec is mono-only).
 
 ### JPEG header reconstruction
 
@@ -231,6 +239,39 @@ header `int16` seed, the `+0x02` `initialStepIndex` is emitted as `0` (the
 decode-verified reset value), and nibbles pack low-first. Decode∘encode is
 the canonical IMA fixed point — byte-idempotent on real device blocks.
 
+### Rate control
+
+The §4a device profile pins the quant / Huffman tables in the *player*,
+so an AMV encoder cannot trade quality for bits by scaling quantization
+the way a generic JPEG encoder would — the only rate lever that keeps a
+payload decodable by the fixed tables is choosing **which quantized
+coefficients to spend bits on**. `encode_frame_rgb_with_budget` /
+`encode_frame_yuv420p_with_budget` (returning `BudgetedFrame`) encode a
+frame into at most `max_payload_bytes`: low-magnitude, high-frequency
+coefficients are dropped first (a zig-zag-ramped dead-zone whose
+drop-sets are nested across trim levels), and the lightest trim that
+fits is binary-searched over the entropy stage only — the DCT +
+quantization run once, so a fully binding search costs ≈ 35 % of a
+plain encode (see `benches/rate_control_encode.rs`). A budget at or
+above the unconstrained size returns the byte-identical unconstrained
+payload; a budget below the frame's DC-only floor returns that floor
+with `within_budget == false` instead of failing. Every budgeted
+payload remains a fully conforming §4a frame.
+
+`AmvRateController` is the stream-level layer: it turns a target payload
+bitrate (`from_video_bitrate(bits_per_sec, fps)`) or a mean bytes/frame
+target into per-frame budgets, with a ±4-frame carry account (simple
+frames donate unspent bytes, forced overshoot borrows) and
+delivered-rate stats. On real `comedian.amv` content at a binding 60 %
+target the delivered rate measures within 6 % under the target with a
+worst sampled MAE ≈ 6.9/channel (`tests/rate_control.rs`). The
+registered `amv_video` encoder engages all of this automatically when
+`CodecParameters::bit_rate` is set (a positive `frame_rate` is then
+required — the per-frame budget derives from the §2 fps). Audio has no
+rate headroom by construction: the §4b IMA-ADPCM profile is
+format-fixed at 4 bits/sample plus the 8-byte block preamble, so AMV
+rate control is video-only.
+
 An **end-to-end encoder round-trip** (`tests/encode_roundtrip.rs`) proves
 the full loop the encoder was built for: a real `comedian.amv` is decoded,
 each frame / block re-encoded, re-muxed through `AmvMuxer`, then re-demuxed
@@ -265,12 +306,13 @@ itself is the in-crate `adpcm_amv` codec (`decode_audio_payload` /
 
 ### Fuzz + bench
 
-A `cargo-fuzz` harness under [`fuzz/`](./fuzz/) drives every public byte
-parser and the full `open` + drain path for panic-free behaviour on
+Three `cargo-fuzz` harnesses under [`fuzz/`](./fuzz/) drive every public
+byte parser, the full `open` + drain path, and the codec-level §4a/§4b
+decode + budgeted-encode round-trip for panic-free behaviour on
 arbitrary input. A Criterion suite under [`benches/`](./benches/) A/Bs
-the demux drain, index build, indexed-vs-linear seek, and mux write hot
-paths, synthesising all inputs through the public muxer (no committed
-fixtures).
+the demux drain, index build, indexed-vs-linear seek, mux write, and
+rate-controlled encode hot paths, synthesising all inputs through the
+public API (no committed fixtures).
 
 ## Public API
 
