@@ -251,8 +251,10 @@ frame into at most `max_payload_bytes`: low-magnitude, high-frequency
 coefficients are dropped first (a zig-zag-ramped dead-zone whose
 drop-sets are nested across trim levels), and the lightest trim that
 fits is binary-searched over the entropy stage only — the DCT +
-quantization run once, so a fully binding search costs ≈ 35 % of a
-plain encode (see `benches/rate_control_encode.rs`). A budget at or
+quantization run once per frame regardless of how many trim levels the
+search probes (see `benches/rate_control_encode.rs`; with the
+precomputed-cosine DCT a 128×96 unconstrained encode measures ≈ 71 µs
+and a fully binding budgeted encode ≈ 280 µs). A budget at or
 above the unconstrained size returns the byte-identical unconstrained
 payload; a budget below the frame's DC-only floor returns that floor
 with `within_budget == false` instead of failing. Every budgeted
