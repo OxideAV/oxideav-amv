@@ -48,6 +48,15 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   average packet size holds the target while every packet stays
   decodable.
 
+- **Measured bitrate-vs-target fixture tests** — `tests/rate_control.rs`
+  re-encodes real `comedian.amv` frames under an `AmvRateController`:
+  at a binding 60 %-of-device-rate target over a 300-frame window the
+  delivered average holds the target from below at >85 % utilisation
+  (measured: device 2275 B/frame → target 1365 → delivered ~1290,
+  worst sampled MAE ≈ 6.9/channel vs the source decode); at a 2× target
+  rate control is byte-for-byte the unconstrained encode. Skips when
+  the fixture is not staged.
+
 ### Changed
 
 - **Encoder internals split into quantize → entropy stages** (no wire
