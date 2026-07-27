@@ -89,19 +89,51 @@ impl HuffEncTable {
 // MSB-first bit writer with JPEG byte-stuffing (inverse of BitReader).
 // ---------------------------------------------------------------------
 
+/// Where the stuffed entropy bytes of a [`BitWriter`] go: either a real
+/// byte buffer ([`VecSink`], the materializing encode) or a bare byte
+/// counter ([`CountSink`], the exact-size probe the rate-control budget
+/// search runs — same stuffing, same final-pad behaviour, no
+/// allocation).
+trait EntropySink {
+    fn emit(&mut self, b: u8);
+}
+
+/// Materializing sink: collects the stuffed entropy bytes.
+struct VecSink(Vec<u8>);
+
+impl EntropySink for VecSink {
+    #[inline]
+    fn emit(&mut self, b: u8) {
+        self.0.push(b);
+    }
+}
+
+/// Counting sink: tracks only how many stuffed bytes *would* be
+/// emitted. Because stuffing decisions depend on the actual byte
+/// values, the counter still sees every byte — the count is exact, not
+/// an estimate.
+struct CountSink(usize);
+
+impl EntropySink for CountSink {
+    #[inline]
+    fn emit(&mut self, _b: u8) {
+        self.0 += 1;
+    }
+}
+
 /// MSB-first bit writer over the entropy-coded scan window. Re-applies
 /// JPEG `FF`→`FF 00` byte stuffing so the emitted stream round-trips
 /// through the decoder's de-stuffing [`crate::jpeg_decode`] `BitReader`.
-struct BitWriter {
-    out: Vec<u8>,
+struct BitWriter<S: EntropySink> {
+    sink: S,
     acc: u32,
     nbits: u32,
 }
 
-impl BitWriter {
-    fn new() -> Self {
+impl<S: EntropySink> BitWriter<S> {
+    fn with_sink(sink: S) -> Self {
         BitWriter {
-            out: Vec::new(),
+            sink,
             acc: 0,
             nbits: 0,
         }
@@ -114,9 +146,9 @@ impl BitWriter {
             self.nbits += 1;
             if self.nbits == 8 {
                 let b = (self.acc & 0xFF) as u8;
-                self.out.push(b);
+                self.sink.emit(b);
                 if b == 0xFF {
-                    self.out.push(0x00); // byte stuffing
+                    self.sink.emit(0x00); // byte stuffing
                 }
                 self.nbits = 0;
                 self.acc = 0;
@@ -125,19 +157,18 @@ impl BitWriter {
     }
 
     /// Flush the final partial byte, padding the low bits with **1**s
-    /// (T.81 §F.1.2.3: the trailing fill bits are 1s). Returns the stuffed
-    /// entropy bytes.
-    fn finish(mut self) -> Vec<u8> {
+    /// (T.81 §F.1.2.3: the trailing fill bits are 1s). Returns the sink.
+    fn finish(mut self) -> S {
         if self.nbits > 0 {
             let pad = 8 - self.nbits;
             self.acc = (self.acc << pad) | ((1u32 << pad) - 1);
             let b = (self.acc & 0xFF) as u8;
-            self.out.push(b);
+            self.sink.emit(b);
             if b == 0xFF {
-                self.out.push(0x00);
+                self.sink.emit(0x00);
             }
         }
-        self.out
+        self.sink
     }
 }
 
@@ -257,8 +288,8 @@ fn trimmed_to_zero(q_abs: u32, zz: usize, trim: u32) -> bool {
 /// difference + AC run/size) into `w`. `pred` carries the running DC
 /// predictor for the component; `trim` is the [`trimmed_to_zero`]
 /// rate-control level (`0` = encode every nonzero coefficient).
-fn encode_block(
-    w: &mut BitWriter,
+fn encode_block<S: EntropySink>(
+    w: &mut BitWriter<S>,
     q: &[i32; 64],
     dc_tbl: &HuffEncTable,
     ac_tbl: &HuffEncTable,
@@ -495,15 +526,18 @@ fn quantize_mcu_blocks(p: &PreparedPlanes) -> Vec<[i32; 64]> {
 /// dropping coefficients per the [`trimmed_to_zero`] rate-control rule
 /// at level `trim` (`0` = unconstrained; byte-identical to the historic
 /// single-stage encode).
-fn entropy_encode_blocks(blocks: &[[i32; 64]], mcus_x: usize, mcus_y: usize, trim: u32) -> Vec<u8> {
-    debug_assert_eq!(blocks.len(), mcus_x * mcus_y * 6);
+/// Drive the interleaved-MCU entropy walk into `sink` at trim level
+/// `trim`. Shared core of the materializing encode
+/// ([`entropy_encode_blocks`]) and the exact-size probe
+/// ([`entropy_encoded_size`]).
+fn entropy_encode_into<S: EntropySink>(blocks: &[[i32; 64]], trim: u32, sink: S) -> S {
     // Build the four Annex K Huffman encode tables once.
     let dc_luma = HuffEncTable::build(&DC_LUMA_BITS, &DC_LUMA_VALS);
     let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
     let dc_chroma = HuffEncTable::build(&DC_CHROMA_BITS, &DC_CHROMA_VALS);
     let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
 
-    let mut bw = BitWriter::new();
+    let mut bw = BitWriter::with_sink(sink);
     let mut pred_y = 0i32;
     let mut pred_cb = 0i32;
     let mut pred_cr = 0i32;
@@ -515,13 +549,25 @@ fn entropy_encode_blocks(blocks: &[[i32; 64]], mcus_x: usize, mcus_y: usize, tri
         encode_block(&mut bw, &mcu[4], &dc_chroma, &ac_chroma, &mut pred_cb, trim);
         encode_block(&mut bw, &mcu[5], &dc_chroma, &ac_chroma, &mut pred_cr, trim);
     }
+    bw.finish()
+}
 
-    let entropy = bw.finish();
+fn entropy_encode_blocks(blocks: &[[i32; 64]], mcus_x: usize, mcus_y: usize, trim: u32) -> Vec<u8> {
+    debug_assert_eq!(blocks.len(), mcus_x * mcus_y * 6);
+    let entropy = entropy_encode_into(blocks, trim, VecSink(Vec::new())).0;
     let mut payload = Vec::with_capacity(entropy.len() + 4);
     payload.extend_from_slice(&[0xFF, 0xD8]); // SOI
     payload.extend_from_slice(&entropy);
     payload.extend_from_slice(&[0xFF, 0xD9]); // EOI
     payload
+}
+
+/// Exact byte size of the payload [`entropy_encode_blocks`] would
+/// produce for `blocks` at `trim` — the full stuffed entropy walk
+/// (stuffing depends on actual byte values, so the walk is identical)
+/// plus the 4 SOI/EOI marker bytes — without allocating the payload.
+fn entropy_encoded_size(blocks: &[[i32; 64]], trim: u32) -> usize {
+    entropy_encode_into(blocks, trim, CountSink(0)).0 + 4
 }
 
 // ---------------------------------------------------------------------
@@ -562,44 +608,42 @@ pub struct BudgetedFrame {
 /// ever returns a payload whose measured size actually fit, so the
 /// rare non-monotone blip (a dropped coefficient stretching a zero run
 /// across a ZRL boundary) can cost a slightly-less-optimal trim pick
-/// but never a budget violation.
+/// but never a budget violation. Search probes run the exact-size
+/// counting walk ([`entropy_encoded_size`]); only the winning trim is
+/// materialized to bytes.
 fn entropy_encode_with_budget(
     blocks: &[[i32; 64]],
     mcus_x: usize,
     mcus_y: usize,
     max_payload_bytes: usize,
 ) -> BudgetedFrame {
-    let full = entropy_encode_blocks(blocks, mcus_x, mcus_y, 0);
-    if full.len() <= max_payload_bytes {
+    if entropy_encoded_size(blocks, 0) <= max_payload_bytes {
         return BudgetedFrame {
-            payload: full,
+            payload: entropy_encode_blocks(blocks, mcus_x, mcus_y, 0),
             within_budget: true,
         };
     }
-    let floor = entropy_encode_blocks(blocks, mcus_x, mcus_y, TRIM_MAX);
-    if floor.len() > max_payload_bytes {
+    if entropy_encoded_size(blocks, TRIM_MAX) > max_payload_bytes {
         return BudgetedFrame {
-            payload: floor,
+            payload: entropy_encode_blocks(blocks, mcus_x, mcus_y, TRIM_MAX),
             within_budget: false,
         };
     }
-    // Invariant: size(lo) > budget ≥ size(hi); `best` is the payload
-    // measured at the current `hi`.
+    // Invariant: size(lo) > budget ≥ size(hi).
     let mut lo = 0u32;
     let mut hi = TRIM_MAX;
-    let mut best = floor;
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        let probe = entropy_encode_blocks(blocks, mcus_x, mcus_y, mid);
-        if probe.len() <= max_payload_bytes {
+        if entropy_encoded_size(blocks, mid) <= max_payload_bytes {
             hi = mid;
-            best = probe;
         } else {
             lo = mid;
         }
     }
+    let payload = entropy_encode_blocks(blocks, mcus_x, mcus_y, hi);
+    debug_assert!(payload.len() <= max_payload_bytes);
     BudgetedFrame {
-        payload: best,
+        payload,
         within_budget: true,
     }
 }
@@ -616,8 +660,9 @@ fn entropy_encode_with_budget(
 /// low-magnitude, high-frequency coefficients first (a zig-zag-ramped
 /// dead-zone with nested drop-sets — see the module's rate-control
 /// notes) and binary-searches the lightest trim that fits the budget.
-/// The DCT + quantization run once; only the cheap entropy pass is
-/// repeated per search probe (≤ 12 passes).
+/// The DCT + quantization run once; each search probe is an
+/// allocation-free exact-size counting walk of the entropy stage (≤ 12
+/// probes), and only the winning trim is materialized to bytes.
 ///
 /// A budget at or above the unconstrained encode size returns the
 /// byte-identical unconstrained payload. A budget below the frame's
@@ -1089,6 +1134,31 @@ mod tests {
             budgeted.payload, unconstrained,
             "a budget equal to the unconstrained size must return the unconstrained bytes"
         );
+    }
+
+    #[test]
+    fn counting_size_probe_equals_materialized_length() {
+        // The budget search trusts the counting walk as an *exact* size
+        // oracle (stuffing + final-pad included); pin it to the
+        // materializing walk across trim levels, geometries and
+        // contents (flat content exercises the EOB-heavy path,
+        // textured content the stuffing path).
+        for (w, h) in [(64u32, 48u32), (17, 17), (16, 16)] {
+            let planes_t = prepare_planes_rgb(w, h, &textured_rgb(w, h)).expect("planes");
+            let flat = vec![200u8; (w * h * 3) as usize];
+            let planes_f = prepare_planes_rgb(w, h, &flat).expect("planes");
+            for planes in [&planes_t, &planes_f] {
+                let blocks = quantize_mcu_blocks(planes);
+                for trim in [0u32, 1, 7, 64, 300, TRIM_MAX] {
+                    let bytes = entropy_encode_blocks(&blocks, planes.mcus_x, planes.mcus_y, trim);
+                    assert_eq!(
+                        entropy_encoded_size(&blocks, trim),
+                        bytes.len(),
+                        "counting probe diverged at {w}x{h} trim {trim}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
