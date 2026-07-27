@@ -134,7 +134,7 @@ impl AmvRateController {
     /// Book the payload size a frame actually spent. Unspent budget
     /// (relative to the per-frame *target*, not the handed-out budget)
     /// becomes carry credit for later frames; overspend becomes debt.
-    /// The carry saturates at ±[`CARRY_CAP_FRAMES`] frames' worth of
+    /// The carry saturates at ±`CARRY_CAP_FRAMES` (4) frames' worth of
     /// target bytes.
     pub fn note_frame(&mut self, payload_bytes: usize) {
         let cap = (self.target_bytes_per_frame * CARRY_CAP_FRAMES) as i64;

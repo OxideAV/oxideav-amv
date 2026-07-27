@@ -134,7 +134,7 @@ fn decode_nibble(nibble: u8, predictor: &mut i32, index: &mut i32) -> i16 {
 ///
 /// The result is the 16-bit PCM the §3b `WAVEFORMATEX` declares. No
 /// device-specific DSP is performed — the recurrence is the public IMA
-/// one (see [`decode_nibble`]).
+/// one (see the private `decode_nibble` helper).
 pub fn decode_audio_block(preamble: &AmvAudioPreamble, compressed_body: &[u8]) -> Vec<i16> {
     let want = preamble.decoded_sample_count as usize;
     // Preallocate to the *smaller* of the declared count and the body's

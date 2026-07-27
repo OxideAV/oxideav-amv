@@ -894,7 +894,7 @@ fn entropy_encode_with_budget(
 /// that keeps the payload decodable by the fixed tables is choosing
 /// which quantized coefficients to spend bits on. This encode makes
 /// that choice by exact per-block Lagrangian rate–distortion
-/// optimization ([`rd_optimize_block`]): each block keeps the
+/// optimization (`rd_optimize_block`): each block keeps the
 /// coefficient subset minimizing `MSE + λ·bits` under the true Annex K
 /// entropy cost (run/size codes, ZRL splits, EOB), and the price `λ` is
 /// bisected to the lightest plan that fits the budget. The DCT +
