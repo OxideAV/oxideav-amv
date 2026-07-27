@@ -123,29 +123,40 @@ baseline-JPEG decoder over the §4a device profile: a byte-stuffing-aware
 MSB bit reader over the entropy window, a canonical T.81 Huffman walk
 built from the Annex K K.3/K.4 `BITS`/`HUFFVAL` lists, zig-zag dequant
 against K.1/K.2, a separable 8×8 inverse DCT, the 4:2:0 MCU layout (2×2
-luma + 1 Cb + 1 Cr), nearest-neighbour chroma upsampling, BT.601
-YCbCr→RGB, and the §4a bottom-up vertical flip so the output is upright.
-The same Annex K table constants back both this decoder and
-`reconstruct_jpeg` (shared in one place, not duplicated).
-`AmvDemuxer::decode_video_packet(&packet)` is the demux→pixels one-call
-convenience: it binds the demuxer's parsed `amvh` geometry to a video
-`Packet`'s raw `00dc` payload and returns the upright `DecodedFrame`
-(rejecting a non-video packet).
+luma + 1 Cb + 1 Cr), chroma upsampling, BT.601 YCbCr→RGB, and the §4a
+bottom-up vertical flip so the output is upright. The same Annex K table
+constants back both this decoder and `reconstruct_jpeg` (shared in one
+place, not duplicated). `AmvDemuxer::decode_video_packet(&packet)` is
+the demux→pixels one-call convenience: it binds the demuxer's parsed
+`amvh` geometry to a video `Packet`'s raw `00dc` payload and returns the
+upright `DecodedFrame` (rejecting a non-video packet).
+
+**Chroma upsampling is selectable** (`ChromaUpsample::{Nearest,
+Triangle}` via `decode_frame_with` / `decode_frame_from_payload_with` /
+`AmvDemuxer::decode_video_packet_with`; `decode_frame` keeps the
+`Nearest` default so every fixed-point invariant is unchanged). The §4a
+profile fixes everything on the wire but not the display-side
+interpolation filter; `Triangle` is the centered separable triangle
+filter derived from 4:2:0 siting geometry (per-axis weights 3/4 : 1/4,
+2-D 9/3/3/1 in exact integer arithmetic, edge taps clamped to the
+visible plane so MCU padding is never read) and reconstructs a visibly
+smoother chroma field. Unit tests pin filter equality on uniform chroma
+and the exact 3/4 : 1/4 blend at chroma-tile boundaries on both axes.
 
 An **end-to-end decode-to-pixels** integration test
 (`tests/decode_to_pixels.rs`) validates this against a **black-box JPEG
 decoder binary** (`djpeg` from libjpeg, falling back to `magick`): the
 in-crate decode of real `comedian.amv` frames matches the reference
-decoder's pixels within **MAE ≈ 1.35/channel** (the only divergence is the
-reference's integer fast-IDCT + fancy chroma upsampling vs the in-crate
-float IDCT + nearest upsample; a wrong table / sampling / colour path is
-tens of levels off — the mis-oriented baseline is ~18). A second test
-decodes **all 1116 frames** in-crate with no external binary, asserting
-each is 128 × 96 and that the stream is overwhelmingly coherent natural
-content (the occasional genuinely-flat fade frame is accepted only when
-near-perfectly uniform, never noisy). The reference tests skip when no
-decoder binary is on `PATH`; no decoder *source* is ever read — the
-validator is an opaque process.
+decoder's pixels within **MAE ≈ 1.35/channel** with `Nearest` and
+**≈ 0.04–0.05/channel** with `Triangle` — at which point the residual is
+the reference's integer fast-IDCT rounding alone (a wrong table /
+sampling / colour path is tens of levels off — the mis-oriented baseline
+is ~18). A second test decodes **all 1116 frames** in-crate with no
+external binary, asserting each is 128 × 96 and that the stream is
+overwhelmingly coherent natural content (the occasional genuinely-flat
+fade frame is accepted only when near-perfectly uniform, never noisy).
+The reference tests skip when no decoder binary is on `PATH`; no decoder
+*source* is ever read — the validator is an opaque process.
 
 A **synthetic-geometry** unit harness hardens the trace §4a *"behaviour
 for non-multiple-of-16 dimensions is untested here"* gap without any
@@ -245,20 +256,27 @@ The §4a device profile pins the quant / Huffman tables in the *player*,
 so an AMV encoder cannot trade quality for bits by scaling quantization
 the way a generic JPEG encoder would — the only rate lever that keeps a
 payload decodable by the fixed tables is choosing **which quantized
-coefficients to spend bits on**. `encode_frame_rgb_with_budget` /
-`encode_frame_yuv420p_with_budget` (returning `BudgetedFrame`) encode a
-frame into at most `max_payload_bytes`: low-magnitude, high-frequency
-coefficients are dropped first (a zig-zag-ramped dead-zone whose
-drop-sets are nested across trim levels), and the lightest trim that
-fits is binary-searched over the entropy stage only — the DCT +
-quantization run once per frame regardless of how many trim levels the
-search probes (see `benches/rate_control_encode.rs`; with the
-precomputed-cosine DCT a 128×96 unconstrained encode measures ≈ 71 µs
-and a fully binding budgeted encode ≈ 280 µs). A budget at or
-above the unconstrained size returns the byte-identical unconstrained
-payload; a budget below the frame's DC-only floor returns that floor
-with `within_budget == false` instead of failing. Every budgeted
-payload remains a fully conforming §4a frame.
+coefficients to spend bits on, and at what precision**.
+`encode_frame_rgb_with_budget` / `encode_frame_yuv420p_with_budget`
+(returning `BudgetedFrame`) encode a frame into at most
+`max_payload_bytes` by exact per-block **Lagrangian rate–distortion
+planning**: every nonzero AC coefficient is kept at full level, stepped
+down to a lower size-category boundary (`2^s − 1`, sign preserved), or
+dropped, minimizing `MSE + λ·bits` per block by dynamic programming —
+distortion is the squared dequantized error (the DCT's orthogonality
+maps it to pixel-domain MSE) and rate is the true Annex K entropy cost
+including run/size coupling, ZRL splits and EOB placement. The price
+`λ` is bisected to the lightest plan that fits: the DCT + quantization
+run once per frame, each probe re-plans and measures the exact payload
+size with an allocation-free counting entropy walk (byte stuffing
+included), and only the winning plan is materialized (see
+`benches/rate_control_encode.rs`; a 128×96 unconstrained encode
+measures ≈ 80 µs and a fully binding budgeted encode ≈ 2.4–2.9 ms — a
+few percent of the 83 ms frame interval of the §2 12 fps profile). A
+budget at or above the unconstrained size returns the byte-identical
+unconstrained payload; a budget below the frame's DC-only floor returns
+that floor with `within_budget == false` instead of failing. Every
+budgeted payload remains a fully conforming §4a frame.
 
 `AmvRateController` is the stream-level layer: it turns a target payload
 bitrate (`from_video_bitrate(bits_per_sec, fps)`) or a mean bytes/frame
@@ -266,13 +284,14 @@ target into per-frame budgets, with a ±4-frame carry account (simple
 frames donate unspent bytes, forced overshoot borrows) and
 delivered-rate stats. On real `comedian.amv` content at a binding 60 %
 target the delivered rate measures within 6 % under the target with a
-worst sampled MAE ≈ 6.9/channel (`tests/rate_control.rs`). The
-registered `amv_video` encoder engages all of this automatically when
-`CodecParameters::bit_rate` is set (a positive `frame_rate` is then
-required — the per-frame budget derives from the §2 fps). Audio has no
-rate headroom by construction: the §4b IMA-ADPCM profile is
-format-fixed at 4 bits/sample plus the 8-byte block preamble, so AMV
-rate control is video-only.
+worst sampled MAE ≈ 4.6/channel (`tests/rate_control.rs`; the
+pre-RD zig-zag dead-zone ramp measured ≈ 6.9 at the same delivered
+rate). The registered `amv_video` encoder engages all of this
+automatically when `CodecParameters::bit_rate` is set (a positive
+`frame_rate` is then required — the per-frame budget derives from the
+§2 fps). Audio has no rate headroom by construction: the §4b IMA-ADPCM
+profile is format-fixed at 4 bits/sample plus the 8-byte block
+preamble, so AMV rate control is video-only.
 
 An **end-to-end encoder round-trip** (`tests/encode_roundtrip.rs`) proves
 the full loop the encoder was built for: a real `comedian.amv` is decoded,
@@ -310,11 +329,15 @@ itself is the in-crate `adpcm_amv` codec (`decode_audio_payload` /
 
 Three `cargo-fuzz` harnesses under [`fuzz/`](./fuzz/) drive every public
 byte parser, the full `open` + drain path, and the codec-level §4a/§4b
-decode + budgeted-encode round-trip for panic-free behaviour on
-arbitrary input. A Criterion suite under [`benches/`](./benches/) A/Bs
-the demux drain, index build, indexed-vs-linear seek, mux write, and
-rate-controlled encode hot paths, synthesising all inputs through the
-public API (no committed fixtures).
+decode (both chroma-upsampling filters) + budgeted-encode round-trip
+for panic-free behaviour on arbitrary input. The sweep has real teeth:
+it caught (and the crate then fixed, with regression tests) a hostile
+`decoded_sample_count` dword driving a multi-GiB preallocation and a
+divide-by-zero on hostile fps / sample-rate dwords above 10⁶. A
+Criterion suite under [`benches/`](./benches/) A/Bs the demux drain,
+index build, indexed-vs-linear seek, mux write, and rate-controlled
+encode hot paths, synthesising all inputs through the public API (no
+committed fixtures).
 
 ## Public API
 
