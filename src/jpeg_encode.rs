@@ -560,46 +560,51 @@ fn dc_only_blocks(blocks: &[[i32; 64]]) -> Vec<[i32; 64]> {
         .collect()
 }
 
-/// Exact entropy bit cost of coding a kept AC coefficient of magnitude
-/// category `size` after `run` zero-valued zig-zag positions: one ZRL
-/// code per full run of 16 zeros, then the Annex K `(run mod 16, size)`
-/// code plus `size` appended magnitude bits.
-#[inline]
-fn ac_coeff_bits(ac: &HuffEncTable, run: usize, size: u32) -> u32 {
-    let zrl = ac.len[0xF0] as u32;
-    (run / 16) as u32 * zrl + ac.len[((run % 16) << 4) | size as usize] as u32 + size
-}
-
-/// Lagrangian rate–distortion plan for one quantized block: choose the
-/// subset of nonzero AC coefficients to **keep** that minimizes
-/// `distortion + lambda · bits`, exactly, by dynamic programming.
+/// Lagrangian rate–distortion plan for one quantized block: for every
+/// nonzero AC coefficient choose to **keep it at full level**, **step
+/// its magnitude down** to a lower size-category boundary, or **drop
+/// it**, minimizing `distortion + lambda · bits` exactly by dynamic
+/// programming.
 ///
 /// The §4a device profile pins the quant tables in the *player*, so the
 /// only rate lever that keeps a payload decodable is choosing which
-/// quantized coefficients to spend bits on. For a given price-per-bit
-/// `lambda` this planner solves that choice optimally per block:
+/// quantized coefficients to spend bits on — and at what precision. For
+/// a given price-per-bit `lambda` this planner solves that choice
+/// optimally per block:
 ///
-/// * **Distortion** of dropping a coefficient of quantized level `q` at
-///   a position whose quantizer is `Q` is `(q·Q)²` — the squared
-///   dequantized magnitude. The 8×8 DCT is orthogonal (up to one fixed
-///   scale factor shared by every coefficient), so summed squared
-///   coefficient error *is* summed squared pixel error: this is true
-///   MSE weighting, not a heuristic frequency ramp.
+/// * **Distortion** of coding a coefficient of quantized level `q` at
+///   reduced magnitude `m` (0 for a drop) under quantizer `Q` is
+///   `((|q|−m)·Q)²` — the squared dequantized error. The 8×8 DCT is
+///   orthogonal (up to one fixed scale factor shared by every
+///   coefficient), so summed squared coefficient error *is* summed
+///   squared pixel error: true MSE weighting, not a heuristic
+///   frequency ramp.
 /// * **Rate** is the exact Annex K entropy cost, including the run/size
-///   coupling the coefficient's presence creates: dropping a
-///   coefficient lengthens the zero run of the next kept one (possibly
-///   across a ZRL boundary) and the last kept coefficient decides
-///   whether an EOB is emitted. The DP walks kept-coefficient pairs, so
-///   every ZRL/EOB interaction is priced exactly (only the whole-byte
-///   packing / stuffing granularity is outside the model).
+///   coupling a coefficient's presence creates: dropping one lengthens
+///   the zero run of the next kept one (possibly across a ZRL
+///   boundary), the last kept coefficient decides whether an EOB is
+///   emitted, and a stepped-down magnitude pays the (usually shorter)
+///   run/size code and appended bits of its smaller category. The DP
+///   walks kept-coefficient pairs, so every ZRL/EOB/size interaction is
+///   priced exactly (only the whole-byte packing / stuffing granularity
+///   is outside the model).
+///
+/// The step-down candidates for a level of magnitude category `s` are
+/// the category boundaries `2^{s'} − 1` for `s' < s` (the largest
+/// magnitude codable in `s'` bits) with the sign preserved — the
+/// candidate set every intermediate magnitude is dominated by: any `m`
+/// strictly inside a category costs that category's bits but more
+/// distortion than its boundary.
 ///
 /// The DP is over the (≤ 63) nonzero AC coefficients in zig-zag order:
 /// `dp[i]` = the cheapest plan for the block prefix in which `i` is the
-/// last kept coefficient, minimized over the previous kept coefficient
-/// (or none). Backtracking materializes the kept set into a copy of the
-/// block with the dropped levels zeroed; DC always survives. Larger
-/// `lambda` monotonically favours dropping more, which is what makes
-/// the budget bisection in [`entropy_encode_with_budget`] behave.
+/// last kept coefficient (at its best candidate magnitude for the
+/// arriving run), minimized over the previous kept coefficient (or
+/// none). Backtracking materializes the plan into a copy of the block
+/// with dropped levels zeroed and stepped-down levels replaced; DC
+/// always survives untouched. Larger `lambda` monotonically favours
+/// spending fewer bits, which is what makes the budget bisection in
+/// [`entropy_encode_with_budget`] behave.
 fn rd_optimize_block(q: &[i32; 64], quant: &[u8; 64], ac: &HuffEncTable, lambda: f64) -> [i32; 64] {
     // Collect the nonzero AC coefficients in zig-zag order.
     let mut zz_pos = [0u8; 63];
@@ -627,26 +632,79 @@ fn rd_optimize_block(q: &[i32; 64], quant: &[u8; 64], ac: &HuffEncTable, lambda:
         pre[i + 1] = pre[i] + d * d;
     }
 
+    // Candidate magnitudes per nonzero: the full level plus each lower
+    // size-category boundary, with the residual distortion of coding at
+    // that magnitude. `cand_mag[i][c]` pairs with `cand_dist[i][c]` and
+    // `cand_size[i][c]`; `cand_n[i]` counts them.
+    const MAX_CAND: usize = 11;
+    let mut cand_mag = [[0u32; MAX_CAND]; 63];
+    let mut cand_size = [[0u32; MAX_CAND]; 63];
+    let mut cand_dist = [[0f64; MAX_CAND]; 63];
+    let mut cand_n = [0usize; 63];
+    for i in 0..n {
+        let mag = lvl[i].unsigned_abs();
+        let size = magnitude_category(lvl[i]).0;
+        let qv = quant[nat[i] as usize] as f64;
+        cand_mag[i][0] = mag;
+        cand_size[i][0] = size;
+        cand_dist[i][0] = 0.0;
+        let mut c = 1usize;
+        for s in (1..size).rev() {
+            let m = (1u32 << s) - 1;
+            let err = (mag - m) as f64 * qv;
+            cand_mag[i][c] = m;
+            cand_size[i][c] = s;
+            cand_dist[i][c] = err * err;
+            c += 1;
+        }
+        cand_n[i] = c;
+    }
+
+    // Cheapest way to code nonzero `i` after `run` zeros: best candidate
+    // magnitude for that arriving run. Returns (cost, magnitude).
+    let code_after_run = |i: usize, run: usize| -> (f64, u32) {
+        let zrl_cost = lambda * ((run / 16) as u32 * ac.len[0xF0] as u32) as f64;
+        let rem = run % 16;
+        let mut best = f64::INFINITY;
+        let mut best_mag = cand_mag[i][0];
+        for c in 0..cand_n[i] {
+            let size = cand_size[i][c] as usize;
+            let bits = (ac.len[(rem << 4) | size] as usize + size) as f64;
+            let cost = cand_dist[i][c] + lambda * bits;
+            if cost < best {
+                best = cost;
+                best_mag = cand_mag[i][c];
+            }
+        }
+        (zrl_cost + best, best_mag)
+    };
+
     // dp[i]: cheapest cost over zig-zag positions 1..=zz(i) with nz `i`
-    // kept last; prev[i] backtracks the kept chain (-1 = none before).
+    // kept last; prev[i] backtracks the kept chain (-1 = none before);
+    // mag[i] the magnitude `i` is coded at on its best path.
     let mut dp = [0f64; 63];
     let mut prev = [-1i8; 63];
+    let mut mag = [0u32; 63];
     for i in 0..n {
-        let size = magnitude_category(lvl[i]).0;
         let zi = zz_pos[i] as usize;
         // Previous kept = none: every nonzero before `i` is dropped.
-        let mut best = pre[i] + lambda * ac_coeff_bits(ac, zi - 1, size) as f64;
+        let (cost, m) = code_after_run(i, zi - 1);
+        let mut best = pre[i] + cost;
         let mut best_j = -1i8;
+        let mut best_m = m;
         for j in 0..i {
             let run = zi - zz_pos[j] as usize - 1;
-            let c = dp[j] + (pre[i] - pre[j + 1]) + lambda * ac_coeff_bits(ac, run, size) as f64;
+            let (cost, m) = code_after_run(i, run);
+            let c = dp[j] + (pre[i] - pre[j + 1]) + cost;
             if c < best {
                 best = c;
                 best_j = j as i8;
+                best_m = m;
             }
         }
         dp[i] = best;
         prev[i] = best_j;
+        mag[i] = best_m;
     }
 
     // Close the block: either every nonzero is dropped (DC + EOB), or
@@ -662,13 +720,17 @@ fn rd_optimize_block(q: &[i32; 64], quant: &[u8; 64], ac: &HuffEncTable, lambda:
         }
     }
 
-    // Materialize the kept set.
+    // Materialize the plan.
     let mut out = [0i32; 64];
     out[0] = q[0];
     let mut i = best_end;
     while i >= 0 {
         let k = i as usize;
-        out[nat[k] as usize] = lvl[k];
+        out[nat[k] as usize] = if lvl[k] < 0 {
+            -(mag[k] as i32)
+        } else {
+            mag[k] as i32
+        };
         i = prev[k];
     }
     out
@@ -1341,35 +1403,56 @@ mod tests {
     }
 
     #[test]
-    fn rd_plan_only_zeroes_ac_coefficients_and_keeps_dc() {
-        // The plan may only turn nonzero ACs into zeros — never alter a
-        // level, never touch DC (the §4a fixed tables decode whatever
-        // levels we emit; correctness of the plan is that it is a
-        // *subset*, so every planned payload stays a faithful, lighter
-        // encode of the same frame).
+    fn rd_plan_only_attenuates_ac_coefficients_and_keeps_dc() {
+        // The plan may only *attenuate* nonzero ACs — drop them to zero
+        // or step their magnitude down (sign preserved) — never grow a
+        // level, flip a sign, invent a coefficient, or touch DC. (The
+        // §4a fixed tables decode whatever levels we emit; correctness
+        // of the plan is that every planned payload stays a faithful,
+        // lighter encode of the same frame.) A stepped-down magnitude
+        // must sit exactly on a lower size-category boundary `2^s − 1`
+        // (any other reduced magnitude is RD-dominated by a boundary).
         let (w, h) = (48u32, 48u32);
         let planes = prepare_planes_rgb(w, h, &textured_rgb(w, h)).expect("planes");
         let blocks = quantize_mcu_blocks(&planes);
         let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
         let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
         let mut plan = Vec::new();
-        rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, 50.0, &mut plan);
         let mut dropped = 0usize;
-        for (b, p) in blocks.iter().zip(&plan) {
-            assert_eq!(b[0], p[0], "DC must survive planning");
-            for k in 1..64 {
-                assert!(
-                    p[k] == b[k] || p[k] == 0,
-                    "planned level {} at {k} is neither original {} nor zero",
-                    p[k],
-                    b[k]
-                );
-                if p[k] == 0 && b[k] != 0 {
-                    dropped += 1;
+        let mut stepped = 0usize;
+        for lambda in [5.0f64, 50.0, 500.0] {
+            rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, lambda, &mut plan);
+            for (b, p) in blocks.iter().zip(&plan) {
+                assert_eq!(b[0], p[0], "DC must survive planning");
+                for k in 1..64 {
+                    if p[k] == b[k] {
+                        continue;
+                    }
+                    assert_ne!(b[k], 0, "planning must not invent coefficient {k}");
+                    if p[k] == 0 {
+                        dropped += 1;
+                        continue;
+                    }
+                    assert_eq!(
+                        p[k].signum(),
+                        b[k].signum(),
+                        "step-down must preserve sign at {k}"
+                    );
+                    let (pm, bm) = (p[k].unsigned_abs(), b[k].unsigned_abs());
+                    assert!(pm < bm, "planned |{pm}| must shrink from |{bm}| at {k}");
+                    assert!(
+                        (pm + 1).is_power_of_two(),
+                        "stepped-down magnitude {pm} must be a size-category boundary"
+                    );
+                    stepped += 1;
                 }
             }
         }
-        assert!(dropped > 0, "a binding λ must actually drop coefficients");
+        assert!(dropped > 0, "a binding λ must drop coefficients");
+        assert!(
+            stepped > 0,
+            "some λ on textured content must engage magnitude step-down"
+        );
     }
 
     #[test]

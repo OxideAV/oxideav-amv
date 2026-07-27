@@ -14,24 +14,28 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
   `max_payload_bytes`. The §4a device profile pins the quant / Huffman
   tables in the player, so the only rate lever that keeps the output
   decodable by the fixed tables is coefficient selection: each block
-  keeps the AC-coefficient subset minimizing `MSE + λ·bits` by an exact
+  plans every nonzero AC coefficient — keep at full level, **step its
+  magnitude down** to a lower size-category boundary (`2^s − 1`, sign
+  preserved), or drop it — minimizing `MSE + λ·bits` by an exact
   per-block Lagrangian rate–distortion dynamic program (distortion =
-  squared dequantized magnitude, which the DCT's orthogonality maps to
+  squared dequantized error, which the DCT's orthogonality maps to
   pixel-domain MSE; rate = the true Annex K entropy cost including
-  run/size coupling, ZRL splits and EOB placement), and the price `λ`
-  is bisected to the lightest plan that fits the budget. The DCT +
-  quantization run once per frame; each `λ` probe re-plans the blocks
-  and measures the exact payload size with an allocation-free counting
-  entropy walk (byte stuffing included — the count is exact, not an
-  estimate). A budget at or above the unconstrained size returns the
-  byte-identical unconstrained payload; a budget below the frame's
-  DC-only floor returns that floor with `within_budget == false` so
-  stream-level controllers can carry the debt. Every budgeted payload
-  remains a fully conforming §4a frame (strict-bind + decode covered by
-  unit tests; on real `comedian.amv` content at a binding 60 % target
-  the RD planner cut the worst sampled trim distortion from
-  MAE ≈ 6.9/channel — the earlier zig-zag dead-zone ramp — to
-  ≈ 4.9/channel at the same delivered rate).
+  run/size coupling, ZRL splits, EOB placement and the smaller
+  category's code + appended bits), and the price `λ` is bisected to
+  the lightest plan that fits the budget. The DCT + quantization run
+  once per frame; each `λ` probe re-plans the blocks and measures the
+  exact payload size with an allocation-free counting entropy walk
+  (byte stuffing included — the count is exact, not an estimate). A
+  budget at or above the unconstrained size returns the byte-identical
+  unconstrained payload; a budget below the frame's DC-only floor
+  returns that floor with `within_budget == false` so stream-level
+  controllers can carry the debt. Every budgeted payload remains a
+  fully conforming §4a frame (strict-bind + decode covered by unit
+  tests; on real `comedian.amv` content at a binding 60 % target the
+  RD planner cut the worst sampled trim distortion from
+  MAE ≈ 6.9/channel — the earlier zig-zag dead-zone ramp — to ≈ 4.9
+  with keep/drop planning and ≈ 4.7 with magnitude step-down, at the
+  same delivered rate).
 
 - **`AmvRateController`** — stream-level video rate control: turns a
   target payload bitrate (`from_video_bitrate(bits_per_sec, fps)`) or a
