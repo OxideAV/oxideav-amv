@@ -505,6 +505,33 @@ fn ycbcr_to_rgb(y: f32, cb: f32, cr: f32) -> [u8; 3] {
     ]
 }
 
+/// How the half-resolution 4:2:0 chroma planes are brought back to luma
+/// resolution for the RGB conversion in [`decode_frame_with`].
+///
+/// The §4a device profile fixes everything *on the wire* (tables,
+/// sampling, scan) but says nothing about the display-side interpolation
+/// filter — that choice is not a bitstream property, so any filter
+/// decodes the same stream; it only changes how smooth the reconstructed
+/// chroma field looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum ChromaUpsample {
+    /// Pixel-replicate each chroma sample over its 2×2 luma quad — the
+    /// cheapest filter and the historic behaviour of [`decode_frame`].
+    #[default]
+    Nearest,
+    /// Centered separable triangle (linear-interpolation) filter. A
+    /// 4:2:0 chroma sample covers a 2×2 luma quad, so its center sits at
+    /// luma coordinate `2i + 0.5`; a luma pixel is therefore 1/4 or 3/4
+    /// of the way between two adjacent chroma centers, giving per-axis
+    /// weights 3/4:1/4 (2-D: 9/3/3/1 over 16, exact integer
+    /// arithmetic). Neighbours clamp at the visible plane edges, never
+    /// reading MCU padding. Smoother chroma edges than `Nearest` and
+    /// measurably closer to a reference JPEG decode of the
+    /// reconstructed stream (see `tests/decode_to_pixels.rs`).
+    Triangle,
+}
+
 /// Decode a §4a-bound AMV video frame to an upright RGB [`DecodedFrame`].
 ///
 /// Performs the full baseline-JPEG decode of the bare entropy window
@@ -512,21 +539,75 @@ fn ycbcr_to_rgb(y: f32, cb: f32, cr: f32) -> [u8; 3] {
 /// baseline single scan), upsamples chroma by nearest-neighbour (2×),
 /// converts YCbCr→RGB (BT.601 / JFIF), crops to the §2 `amvh` geometry,
 /// and applies the §4a bottom-up vertical flip so the result is upright.
+///
+/// Equivalent to [`decode_frame_with`] at [`ChromaUpsample::Nearest`];
+/// use that entry point to pick the smoother triangle chroma filter.
 pub fn decode_frame(frame: &AmvVideoFrame<'_>) -> Result<DecodedFrame, AmvDemuxerError> {
+    decode_frame_with(frame, ChromaUpsample::Nearest)
+}
+
+/// [`decode_frame`] with an explicit chroma-upsampling filter (see
+/// [`ChromaUpsample`]). The entropy decode, crop and §4a bottom-up flip
+/// are identical across filters; only the chroma interpolation feeding
+/// the YCbCr→RGB conversion differs.
+pub fn decode_frame_with(
+    frame: &AmvVideoFrame<'_>,
+    upsample: ChromaUpsample,
+) -> Result<DecodedFrame, AmvDemuxerError> {
     let width = frame.width() as usize;
     let height = frame.height() as usize;
     let (yp, cbp, crp) = decode_planes(frame.entropy_coded(), width, height)?;
+
+    // Highest visible chroma index (exclusive of MCU padding): the
+    // triangle filter clamps its outer taps here so interpolation never
+    // reads pad samples.
+    let cx_max = width.div_ceil(2) - 1;
+    let cy_max = height.div_ceil(2) - 1;
 
     let mut rgb = vec![0u8; width * height * 3];
     for y in 0..height {
         for x in 0..width {
             let yv = yp.samples[y * yp.width + x] as f32;
-            // 4:2:0: chroma sampled at half resolution, nearest-neighbour
-            // upsample.
-            let cx = x / 2;
-            let cy = y / 2;
-            let cb = cbp.samples[cy * cbp.width + cx] as f32;
-            let cr = crp.samples[cy * crp.width + cx] as f32;
+            let (cb, cr) = match upsample {
+                ChromaUpsample::Nearest => {
+                    // Chroma sampled at half resolution; replicate over
+                    // the 2×2 quad.
+                    let cx = x / 2;
+                    let cy = y / 2;
+                    (
+                        cbp.samples[cy * cbp.width + cx] as f32,
+                        crp.samples[cy * crp.width + cx] as f32,
+                    )
+                }
+                ChromaUpsample::Triangle => {
+                    // Centered siting: chroma sample i spans luma 2i /
+                    // 2i+1, center at 2i + 0.5. The even luma pixel of a
+                    // quad leans 3/4 toward its own sample and 1/4
+                    // toward the previous; the odd pixel mirrors that
+                    // toward the next. Separable ⇒ 2-D weights 9/3/3/1.
+                    let cx0 = x / 2;
+                    let cy0 = y / 2;
+                    let cx1 = if x % 2 == 0 {
+                        cx0.saturating_sub(1)
+                    } else {
+                        (cx0 + 1).min(cx_max)
+                    };
+                    let cy1 = if y % 2 == 0 {
+                        cy0.saturating_sub(1)
+                    } else {
+                        (cy0 + 1).min(cy_max)
+                    };
+                    let tap = |p: &Plane, cx: usize, cy: usize| p.samples[cy * p.width + cx] as u32;
+                    let blend = |p: &Plane| {
+                        let s = 9 * tap(p, cx0, cy0)
+                            + 3 * tap(p, cx1, cy0)
+                            + 3 * tap(p, cx0, cy1)
+                            + tap(p, cx1, cy1);
+                        ((s + 8) >> 4) as f32
+                    };
+                    (blend(&cbp), blend(&crp))
+                }
+            };
             let [r, g, b] = ycbcr_to_rgb(yv, cb, cr);
             let k = (y * width + x) * 3;
             rgb[k] = r;
@@ -555,6 +636,17 @@ pub fn decode_frame_from_payload(
 ) -> Result<DecodedFrame, AmvDemuxerError> {
     let frame = AmvVideoFrame::bind_strict(header, payload)?;
     decode_frame(&frame)
+}
+
+/// [`decode_frame_from_payload`] with an explicit chroma-upsampling
+/// filter — the one-call convenience for [`decode_frame_with`].
+pub fn decode_frame_from_payload_with(
+    header: &AmvHeader,
+    payload: &[u8],
+    upsample: ChromaUpsample,
+) -> Result<DecodedFrame, AmvDemuxerError> {
+    let frame = AmvVideoFrame::bind_strict(header, payload)?;
+    decode_frame_with(&frame, upsample)
 }
 
 /// A decoded AMV video frame in native planar **YUV420P** — the §4a
@@ -899,6 +991,37 @@ mod tests {
         w.put(ec, el);
     }
 
+    /// Annex K chroma-DC Huffman code (K.4) for magnitude category
+    /// `size`: canonical assignment from `BITS = [0,3,1,1,…]` — sizes
+    /// 0–2 are the three length-2 codes `00`/`01`/`10`, and each size
+    /// `s ≥ 3` is the all-ones-then-zero code of length `s`
+    /// (`110`, `1110`, …, value `2^s − 2`).
+    fn dc_chroma_code(size: u32) -> (u32, u32) {
+        if size <= 2 {
+            (size, 2)
+        } else {
+            ((1u32 << size) - 2, size)
+        }
+    }
+
+    /// Emit one DC-only chroma block carrying positive DC *difference*
+    /// `diff` (AC part is a single EOB), mirroring
+    /// [`emit_luma_dc_block`] on the chroma tables.
+    fn emit_chroma_dc_block(w: &mut BitWriter, diff: u32) {
+        let size = if diff == 0 {
+            0
+        } else {
+            32 - diff.leading_zeros()
+        };
+        let (c, l) = dc_chroma_code(size);
+        w.put(c, l);
+        if size > 0 {
+            w.put(diff, size);
+        }
+        let (ec, el) = ac_eob_chroma();
+        w.put(ec, el);
+    }
+
     /// Build a bare AMV `00dc` payload (SOI + stuffed entropy + EOI)
     /// whose decode is a uniform luma plane: the running luma DC
     /// predictor is bumped to `+1` on the very first block and held there
@@ -1051,6 +1174,110 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Build a payload with **uniform luma** (single +1 DC bump) and a
+    /// **per-MCU Cb ramp** (+8 per MCU, Cr flat): every 8×8 chroma tile
+    /// of the Cb plane is a flat plateau 17 dequant levels above its
+    /// predecessor — a step field for exercising the chroma upsampling
+    /// filters across tile boundaries.
+    fn synth_cb_tile_ramp_payload(mcus: usize) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        let mut first = true;
+        for _ in 0..mcus {
+            for _ in 0..4 {
+                emit_luma_dc_block(&mut w, if first { 1 } else { 0 });
+                first = false;
+            }
+            emit_chroma_dc_block(&mut w, 8); // Cb: +8 per MCU
+            emit_chroma_zero_block(&mut w); // Cr flat
+        }
+        let entropy = w.finish();
+        let mut body = vec![0xFF, 0xD8];
+        body.extend_from_slice(&entropy);
+        body.extend_from_slice(&[0xFF, 0xD9]);
+        body
+    }
+
+    #[test]
+    fn triangle_upsample_equals_nearest_on_uniform_chroma() {
+        // A linear interpolation of a constant field is that constant:
+        // on uniform-chroma content the two filters must agree
+        // byte-for-byte, at mod-16 and non-mod-16 geometry (the clamped
+        // edge taps and the visible-extent bound are exercised at every
+        // border pixel).
+        for (w, h) in [(16u32, 16u32), (17, 17), (33, 9), (20, 12), (1, 1)] {
+            let mcus = (w.div_ceil(16) * h.div_ceil(16)) as usize;
+            let payload = synth_uniform_payload(mcus);
+            let hd = header_wh(w, h);
+            let near = decode_frame_from_payload_with(&hd, &payload, ChromaUpsample::Nearest)
+                .expect("nearest decodes");
+            let tri = decode_frame_from_payload_with(&hd, &payload, ChromaUpsample::Triangle)
+                .expect("triangle decodes");
+            assert_eq!(
+                near.rgb, tri.rgb,
+                "{w}×{h}: filters must agree on uniform chroma"
+            );
+        }
+    }
+
+    #[test]
+    fn triangle_upsample_blends_chroma_tile_boundaries_with_quarter_weights() {
+        // Two flat Cb plateaus meeting at a chroma-tile boundary: the
+        // triangle filter must (a) leave every pixel whose both taps
+        // fall inside one plateau identical to nearest, and (b) blend
+        // the two boundary-adjacent pixels at exactly 3/4 : 1/4 toward
+        // their own plateau (checked through the linear YCbCr→RGB map
+        // with ±2 for the two rounding stages). Run once with a
+        // horizontal chroma step (32×16, 2 MCU columns) and once with a
+        // vertical step (16×32, 2 MCU rows — the §4a bottom-up flip is
+        // in play on this axis).
+        for (w, h, horiz) in [(32u32, 16u32, true), (16, 32, false)] {
+            let mcus = (w.div_ceil(16) * h.div_ceil(16)) as usize;
+            assert_eq!(mcus, 2);
+            let payload = synth_cb_tile_ramp_payload(mcus);
+            let hd = header_wh(w, h);
+            let near = decode_frame_from_payload_with(&hd, &payload, ChromaUpsample::Nearest)
+                .expect("nearest decodes");
+            let tri = decode_frame_from_payload_with(&hd, &payload, ChromaUpsample::Triangle)
+                .expect("triangle decodes");
+            let px = |f: &DecodedFrame, x: u32, y: u32, c: usize| {
+                f.rgb[((y * w + x) * 3) as usize + c] as f64
+            };
+            let mut boundary_pixels = 0u32;
+            for y in 0..h {
+                for x in 0..w {
+                    let t = if horiz { x } else { y };
+                    if t == 15 || t == 16 {
+                        // Boundary pixel: one tap in each plateau.
+                        boundary_pixels += 1;
+                        let (qx, qy) = if horiz {
+                            (if x == 15 { 16 } else { 15 }, y)
+                        } else {
+                            (x, if y == 15 { 16 } else { 15 })
+                        };
+                        for c in 0..3 {
+                            let want = 0.75 * px(&near, x, y, c) + 0.25 * px(&near, qx, qy, c);
+                            let got = px(&tri, x, y, c);
+                            assert!(
+                                (got - want).abs() <= 2.0,
+                                "{w}×{h} ({x},{y}) ch{c}: triangle {got} vs 3/4:1/4 blend {want}"
+                            );
+                        }
+                    } else {
+                        // Interior pixel: both taps in one plateau.
+                        for c in 0..3 {
+                            assert_eq!(
+                                px(&tri, x, y, c),
+                                px(&near, x, y, c),
+                                "{w}×{h} ({x},{y}) ch{c}: interior pixels must match nearest"
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(boundary_pixels, 2 * if horiz { h } else { w });
         }
     }
 

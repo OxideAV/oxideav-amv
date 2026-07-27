@@ -115,8 +115,9 @@ pub use codec_video::{
 };
 pub use demuxer::{AmvDemuxer, AmvDemuxerError, ChunkIndexEntry};
 pub use jpeg_decode::{
-    decode_frame, decode_frame_from_payload, decode_frame_yuv420p,
-    decode_frame_yuv420p_from_payload, DecodedFrame, DecodedYuv420p,
+    decode_frame, decode_frame_from_payload, decode_frame_from_payload_with, decode_frame_with,
+    decode_frame_yuv420p, decode_frame_yuv420p_from_payload, ChromaUpsample, DecodedFrame,
+    DecodedYuv420p,
 };
 pub use jpeg_encode::{
     encode_frame, encode_frame_rgb, encode_frame_rgb_with_budget, encode_frame_yuv420p,

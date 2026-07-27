@@ -346,6 +346,18 @@ impl AmvDemuxer {
     /// (stream index `0`), or surfaces the decode error for a malformed
     /// payload (missing SOI/EOI bracket, internal markers, zero geometry).
     pub fn decode_video_packet(&self, packet: &Packet) -> Result<crate::DecodedFrame> {
+        self.decode_video_packet_with(packet, crate::ChromaUpsample::Nearest)
+    }
+
+    /// [`decode_video_packet`](Self::decode_video_packet) with an
+    /// explicit chroma-upsampling filter (see [`crate::ChromaUpsample`]
+    /// — `Triangle` reconstructs a smoother chroma field than the
+    /// nearest-neighbour default).
+    pub fn decode_video_packet_with(
+        &self,
+        packet: &Packet,
+        upsample: crate::ChromaUpsample,
+    ) -> Result<crate::DecodedFrame> {
         if packet.stream_index != STREAM_INDEX_VIDEO {
             return Err(Error::invalid(format!(
                 "amv: decode_video_packet expects a video packet (stream {STREAM_INDEX_VIDEO}), \
@@ -353,7 +365,8 @@ impl AmvDemuxer {
                 packet.stream_index
             )));
         }
-        crate::decode_frame_from_payload(&self.header, &packet.data).map_err(Error::from)
+        crate::decode_frame_from_payload_with(&self.header, &packet.data, upsample)
+            .map_err(Error::from)
     }
 
     /// Decode an audio [`Packet`] emitted by this demuxer straight to

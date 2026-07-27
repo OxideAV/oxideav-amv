@@ -20,10 +20,12 @@
 //!    [`oxideav_amv::AmvDemuxer::decode_video_packet`]) — the crate's
 //!    own baseline-JPEG decoder over the §4a device profile, producing
 //!    upright RGB with no external binary. The two paths are cross-checked
-//!    pixel-for-pixel: the in-crate decode matches the reference within a
-//!    few levels per channel (MAE ≈ 1.35), the residual being the
-//!    reference's integer fast-IDCT + fancy upsampling vs the in-crate
-//!    float IDCT + nearest upsample.
+//!    pixel-for-pixel: the default nearest-upsample decode matches the
+//!    reference within a few levels per channel (MAE ≈ 1.35), and the
+//!    [`oxideav_amv::ChromaUpsample::Triangle`] decode within
+//!    MAE ≈ 0.04–0.05/channel — the residual there being only integer
+//!    fast-IDCT rounding, since the centered triangle filter reconstructs
+//!    the same smooth chroma field the reference does.
 //!
 //! No decoder *source* is read — the black-box binary is an opaque
 //! process. The reference-comparison tests skip when no JPEG decoder
@@ -455,6 +457,66 @@ fn in_crate_decoder_matches_blackbox_reference_on_real_frames() {
     }
 }
 
+/// The [`oxideav_amv::ChromaUpsample::Triangle`] decode tracks the
+/// black-box reference **closer** than the nearest-neighbour default on
+/// every tested real frame: the reference applies a smooth (triangle)
+/// chroma reconstruction, so the residual of the nearest decode is
+/// dominated by exactly the chroma-edge replication the triangle filter
+/// removes. Measured MAE must strictly improve per frame — and by a
+/// meaningful margin in aggregate — while the luma path stays byte-shared
+/// (the two in-crate decodes may differ only where chroma varies).
+#[test]
+fn triangle_upsample_tracks_reference_closer_than_nearest() {
+    use oxideav_amv::{decode_frame_from_payload_with, ChromaUpsample};
+
+    let Some(path) = comedian_fixture() else {
+        eprintln!("skipping triangle vs reference: comedian.amv not staged");
+        return;
+    };
+    let Some(dec) = find_decoder() else {
+        eprintln!("skipping triangle vs reference: no djpeg/magick on PATH");
+        return;
+    };
+
+    let (header, payloads) = raw_video_payloads(&path);
+    let (_h2, jpegs) = reconstruct_first_frames(&path, 3);
+
+    let mut mae_near_sum = 0f64;
+    let mut mae_tri_sum = 0f64;
+    for i in 0..3 {
+        let near = decode_frame_from_payload_with(&header, &payloads[i], ChromaUpsample::Nearest)
+            .expect("nearest decodes");
+        let tri = decode_frame_from_payload_with(&header, &payloads[i], ChromaUpsample::Triangle)
+            .expect("triangle decodes");
+
+        let reference = decode_to_raster(dec, &jpegs[i])
+            .unwrap_or_else(|e| panic!("frame {i} reference decode failed: {e}"));
+        let bpr = reference.width * 3;
+        let mut ref_upright = reference.rgb.clone();
+        oxideav_amv::flip_rows_vertical(&mut ref_upright, reference.height, bpr);
+
+        let mae_near = rgb_mae(&near.rgb, &ref_upright);
+        let mae_tri = rgb_mae(&tri.rgb, &ref_upright);
+        eprintln!(
+            "frame {i}: MAE vs reference — nearest {mae_near:.3}, triangle {mae_tri:.3}/channel"
+        );
+        assert!(
+            mae_tri < mae_near,
+            "frame {i}: triangle ({mae_tri:.3}) must track the reference closer than \
+             nearest ({mae_near:.3})"
+        );
+        mae_near_sum += mae_near;
+        mae_tri_sum += mae_tri;
+    }
+    // Aggregate: the triangle residual (integer fast-IDCT rounding only)
+    // must be meaningfully below the nearest residual (IDCT rounding +
+    // chroma replication error).
+    assert!(
+        mae_tri_sum < mae_near_sum * 0.8,
+        "triangle aggregate MAE {mae_tri_sum:.3} not meaningfully below nearest {mae_near_sum:.3}"
+    );
+}
+
 /// The in-crate decoder runs over **every** video frame of the fixture
 /// with no external binary, producing a correctly-sized, coherent,
 /// keyframe-stable raster for each — proving the §4a fixed-table profile
@@ -546,6 +608,20 @@ fn demuxer_decode_video_packet_yields_pixels() {
             let frame = demuxer
                 .decode_video_packet(&pkt)
                 .expect("first video packet decodes to pixels");
+            // The filter-selecting variant agrees with the free
+            // function on both filters.
+            for ups in [
+                oxideav_amv::ChromaUpsample::Nearest,
+                oxideav_amv::ChromaUpsample::Triangle,
+            ] {
+                let via_demuxer = demuxer
+                    .decode_video_packet_with(&pkt, ups)
+                    .expect("filtered decode");
+                let via_free =
+                    oxideav_amv::decode_frame_from_payload_with(demuxer.header(), &pkt.data, ups)
+                        .expect("free-function decode");
+                assert_eq!(via_demuxer.rgb, via_free.rgb, "{ups:?} paths must agree");
+            }
             decoded = Some(frame);
             break;
         }

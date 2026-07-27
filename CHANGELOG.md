@@ -8,6 +8,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Selectable chroma upsampling for the RGB decode** —
+  `ChromaUpsample::{Nearest, Triangle}` with the new entry points
+  `decode_frame_with`, `decode_frame_from_payload_with` and
+  `AmvDemuxer::decode_video_packet_with` (the existing `decode_frame`
+  family keeps the nearest-neighbour default, so all fixed-point
+  invariants are unchanged). The §4a device profile fixes everything on
+  the wire but not the display-side interpolation filter; the new
+  `Triangle` option is the centered separable triangle filter derived
+  from 4:2:0 siting geometry (a chroma sample's center sits at luma
+  `2i + 0.5`, giving per-axis weights 3/4 : 1/4, 2-D 9/3/3/1 in exact
+  integer arithmetic, edge taps clamped to the visible plane so MCU
+  padding is never read). Measured against the black-box reference
+  decode of real `comedian.amv` frames the triangle decode lands at
+  **MAE ≈ 0.04–0.05/channel** (nearest: ≈ 1.35) — the residual is
+  reference integer fast-IDCT rounding only. Unit tests pin
+  filter equality on uniform chroma across geometries and the exact
+  3/4 : 1/4 blend at chroma-tile boundaries on both axes (the vertical
+  case with the §4a bottom-up flip in play).
+
 - **Rate-controlled video frame encode** — `encode_frame_rgb_with_budget`
   / `encode_frame_yuv420p_with_budget` (returning the new
   `BudgetedFrame`) encode a frame into a bare `00dc` payload of at most
