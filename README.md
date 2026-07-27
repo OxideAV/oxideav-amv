@@ -271,8 +271,10 @@ run once per frame, each probe re-plans and measures the exact payload
 size with an allocation-free counting entropy walk (byte stuffing
 included), and only the winning plan is materialized (see
 `benches/rate_control_encode.rs`; a 128×96 unconstrained encode
-measures ≈ 80 µs and a fully binding budgeted encode ≈ 2.4–2.9 ms — a
-few percent of the 83 ms frame interval of the §2 12 fps profile). A
+measures ≈ 80 µs, a cold fully binding budgeted encode ≈ 2.4–2.9 ms,
+and the streaming steady state ≈ 255 µs — the registry encoder carries
+a **λ warm start** across frames, collapsing the search to a probe or
+two on near-identical consecutive content). A
 budget at or above the unconstrained size returns the byte-identical
 unconstrained payload; a budget below the frame's DC-only floor returns
 that floor with `within_budget == false` instead of failing. Every
