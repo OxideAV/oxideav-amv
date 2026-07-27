@@ -499,15 +499,37 @@ fn quantize_mcu_blocks(p: &PreparedPlanes) -> Vec<[i32; 64]> {
     blocks
 }
 
+/// The four Annex K Huffman encode tables, built once and shared by
+/// every entropy walk / RD plan of a frame encode (the budget search
+/// runs many walks per frame).
+struct EncTables {
+    dc_luma: HuffEncTable,
+    ac_luma: HuffEncTable,
+    dc_chroma: HuffEncTable,
+    ac_chroma: HuffEncTable,
+}
+
+impl EncTables {
+    fn build() -> Self {
+        EncTables {
+            dc_luma: HuffEncTable::build(&DC_LUMA_BITS, &DC_LUMA_VALS),
+            ac_luma: HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS),
+            dc_chroma: HuffEncTable::build(&DC_CHROMA_BITS, &DC_CHROMA_VALS),
+            ac_chroma: HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS),
+        }
+    }
+}
+
 /// Drive the interleaved-MCU entropy walk into `sink`. Shared core of
 /// the materializing encode ([`entropy_encode_blocks`]) and the
 /// exact-size probe ([`entropy_encoded_size`]).
-fn entropy_encode_into<S: EntropySink>(blocks: &[[i32; 64]], sink: S) -> S {
-    // Build the four Annex K Huffman encode tables once.
-    let dc_luma = HuffEncTable::build(&DC_LUMA_BITS, &DC_LUMA_VALS);
-    let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
-    let dc_chroma = HuffEncTable::build(&DC_CHROMA_BITS, &DC_CHROMA_VALS);
-    let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
+fn entropy_encode_into<S: EntropySink>(blocks: &[[i32; 64]], t: &EncTables, sink: S) -> S {
+    let EncTables {
+        dc_luma,
+        ac_luma,
+        dc_chroma,
+        ac_chroma,
+    } = t;
 
     let mut bw = BitWriter::with_sink(sink);
     let mut pred_y = 0i32;
@@ -516,17 +538,24 @@ fn entropy_encode_into<S: EntropySink>(blocks: &[[i32; 64]], sink: S) -> S {
 
     for mcu in blocks.chunks_exact(6) {
         for luma in &mcu[..4] {
-            encode_block(&mut bw, luma, &dc_luma, &ac_luma, &mut pred_y);
+            encode_block(&mut bw, luma, dc_luma, ac_luma, &mut pred_y);
         }
-        encode_block(&mut bw, &mcu[4], &dc_chroma, &ac_chroma, &mut pred_cb);
-        encode_block(&mut bw, &mcu[5], &dc_chroma, &ac_chroma, &mut pred_cr);
+        encode_block(&mut bw, &mcu[4], dc_chroma, ac_chroma, &mut pred_cb);
+        encode_block(&mut bw, &mcu[5], dc_chroma, ac_chroma, &mut pred_cr);
     }
     bw.finish()
 }
 
 fn entropy_encode_blocks(blocks: &[[i32; 64]], mcus_x: usize, mcus_y: usize) -> Vec<u8> {
     debug_assert_eq!(blocks.len(), mcus_x * mcus_y * 6);
-    let entropy = entropy_encode_into(blocks, VecSink(Vec::new())).0;
+    entropy_encode_blocks_with(blocks, &EncTables::build())
+}
+
+/// [`entropy_encode_blocks`] with caller-provided prebuilt tables (the
+/// budget search materializes its winning plan without rebuilding
+/// them).
+fn entropy_encode_blocks_with(blocks: &[[i32; 64]], t: &EncTables) -> Vec<u8> {
+    let entropy = entropy_encode_into(blocks, t, VecSink(Vec::new())).0;
     let mut payload = Vec::with_capacity(entropy.len() + 4);
     payload.extend_from_slice(&[0xFF, 0xD8]); // SOI
     payload.extend_from_slice(&entropy);
@@ -538,8 +567,8 @@ fn entropy_encode_blocks(blocks: &[[i32; 64]], mcus_x: usize, mcus_y: usize) -> 
 /// produce for `blocks` — the full stuffed entropy walk (stuffing
 /// depends on actual byte values, so the walk is identical) plus the 4
 /// SOI/EOI marker bytes — without allocating the payload.
-fn entropy_encoded_size(blocks: &[[i32; 64]]) -> usize {
-    entropy_encode_into(blocks, CountSink(0)).0 + 4
+fn entropy_encoded_size(blocks: &[[i32; 64]], t: &EncTables) -> usize {
+    entropy_encode_into(blocks, t, CountSink(0)).0 + 4
 }
 
 // ---------------------------------------------------------------------
@@ -741,19 +770,13 @@ fn rd_optimize_block(q: &[i32; 64], quant: &[u8; 64], ac: &HuffEncTable, lambda:
 /// Block interleave per MCU is 4 luma + Cb + Cr (§4a 4:2:0), so blocks
 /// `idx % 6 < 4` price against the luma tables and the rest against the
 /// chroma tables.
-fn rd_plan_blocks(
-    blocks: &[[i32; 64]],
-    ac_luma: &HuffEncTable,
-    ac_chroma: &HuffEncTable,
-    lambda: f64,
-    out: &mut Vec<[i32; 64]>,
-) {
+fn rd_plan_blocks(blocks: &[[i32; 64]], t: &EncTables, lambda: f64, out: &mut Vec<[i32; 64]>) {
     out.clear();
     out.extend(blocks.iter().enumerate().map(|(idx, b)| {
         if idx % 6 < 4 {
-            rd_optimize_block(b, &QUANT_LUMA, ac_luma, lambda)
+            rd_optimize_block(b, &QUANT_LUMA, &t.ac_luma, lambda)
         } else {
-            rd_optimize_block(b, &QUANT_CHROMA, ac_chroma, lambda)
+            rd_optimize_block(b, &QUANT_CHROMA, &t.ac_chroma, lambda)
         }
     }));
 }
@@ -793,58 +816,67 @@ fn entropy_encode_with_budget(
     mcus_y: usize,
     max_payload_bytes: usize,
 ) -> BudgetedFrame {
-    if entropy_encoded_size(blocks) <= max_payload_bytes {
+    debug_assert_eq!(blocks.len(), mcus_x * mcus_y * 6);
+    let tables = EncTables::build();
+    if entropy_encoded_size(blocks, &tables) <= max_payload_bytes {
         return BudgetedFrame {
-            payload: entropy_encode_blocks(blocks, mcus_x, mcus_y),
+            payload: entropy_encode_blocks_with(blocks, &tables),
             within_budget: true,
         };
     }
     let floor = dc_only_blocks(blocks);
-    if entropy_encoded_size(&floor) > max_payload_bytes {
+    if entropy_encoded_size(&floor, &tables) > max_payload_bytes {
         return BudgetedFrame {
-            payload: entropy_encode_blocks(&floor, mcus_x, mcus_y),
+            payload: entropy_encode_blocks_with(&floor, &tables),
             within_budget: false,
         };
     }
 
-    let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
-    let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
-
     // Bracket: grow λ geometrically until the plan fits. λ = distortion
     // per bit; the largest useful price is bounded by the largest
     // single-coefficient distortion (≤ (2048)² — the DCT magnitude
-    // bound — over ≥ 2 bits), so the ×8 ladder from 1 reaches a fitting
-    // λ within ~8 steps on any input; the DC-only floor (which fits,
-    // checked above) is the safety net.
+    // bound — over ≥ 2 bits), so the ×16 ladder from 1 reaches a
+    // fitting λ within ~6 steps on any input; the DC-only floor (which
+    // fits, checked above) is the safety net.
     let mut plan = Vec::with_capacity(blocks.len());
     let mut best: Option<Vec<[i32; 64]>> = None;
+    let mut best_size = 0usize;
     let mut lo = 0.0f64;
     let mut hi = 1.0f64;
     for _ in 0..24 {
-        rd_plan_blocks(blocks, &ac_luma, &ac_chroma, hi, &mut plan);
-        if entropy_encoded_size(&plan) <= max_payload_bytes {
+        rd_plan_blocks(blocks, &tables, hi, &mut plan);
+        let size = entropy_encoded_size(&plan, &tables);
+        if size <= max_payload_bytes {
             best = Some(plan.clone());
+            best_size = size;
             break;
         }
         lo = hi;
-        hi *= 8.0;
+        hi *= 16.0;
     }
     let mut best = best.unwrap_or(floor);
 
-    // Bisect λ down to the lightest plan that still fits. Invariant:
-    // `hi` produced `best` (measured to fit), `lo` did not fit.
-    for _ in 0..16 {
+    // Bisect λ down to the lightest plan that still fits, stopping
+    // early once the kept plan uses ≥ 99.5 % of the budget (further λ
+    // resolution cannot buy a visible quality step at that point).
+    // Invariant: `hi` produced `best` (measured to fit), `lo` did not.
+    for _ in 0..12 {
+        if best_size * 1000 >= max_payload_bytes * 995 {
+            break;
+        }
         let mid = 0.5 * (lo + hi);
-        rd_plan_blocks(blocks, &ac_luma, &ac_chroma, mid, &mut plan);
-        if entropy_encoded_size(&plan) <= max_payload_bytes {
+        rd_plan_blocks(blocks, &tables, mid, &mut plan);
+        let size = entropy_encoded_size(&plan, &tables);
+        if size <= max_payload_bytes {
             hi = mid;
+            best_size = size;
             std::mem::swap(&mut best, &mut plan);
         } else {
             lo = mid;
         }
     }
 
-    let payload = entropy_encode_blocks(&best, mcus_x, mcus_y);
+    let payload = entropy_encode_blocks_with(&best, &tables);
     debug_assert!(payload.len() <= max_payload_bytes);
     BudgetedFrame {
         payload,
@@ -1348,8 +1380,7 @@ mod tests {
         // materializing walk across RD plans, geometries and contents
         // (flat content exercises the EOB-heavy path, textured content
         // the stuffing path).
-        let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
-        let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
+        let tables = EncTables::build();
         for (w, h) in [(64u32, 48u32), (17, 17), (16, 16)] {
             let planes_t = prepare_planes_rgb(w, h, &textured_rgb(w, h)).expect("planes");
             let flat = vec![200u8; (w * h * 3) as usize];
@@ -1359,13 +1390,13 @@ mod tests {
                 let mut candidates = vec![blocks.clone(), dc_only_blocks(&blocks)];
                 for lambda in [0.5f64, 8.0, 200.0, 1e6] {
                     let mut plan = Vec::new();
-                    rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, lambda, &mut plan);
+                    rd_plan_blocks(&blocks, &tables, lambda, &mut plan);
                     candidates.push(plan);
                 }
                 for (ci, cand) in candidates.iter().enumerate() {
                     let bytes = entropy_encode_blocks(cand, planes.mcus_x, planes.mcus_y);
                     assert_eq!(
-                        entropy_encoded_size(cand),
+                        entropy_encoded_size(cand, &tables),
                         bytes.len(),
                         "counting probe diverged at {w}x{h} candidate {ci}"
                     );
@@ -1381,24 +1412,23 @@ mod tests {
         let (w, h) = (64u32, 48u32);
         let planes = prepare_planes_rgb(w, h, &textured_rgb(w, h)).expect("planes");
         let blocks = quantize_mcu_blocks(&planes);
-        let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
-        let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
+        let tables = EncTables::build();
 
-        let full = entropy_encoded_size(&blocks);
-        let floor = entropy_encoded_size(&dc_only_blocks(&blocks));
+        let full = entropy_encoded_size(&blocks, &tables);
+        let floor = entropy_encoded_size(&dc_only_blocks(&blocks), &tables);
         let mut last = usize::MAX;
         let mut plan = Vec::new();
         for lambda in [0.0f64, 1.0, 10.0, 100.0, 1e3, 1e5, 1e9] {
-            rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, lambda, &mut plan);
-            let size = entropy_encoded_size(&plan);
+            rd_plan_blocks(&blocks, &tables, lambda, &mut plan);
+            let size = entropy_encoded_size(&plan, &tables);
             assert!(size <= last, "λ={lambda}: size {size} grew past {last}");
             assert!((floor..=full).contains(&size));
             last = size;
         }
         // λ = 0 keeps everything; a huge λ is the DC-only floor.
-        rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, 0.0, &mut plan);
+        rd_plan_blocks(&blocks, &tables, 0.0, &mut plan);
         assert_eq!(plan, blocks);
-        rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, 1e12, &mut plan);
+        rd_plan_blocks(&blocks, &tables, 1e12, &mut plan);
         assert_eq!(plan, dc_only_blocks(&blocks));
     }
 
@@ -1415,13 +1445,12 @@ mod tests {
         let (w, h) = (48u32, 48u32);
         let planes = prepare_planes_rgb(w, h, &textured_rgb(w, h)).expect("planes");
         let blocks = quantize_mcu_blocks(&planes);
-        let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
-        let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
+        let tables = EncTables::build();
         let mut plan = Vec::new();
         let mut dropped = 0usize;
         let mut stepped = 0usize;
         for lambda in [5.0f64, 50.0, 500.0] {
-            rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, lambda, &mut plan);
+            rd_plan_blocks(&blocks, &tables, lambda, &mut plan);
             for (b, p) in blocks.iter().zip(&plan) {
                 assert_eq!(b[0], p[0], "DC must survive planning");
                 for k in 1..64 {

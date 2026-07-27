@@ -1,10 +1,14 @@
 //! Bench: the §4a rate-controlled frame encode vs the unconstrained
-//! encode — how much the budget search costs on top of a plain encode.
+//! encode — how much the rate–distortion budget search costs on top of
+//! a plain encode.
 //!
-//! The budgeted path quantizes once (DCT + quant, the expensive stage)
-//! and then binary-searches the trim level over the entropy stage only
-//! (≤ 12 cheap passes), so the expected overhead is well under the
-//! naive "12× the encode". Three cases on the same deterministic
+//! The budgeted path quantizes once (DCT + quant) and then bisects the
+//! Lagrangian price λ, re-running the per-block RD dynamic program plus
+//! an allocation-free exact-size counting walk per probe (bracket +
+//! ≤ 12 bisections, with an early exit once the plan uses ≥ 99.5 % of
+//! the budget). The binding cases therefore cost a couple dozen entropy-
+//! stage passes — still a few percent of the 83 ms frame interval of
+//! the §2 12 fps device profile. Cases on the same deterministic
 //! textured 128×96 frame (the comedian geometry):
 //!
 //! * `unconstrained` — the plain `encode_frame_rgb` baseline;
