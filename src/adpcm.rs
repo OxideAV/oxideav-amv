@@ -137,7 +137,13 @@ fn decode_nibble(nibble: u8, predictor: &mut i32, index: &mut i32) -> i16 {
 /// one (see [`decode_nibble`]).
 pub fn decode_audio_block(preamble: &AmvAudioPreamble, compressed_body: &[u8]) -> Vec<i16> {
     let want = preamble.decoded_sample_count as usize;
-    let mut out = Vec::with_capacity(want);
+    // Preallocate to the *smaller* of the declared count and the body's
+    // real nibble budget (2 per byte): `decoded_sample_count` is an
+    // attacker-controlled dword in a hostile file, and the decode below
+    // can never produce more samples than the body holds nibbles, so
+    // trusting the declared count alone would let an 8-byte preamble
+    // demand a multi-GiB allocation (fuzz-found, `codec_decode` target).
+    let mut out = Vec::with_capacity(want.min(compressed_body.len() * 2));
 
     // §4b: per-block re-seed of the predictor from the header `int16`,
     // and the step index is **reset to 0** at block start — the trace's
@@ -315,6 +321,24 @@ mod tests {
         let pre = preamble(0, 10);
         let out = decode_audio_block(&pre, &[]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn hostile_sample_count_does_not_drive_allocation() {
+        // `decoded_sample_count` is an attacker-controlled dword: a
+        // hostile preamble declaring u32::MAX samples over a 4-byte body
+        // must decode to the body's real nibble budget (8 samples) with
+        // an allocation sized by the body, not the claim (fuzz-found:
+        // the pre-fix preallocation asked malloc for ~8.6 GiB here).
+        let pre = preamble(0, u32::MAX);
+        let out = decode_audio_block(&pre, &[0x44, 0x44, 0x44, 0x44]);
+        assert_eq!(out.len(), 8, "decode bounded by available nibbles");
+        assert!(
+            out.capacity() <= 64,
+            "allocation must be sized by the nibble budget, not the declared count \
+             (capacity {})",
+            out.capacity()
+        );
     }
 
     #[test]

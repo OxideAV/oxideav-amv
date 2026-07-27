@@ -6,6 +6,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Two fuzz-found hostile-input hardenings** (both pre-existing;
+  surfaced by this round's bounded `cargo fuzz` sweep of all three
+  targets):
+  - `decode_audio_block` preallocated its output from the
+    attacker-controlled §4b `decoded_sample_count` dword — a 14-byte
+    hostile block claiming `u32::MAX` samples asked malloc for
+    ~8.6 GiB. The preallocation is now capped by the body's real nibble
+    budget (2 per byte); decoded output was always bounded, only the
+    reserve trusted the claim.
+  - `AmvDemuxer::open` divided by zero deriving stream durations when a
+    hostile header carried an fps or `nSamplesPerSec` dword above
+    1 000 000 (the µs-per-tick floor hit 0). The derivation now clamps
+    to ≥ 1 µs/tick with i128 widening.
+  Regression unit tests pin both; the `codec_decode` fuzz target
+  additionally drives the new `ChromaUpsample::Triangle` decode path.
+
 ### Added
 
 - **Selectable chroma upsampling for the RGB decode** —

@@ -39,8 +39,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_amv::{
-    decode_audio_payload, decode_frame_from_payload, decode_frame_yuv420p_from_payload,
-    encode_frame_rgb_with_budget, AmvHeader,
+    decode_audio_payload, decode_frame_from_payload, decode_frame_from_payload_with,
+    decode_frame_yuv420p_from_payload, encode_frame_rgb_with_budget, AmvHeader, ChromaUpsample,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -64,8 +64,12 @@ fuzz_target!(|data: &[u8]| {
         duration_packed: 0,
     };
 
-    // 1 + 2: hostile bytes into both §4a decode front doors.
+    // 1 + 2: hostile bytes into both §4a decode front doors — the RGB
+    // path under both chroma-upsampling filters (the triangle filter's
+    // clamped edge taps must stay inside the visible plane for every
+    // hostile geometry) and the native planar path.
     let _ = decode_frame_from_payload(&header, body);
+    let _ = decode_frame_from_payload_with(&header, body, ChromaUpsample::Triangle);
     let _ = decode_frame_yuv420p_from_payload(&header, body);
 
     // 3: hostile bytes into the §4b audio decode.

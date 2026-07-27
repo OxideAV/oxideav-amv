@@ -1161,7 +1161,14 @@ fn micros_per_tick(tb: TimeBase) -> i64 {
         1
     } else {
         // 1 tick = (num / den) seconds = (num * 1_000_000 / den) µs.
-        (1_000_000 * r.num) / r.den
+        // Clamp to ≥ 1: a hostile header can carry an fps / sample-rate
+        // dword above 1 000 000, flooring the µs-per-tick to 0 — which
+        // must not poison the caller's `duration_micros() / …`
+        // derivation with a division by zero (fuzz-found,
+        // `demuxer_open` target). The i128 widening keeps the product
+        // overflow-free for any dword-derived rational.
+        let micros = (r.num as i128 * 1_000_000) / r.den as i128;
+        micros.clamp(1, i64::MAX as i128) as i64
     }
 }
 
@@ -1229,6 +1236,27 @@ mod tests {
         );
         assert_eq!(d.cursor(), 0x13C);
         assert_eq!(d.duration_micros(), Some(93_000_000));
+    }
+
+    #[test]
+    fn hostile_fps_and_sample_rate_dwords_open_without_panicking() {
+        // A hostile header can carry fps / nSamplesPerSec dwords above
+        // 1 000 000, flooring the µs-per-tick derivation to 0 — the
+        // permissive open must survive (no divide-by-zero building the
+        // stream durations; fuzz-found via the demuxer_open target).
+        for (fps, rate) in [
+            (0xFF00_0001u32, 22_050u32),
+            (12, 0x7FFF_FFFF),
+            (2_000_000, 48_000_000),
+        ] {
+            let mut buf = build_synthetic_prelude(128, 96, fps, 0x0000_0121, rate);
+            buf.extend_from_slice(&AMV_END_TRAILER);
+            let d = AmvDemuxer::open(Cursor::new(buf))
+                .unwrap_or_else(|e| panic!("fps {fps} / rate {rate} must open: {e:?}"));
+            for s in d.streams() {
+                assert!(s.duration.is_some(), "duration still derived");
+            }
+        }
     }
 
     #[test]
