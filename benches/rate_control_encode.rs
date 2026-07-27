@@ -90,6 +90,46 @@ fn bench_rate_control_encode(c: &mut Criterion) {
             black_box(f.payload.len())
         });
     });
+    // Streaming steady state: the λ warm start the registry encoder
+    // carries across frames — seed each encode with the fitted price of
+    // an identical previous frame (the search should collapse to a
+    // probe or two instead of the full bracket + bisection).
+    {
+        use oxideav_amv::{
+            decode_frame_yuv420p_from_payload, encode_frame_yuv420p_with_budget_seeded, AmvHeader,
+        };
+        let header = AmvHeader {
+            micros_per_frame: 83_333,
+            width: W,
+            height: H,
+            fps: 12,
+            flag_one: 1,
+            reserved_30: 0,
+            duration_packed: 0,
+        };
+        let full = encode_frame_rgb(W, H, &rgb).expect("encode");
+        let yuv = decode_frame_yuv420p_from_payload(&header, &full).expect("planes");
+        let budget = full_len / 2;
+        let (_f, seed) =
+            encode_frame_yuv420p_with_budget_seeded(W, H, &yuv.y, &yuv.cb, &yuv.cr, budget, None)
+                .expect("seed encode");
+        assert!(seed.is_some());
+        group.bench_function("budget_half_warm_started", |b| {
+            b.iter(|| {
+                let (f, l) = encode_frame_yuv420p_with_budget_seeded(
+                    black_box(W),
+                    black_box(H),
+                    black_box(&yuv.y),
+                    black_box(&yuv.cb),
+                    black_box(&yuv.cr),
+                    black_box(budget),
+                    black_box(seed),
+                )
+                .unwrap();
+                black_box((f.payload.len(), l))
+            });
+        });
+    }
     group.finish();
 }
 

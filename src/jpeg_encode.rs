@@ -816,33 +816,64 @@ fn entropy_encode_with_budget(
     mcus_y: usize,
     max_payload_bytes: usize,
 ) -> BudgetedFrame {
+    entropy_encode_with_budget_seeded(blocks, mcus_x, mcus_y, max_payload_bytes, None).0
+}
+
+/// [`entropy_encode_with_budget`] with an optional **λ warm start**,
+/// returning the fitted λ alongside the frame (`None` when the search
+/// never ran — the unconstrained fast path or the below-floor case).
+///
+/// A streaming encoder codes near-identical consecutive frames, so the
+/// previous frame's fitted price is an excellent first probe: when it
+/// fits and already lands in the ≥ 99.5 %-of-budget acceptance band the
+/// whole search collapses to a single plan+count pass. A stale seed
+/// costs nothing in correctness — a too-small seed just becomes the
+/// ladder's starting rung, and a too-large one bisects back down from
+/// `(0, seed]` exactly as the unseeded search would from its own
+/// bracket.
+fn entropy_encode_with_budget_seeded(
+    blocks: &[[i32; 64]],
+    mcus_x: usize,
+    mcus_y: usize,
+    max_payload_bytes: usize,
+    lambda_seed: Option<f64>,
+) -> (BudgetedFrame, Option<f64>) {
     debug_assert_eq!(blocks.len(), mcus_x * mcus_y * 6);
     let tables = EncTables::build();
     if entropy_encoded_size(blocks, &tables) <= max_payload_bytes {
-        return BudgetedFrame {
-            payload: entropy_encode_blocks_with(blocks, &tables),
-            within_budget: true,
-        };
+        return (
+            BudgetedFrame {
+                payload: entropy_encode_blocks_with(blocks, &tables),
+                within_budget: true,
+            },
+            None,
+        );
     }
     let floor = dc_only_blocks(blocks);
     if entropy_encoded_size(&floor, &tables) > max_payload_bytes {
-        return BudgetedFrame {
-            payload: entropy_encode_blocks_with(&floor, &tables),
-            within_budget: false,
-        };
+        return (
+            BudgetedFrame {
+                payload: entropy_encode_blocks_with(&floor, &tables),
+                within_budget: false,
+            },
+            None,
+        );
     }
 
-    // Bracket: grow λ geometrically until the plan fits. λ = distortion
-    // per bit; the largest useful price is bounded by the largest
+    // Bracket: grow λ geometrically until the plan fits, starting from
+    // the warm-start seed when one is supplied. λ = distortion per bit;
+    // the largest useful price is bounded by the largest
     // single-coefficient distortion (≤ (2048)² — the DCT magnitude
-    // bound — over ≥ 2 bits), so the ×16 ladder from 1 reaches a
-    // fitting λ within ~6 steps on any input; the DC-only floor (which
+    // bound — over ≥ 2 bits), so the ×16 ladder reaches a fitting λ
+    // within ~6 steps from 1 on any input; the DC-only floor (which
     // fits, checked above) is the safety net.
     let mut plan = Vec::with_capacity(blocks.len());
     let mut best: Option<Vec<[i32; 64]>> = None;
     let mut best_size = 0usize;
     let mut lo = 0.0f64;
-    let mut hi = 1.0f64;
+    let mut hi = lambda_seed
+        .filter(|l| l.is_finite() && *l > 0.0)
+        .unwrap_or(1.0);
     for _ in 0..24 {
         rd_plan_blocks(blocks, &tables, hi, &mut plan);
         let size = entropy_encoded_size(&plan, &tables);
@@ -878,10 +909,13 @@ fn entropy_encode_with_budget(
 
     let payload = entropy_encode_blocks_with(&best, &tables);
     debug_assert!(payload.len() <= max_payload_bytes);
-    BudgetedFrame {
-        payload,
-        within_budget: true,
-    }
+    (
+        BudgetedFrame {
+            payload,
+            within_budget: true,
+        },
+        Some(hi),
+    )
 }
 
 /// Rate-controlled variant of [`encode_frame_rgb`]: encode an upright
@@ -941,6 +975,34 @@ pub fn encode_frame_yuv420p_with_budget(
         planes.mcus_x,
         planes.mcus_y,
         max_payload_bytes,
+    ))
+}
+
+/// Streaming-encoder internal: [`encode_frame_yuv420p_with_budget`]
+/// with a **λ warm start** carried across frames, returning the fitted
+/// price so the caller can seed the next frame's search (a
+/// near-identical consecutive frame typically collapses the whole λ
+/// search to a single probe). `None` fitted-λ means the search never
+/// ran (unconstrained fast path / below-floor case) — keep the previous
+/// seed. Budget semantics are identical to the unseeded entry point;
+/// the seed only steers where the search *starts*.
+#[doc(hidden)]
+pub fn encode_frame_yuv420p_with_budget_seeded(
+    width: u32,
+    height: u32,
+    y: &[u8],
+    cb: &[u8],
+    cr: &[u8],
+    max_payload_bytes: usize,
+    lambda_seed: Option<f64>,
+) -> Result<(BudgetedFrame, Option<f64>), AmvDemuxerError> {
+    let planes = prepare_planes_yuv420p(width, height, y, cb, cr)?;
+    Ok(entropy_encode_with_budget_seeded(
+        &quantize_mcu_blocks(&planes),
+        planes.mcus_x,
+        planes.mcus_y,
+        max_payload_bytes,
+        lambda_seed,
     ))
 }
 
@@ -1526,6 +1588,62 @@ mod tests {
                 2,
                 frac
             );
+        }
+    }
+
+    #[test]
+    fn seeded_budget_search_is_budget_safe_for_any_seed() {
+        // The λ warm start only steers where the search starts: for a
+        // sane, stale, absurd or invalid seed the result must still fit
+        // the budget, stay a decodable §4a frame, and report a usable
+        // fitted λ. A `None` seed must reproduce the unseeded entry
+        // point byte-for-byte (same code path).
+        let (w, h) = (64u32, 48u32);
+        let rgb = textured_rgb(w, h);
+        // Shared content through the YUV door so the seeded/unseeded
+        // comparisons see identical quantized blocks.
+        use crate::jpeg_decode::decode_frame_yuv420p_from_payload;
+        let header = header_wh(w, h);
+        let full = encode_frame_rgb(w, h, &rgb).expect("full encode");
+        let yuv = decode_frame_yuv420p_from_payload(&header, &full).expect("planes");
+        let budget = full.len() / 2;
+
+        let unseeded =
+            encode_frame_yuv420p_with_budget(w, h, &yuv.y, &yuv.cb, &yuv.cr, budget).expect("...");
+        assert!(unseeded.within_budget);
+
+        let (none_seeded, fitted) =
+            encode_frame_yuv420p_with_budget_seeded(w, h, &yuv.y, &yuv.cb, &yuv.cr, budget, None)
+                .expect("seeded encode");
+        assert_eq!(
+            none_seeded.payload, unseeded.payload,
+            "None seed must equal the unseeded entry point"
+        );
+        let fitted = fitted.expect("a binding budget must fit a λ");
+        assert!(fitted.is_finite() && fitted > 0.0);
+
+        for seed in [1e-30f64, 1e30, f64::NAN, -5.0, fitted] {
+            let (b, l) = encode_frame_yuv420p_with_budget_seeded(
+                w,
+                h,
+                &yuv.y,
+                &yuv.cb,
+                &yuv.cr,
+                budget,
+                Some(seed),
+            )
+            .expect("seeded encode");
+            assert!(b.within_budget, "seed {seed}: must fit");
+            assert!(b.payload.len() <= budget, "seed {seed}: budget violated");
+            let dec = decode_frame_from_payload(&header, &b.payload)
+                .unwrap_or_else(|e| panic!("seed {seed}: payload must decode: {e:?}"));
+            assert_eq!((dec.width, dec.height), (w, h));
+            let m = mae(&rgb, &dec.rgb);
+            assert!(
+                m < 40.0,
+                "seed {seed}: quality must stay graceful (MAE {m:.2})"
+            );
+            assert!(l.is_some(), "seed {seed}: binding search must report λ");
         }
     }
 

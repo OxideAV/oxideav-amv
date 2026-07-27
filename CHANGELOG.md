@@ -6,6 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **λ warm start across frames in the `amv_video` registry encoder** —
+  the rate-controlled encoder now carries the previous frame's fitted
+  Lagrangian price into the next frame's budget search
+  (`encode_frame_yuv420p_with_budget_seeded`, a `#[doc(hidden)]`
+  streaming internal): consecutive frames are near-identical, so the
+  search typically collapses from the full bracket + bisection to one
+  or two probes. Measured on the `rate_control_encode` bench, the
+  binding steady-state encode drops **2.80 ms → 255 µs** (11×), with
+  budget semantics untouched for any seed — a stale, absurd or invalid
+  seed only changes where the search starts (unit-tested with seeds
+  from 1e-30 to 1e30, NaN and negatives).
+
 ### Fixed
 
 - **Two fuzz-found hostile-input hardenings** (both pre-existing;

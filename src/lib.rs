@@ -121,7 +121,7 @@ pub use jpeg_decode::{
 };
 pub use jpeg_encode::{
     encode_frame, encode_frame_rgb, encode_frame_rgb_with_budget, encode_frame_yuv420p,
-    encode_frame_yuv420p_with_budget, BudgetedFrame,
+    encode_frame_yuv420p_with_budget, encode_frame_yuv420p_with_budget_seeded, BudgetedFrame,
 };
 pub use jpeg_reconstruct::{reconstruct_jpeg, reconstruct_jpeg_from_payload};
 pub use muxer::AmvMuxer;

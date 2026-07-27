@@ -36,7 +36,7 @@ use oxideav_core::{
 };
 
 use crate::jpeg_decode::decode_frame_yuv420p_from_payload;
-use crate::jpeg_encode::{encode_frame_yuv420p, encode_frame_yuv420p_with_budget};
+use crate::jpeg_encode::{encode_frame_yuv420p, encode_frame_yuv420p_with_budget_seeded};
 use crate::parse::AmvHeader;
 use crate::rate::AmvRateController;
 
@@ -222,6 +222,7 @@ pub fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
         height,
         time_base,
         rate,
+        last_lambda: None,
         queue: VecDeque::new(),
     }))
 }
@@ -237,6 +238,12 @@ pub struct AmvVideoEncoder {
     height: u32,
     time_base: TimeBase,
     rate: Option<AmvRateController>,
+    /// λ warm start for the rate-controlled path: the previous frame's
+    /// fitted Lagrangian price seeds the next frame's budget search
+    /// (consecutive frames are near-identical, so the search typically
+    /// collapses to a single probe). `None` until the first binding
+    /// frame; budget semantics are unaffected by the seed.
+    last_lambda: Option<f64>,
     queue: VecDeque<Packet>,
 }
 
@@ -274,9 +281,19 @@ impl Encoder for AmvVideoEncoder {
         let payload = match &mut self.rate {
             Some(rc) => {
                 let budget = rc.frame_budget();
-                let budgeted =
-                    encode_frame_yuv420p_with_budget(self.width, self.height, &y, &cb, &cr, budget)
-                        .map_err(Error::from)?;
+                let (budgeted, fitted) = encode_frame_yuv420p_with_budget_seeded(
+                    self.width,
+                    self.height,
+                    &y,
+                    &cb,
+                    &cr,
+                    budget,
+                    self.last_lambda,
+                )
+                .map_err(Error::from)?;
+                if fitted.is_some() {
+                    self.last_lambda = fitted;
+                }
                 rc.note_frame(budgeted.payload.len());
                 budgeted.payload
             }
