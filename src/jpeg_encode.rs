@@ -262,39 +262,18 @@ fn quantize_block(coeffs: &[f32; 64], quant: &[u8; 64]) -> [i32; 64] {
     q
 }
 
-/// Rate-control coefficient-trim rule: at trim level `trim`, the
-/// quantized AC coefficient at zig-zag position `zz` is dropped (coded
-/// as zero) when `64·|q| ≤ trim·(zz + 16)`.
-///
-/// The §4a device profile pins the quant tables on the player side, so
-/// an AMV encoder cannot scale quantization to spend fewer bits the way
-/// a generic JPEG encoder would — the only rate lever that keeps the
-/// output decodable by the fixed tables is choosing *which quantized
-/// coefficients to spend bits on*. This rule is a zig-zag-ramped
-/// dead-zone: higher frequencies (larger `zz`) are dropped first, and a
-/// larger `trim` drops progressively larger magnitudes at progressively
-/// lower frequencies. Because the threshold is monotone in `trim` for
-/// every position, the dropped-coefficient sets are **nested** across
-/// trim levels, which keeps payload size near-monotone in `trim` and
-/// makes the budget search in [`entropy_encode_with_budget`] safe.
-/// `trim == 0` drops nothing (the unconstrained encode); DC is never
-/// trimmed (the DC predictor chain always survives).
-#[inline]
-fn trimmed_to_zero(q_abs: u32, zz: usize, trim: u32) -> bool {
-    64 * q_abs as u64 <= trim as u64 * (zz as u64 + 16)
-}
-
 /// Huffman-encode one already-quantized natural-order block (DC
 /// difference + AC run/size) into `w`. `pred` carries the running DC
-/// predictor for the component; `trim` is the [`trimmed_to_zero`]
-/// rate-control level (`0` = encode every nonzero coefficient).
+/// predictor for the component. Rate control does not tap into this
+/// walk: a budgeted encode first *plans* a reduced block
+/// ([`rd_optimize_block`]) and then encodes the planned levels through
+/// this same unconditional path.
 fn encode_block<S: EntropySink>(
     w: &mut BitWriter<S>,
     q: &[i32; 64],
     dc_tbl: &HuffEncTable,
     ac_tbl: &HuffEncTable,
     pred: &mut i32,
-    trim: u32,
 ) {
     // DC: difference against the predictor, encoded as category + bits.
     let dc = q[0];
@@ -311,10 +290,10 @@ fn encode_block<S: EntropySink>(
 
     // AC: walk zig-zag positions 1..=63, run-length encoding zeros.
     let mut run = 0u32;
-    for (zz, &natural) in NATURAL_FROM_ZZ.iter().enumerate().skip(1) {
-        // `natural`: the natural index whose zig-zag position is `zz`.
+    for &natural in NATURAL_FROM_ZZ.iter().skip(1) {
+        // `natural`: the natural index at this zig-zag position.
         let coeff = q[natural as usize];
-        if coeff == 0 || (trim > 0 && trimmed_to_zero(coeff.unsigned_abs(), zz, trim)) {
+        if coeff == 0 {
             run += 1;
             continue;
         }
@@ -376,7 +355,6 @@ pub fn encode_frame_rgb(width: u32, height: u32, rgb: &[u8]) -> Result<Vec<u8>, 
         &quantize_mcu_blocks(&planes),
         planes.mcus_x,
         planes.mcus_y,
-        0,
     ))
 }
 
@@ -521,16 +499,10 @@ fn quantize_mcu_blocks(p: &PreparedPlanes) -> Vec<[i32; 64]> {
     blocks
 }
 
-/// Entropy-code an already-quantized [`quantize_mcu_blocks`] sequence
-/// into a bare `00dc` payload (`FF D8` + stuffed entropy + `FF D9`),
-/// dropping coefficients per the [`trimmed_to_zero`] rate-control rule
-/// at level `trim` (`0` = unconstrained; byte-identical to the historic
-/// single-stage encode).
-/// Drive the interleaved-MCU entropy walk into `sink` at trim level
-/// `trim`. Shared core of the materializing encode
-/// ([`entropy_encode_blocks`]) and the exact-size probe
-/// ([`entropy_encoded_size`]).
-fn entropy_encode_into<S: EntropySink>(blocks: &[[i32; 64]], trim: u32, sink: S) -> S {
+/// Drive the interleaved-MCU entropy walk into `sink`. Shared core of
+/// the materializing encode ([`entropy_encode_blocks`]) and the
+/// exact-size probe ([`entropy_encoded_size`]).
+fn entropy_encode_into<S: EntropySink>(blocks: &[[i32; 64]], sink: S) -> S {
     // Build the four Annex K Huffman encode tables once.
     let dc_luma = HuffEncTable::build(&DC_LUMA_BITS, &DC_LUMA_VALS);
     let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
@@ -544,17 +516,17 @@ fn entropy_encode_into<S: EntropySink>(blocks: &[[i32; 64]], trim: u32, sink: S)
 
     for mcu in blocks.chunks_exact(6) {
         for luma in &mcu[..4] {
-            encode_block(&mut bw, luma, &dc_luma, &ac_luma, &mut pred_y, trim);
+            encode_block(&mut bw, luma, &dc_luma, &ac_luma, &mut pred_y);
         }
-        encode_block(&mut bw, &mcu[4], &dc_chroma, &ac_chroma, &mut pred_cb, trim);
-        encode_block(&mut bw, &mcu[5], &dc_chroma, &ac_chroma, &mut pred_cr, trim);
+        encode_block(&mut bw, &mcu[4], &dc_chroma, &ac_chroma, &mut pred_cb);
+        encode_block(&mut bw, &mcu[5], &dc_chroma, &ac_chroma, &mut pred_cr);
     }
     bw.finish()
 }
 
-fn entropy_encode_blocks(blocks: &[[i32; 64]], mcus_x: usize, mcus_y: usize, trim: u32) -> Vec<u8> {
+fn entropy_encode_blocks(blocks: &[[i32; 64]], mcus_x: usize, mcus_y: usize) -> Vec<u8> {
     debug_assert_eq!(blocks.len(), mcus_x * mcus_y * 6);
-    let entropy = entropy_encode_into(blocks, trim, VecSink(Vec::new())).0;
+    let entropy = entropy_encode_into(blocks, VecSink(Vec::new())).0;
     let mut payload = Vec::with_capacity(entropy.len() + 4);
     payload.extend_from_slice(&[0xFF, 0xD8]); // SOI
     payload.extend_from_slice(&entropy);
@@ -563,24 +535,166 @@ fn entropy_encode_blocks(blocks: &[[i32; 64]], mcus_x: usize, mcus_y: usize, tri
 }
 
 /// Exact byte size of the payload [`entropy_encode_blocks`] would
-/// produce for `blocks` at `trim` — the full stuffed entropy walk
-/// (stuffing depends on actual byte values, so the walk is identical)
-/// plus the 4 SOI/EOI marker bytes — without allocating the payload.
-fn entropy_encoded_size(blocks: &[[i32; 64]], trim: u32) -> usize {
-    entropy_encode_into(blocks, trim, CountSink(0)).0 + 4
+/// produce for `blocks` — the full stuffed entropy walk (stuffing
+/// depends on actual byte values, so the walk is identical) plus the 4
+/// SOI/EOI marker bytes — without allocating the payload.
+fn entropy_encoded_size(blocks: &[[i32; 64]]) -> usize {
+    entropy_encode_into(blocks, CountSink(0)).0 + 4
 }
 
 // ---------------------------------------------------------------------
 // Rate-controlled (budgeted) frame encode.
 // ---------------------------------------------------------------------
 
-/// Trim level at which every AC coefficient any §4a frame can produce
-/// is dropped, leaving the DC-only floor payload. The forward 8×8 DCT
-/// of level-shifted 8-bit samples is bounded by `|c| ≤ 2048`, and the
-/// smallest Annex K AC quantizer is 10, so `|q| ≤ 205`; the tightest
-/// [`trimmed_to_zero`] threshold (zig-zag position 1) then needs
-/// `trim ≥ 64·205/17 ≈ 772`. 2048 covers that with a wide margin.
-const TRIM_MAX: u32 = 2048;
+/// The DC-only floor plan: every AC coefficient dropped, the smallest
+/// §4a encode of this content (the DC predictor chain always survives —
+/// dropping DC would shift whole tiles, not save meaningful bits).
+fn dc_only_blocks(blocks: &[[i32; 64]]) -> Vec<[i32; 64]> {
+    blocks
+        .iter()
+        .map(|b| {
+            let mut o = [0i32; 64];
+            o[0] = b[0];
+            o
+        })
+        .collect()
+}
+
+/// Exact entropy bit cost of coding a kept AC coefficient of magnitude
+/// category `size` after `run` zero-valued zig-zag positions: one ZRL
+/// code per full run of 16 zeros, then the Annex K `(run mod 16, size)`
+/// code plus `size` appended magnitude bits.
+#[inline]
+fn ac_coeff_bits(ac: &HuffEncTable, run: usize, size: u32) -> u32 {
+    let zrl = ac.len[0xF0] as u32;
+    (run / 16) as u32 * zrl + ac.len[((run % 16) << 4) | size as usize] as u32 + size
+}
+
+/// Lagrangian rate–distortion plan for one quantized block: choose the
+/// subset of nonzero AC coefficients to **keep** that minimizes
+/// `distortion + lambda · bits`, exactly, by dynamic programming.
+///
+/// The §4a device profile pins the quant tables in the *player*, so the
+/// only rate lever that keeps a payload decodable is choosing which
+/// quantized coefficients to spend bits on. For a given price-per-bit
+/// `lambda` this planner solves that choice optimally per block:
+///
+/// * **Distortion** of dropping a coefficient of quantized level `q` at
+///   a position whose quantizer is `Q` is `(q·Q)²` — the squared
+///   dequantized magnitude. The 8×8 DCT is orthogonal (up to one fixed
+///   scale factor shared by every coefficient), so summed squared
+///   coefficient error *is* summed squared pixel error: this is true
+///   MSE weighting, not a heuristic frequency ramp.
+/// * **Rate** is the exact Annex K entropy cost, including the run/size
+///   coupling the coefficient's presence creates: dropping a
+///   coefficient lengthens the zero run of the next kept one (possibly
+///   across a ZRL boundary) and the last kept coefficient decides
+///   whether an EOB is emitted. The DP walks kept-coefficient pairs, so
+///   every ZRL/EOB interaction is priced exactly (only the whole-byte
+///   packing / stuffing granularity is outside the model).
+///
+/// The DP is over the (≤ 63) nonzero AC coefficients in zig-zag order:
+/// `dp[i]` = the cheapest plan for the block prefix in which `i` is the
+/// last kept coefficient, minimized over the previous kept coefficient
+/// (or none). Backtracking materializes the kept set into a copy of the
+/// block with the dropped levels zeroed; DC always survives. Larger
+/// `lambda` monotonically favours dropping more, which is what makes
+/// the budget bisection in [`entropy_encode_with_budget`] behave.
+fn rd_optimize_block(q: &[i32; 64], quant: &[u8; 64], ac: &HuffEncTable, lambda: f64) -> [i32; 64] {
+    // Collect the nonzero AC coefficients in zig-zag order.
+    let mut zz_pos = [0u8; 63];
+    let mut nat = [0u8; 63];
+    let mut lvl = [0i32; 63];
+    let mut n = 0usize;
+    for (zz, &natural) in NATURAL_FROM_ZZ.iter().enumerate().skip(1) {
+        let c = q[natural as usize];
+        if c != 0 {
+            zz_pos[n] = zz as u8;
+            nat[n] = natural;
+            lvl[n] = c;
+            n += 1;
+        }
+    }
+    if n == 0 {
+        return *q;
+    }
+    let eob = ac.len[0x00] as f64;
+
+    // Prefix sums of drop distortion: pre[i] = Σ dist(nz[0..i]).
+    let mut pre = [0f64; 64];
+    for i in 0..n {
+        let d = lvl[i].unsigned_abs() as f64 * quant[nat[i] as usize] as f64;
+        pre[i + 1] = pre[i] + d * d;
+    }
+
+    // dp[i]: cheapest cost over zig-zag positions 1..=zz(i) with nz `i`
+    // kept last; prev[i] backtracks the kept chain (-1 = none before).
+    let mut dp = [0f64; 63];
+    let mut prev = [-1i8; 63];
+    for i in 0..n {
+        let size = magnitude_category(lvl[i]).0;
+        let zi = zz_pos[i] as usize;
+        // Previous kept = none: every nonzero before `i` is dropped.
+        let mut best = pre[i] + lambda * ac_coeff_bits(ac, zi - 1, size) as f64;
+        let mut best_j = -1i8;
+        for j in 0..i {
+            let run = zi - zz_pos[j] as usize - 1;
+            let c = dp[j] + (pre[i] - pre[j + 1]) + lambda * ac_coeff_bits(ac, run, size) as f64;
+            if c < best {
+                best = c;
+                best_j = j as i8;
+            }
+        }
+        dp[i] = best;
+        prev[i] = best_j;
+    }
+
+    // Close the block: either every nonzero is dropped (DC + EOB), or
+    // the plan ends at kept `i` (EOB unless `i` sits at position 63).
+    let mut best = pre[n] + lambda * eob;
+    let mut best_end = -1i8;
+    for i in 0..n {
+        let tail_eob = if (zz_pos[i] as usize) < 63 { eob } else { 0.0 };
+        let c = dp[i] + (pre[n] - pre[i + 1]) + lambda * tail_eob;
+        if c < best {
+            best = c;
+            best_end = i as i8;
+        }
+    }
+
+    // Materialize the kept set.
+    let mut out = [0i32; 64];
+    out[0] = q[0];
+    let mut i = best_end;
+    while i >= 0 {
+        let k = i as usize;
+        out[nat[k] as usize] = lvl[k];
+        i = prev[k];
+    }
+    out
+}
+
+/// Run [`rd_optimize_block`] over every block of the frame at one
+/// `lambda`, writing the planned blocks into the reusable `out` buffer.
+/// Block interleave per MCU is 4 luma + Cb + Cr (§4a 4:2:0), so blocks
+/// `idx % 6 < 4` price against the luma tables and the rest against the
+/// chroma tables.
+fn rd_plan_blocks(
+    blocks: &[[i32; 64]],
+    ac_luma: &HuffEncTable,
+    ac_chroma: &HuffEncTable,
+    lambda: f64,
+    out: &mut Vec<[i32; 64]>,
+) {
+    out.clear();
+    out.extend(blocks.iter().enumerate().map(|(idx, b)| {
+        if idx % 6 < 4 {
+            rd_optimize_block(b, &QUANT_LUMA, ac_luma, lambda)
+        } else {
+            rd_optimize_block(b, &QUANT_CHROMA, ac_chroma, lambda)
+        }
+    }));
+}
 
 /// Result of a rate-controlled frame encode
 /// ([`encode_frame_rgb_with_budget`] /
@@ -599,48 +713,76 @@ pub struct BudgetedFrame {
     pub within_budget: bool,
 }
 
-/// Binary-search the smallest-trim entropy encode that fits
+/// Bisect the Lagrangian price-per-bit `λ` to the cheapest
+/// rate–distortion plan ([`rd_optimize_block`]) that fits
 /// `max_payload_bytes`, over blocks quantized once up front.
 ///
-/// The dropped-coefficient sets are nested across trim levels (see
-/// [`trimmed_to_zero`]), so payload size is near-monotone in `trim`;
-/// the search keeps the invariant "`hi` fits, `lo` does not" and only
-/// ever returns a payload whose measured size actually fit, so the
-/// rare non-monotone blip (a dropped coefficient stretching a zero run
-/// across a ZRL boundary) can cost a slightly-less-optimal trim pick
-/// but never a budget violation. Search probes run the exact-size
-/// counting walk ([`entropy_encoded_size`]); only the winning trim is
-/// materialized to bytes.
+/// A larger `λ` makes every per-block DP drop at least as much (the
+/// classic Lagrangian sweep), so payload size is near-monotone in `λ`;
+/// the search first brackets a fitting `λ` geometrically, then bisects,
+/// keeping the invariant that the returned plan's **measured** size fit
+/// (each probe is the exact counting walk [`entropy_encoded_size`] —
+/// the rare monotonicity blip from byte-packing granularity can cost a
+/// slightly-less-optimal `λ` pick but never a budget violation). Only
+/// the winning plan is materialized to bytes.
 fn entropy_encode_with_budget(
     blocks: &[[i32; 64]],
     mcus_x: usize,
     mcus_y: usize,
     max_payload_bytes: usize,
 ) -> BudgetedFrame {
-    if entropy_encoded_size(blocks, 0) <= max_payload_bytes {
+    if entropy_encoded_size(blocks) <= max_payload_bytes {
         return BudgetedFrame {
-            payload: entropy_encode_blocks(blocks, mcus_x, mcus_y, 0),
+            payload: entropy_encode_blocks(blocks, mcus_x, mcus_y),
             within_budget: true,
         };
     }
-    if entropy_encoded_size(blocks, TRIM_MAX) > max_payload_bytes {
+    let floor = dc_only_blocks(blocks);
+    if entropy_encoded_size(&floor) > max_payload_bytes {
         return BudgetedFrame {
-            payload: entropy_encode_blocks(blocks, mcus_x, mcus_y, TRIM_MAX),
+            payload: entropy_encode_blocks(&floor, mcus_x, mcus_y),
             within_budget: false,
         };
     }
-    // Invariant: size(lo) > budget ≥ size(hi).
-    let mut lo = 0u32;
-    let mut hi = TRIM_MAX;
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
-        if entropy_encoded_size(blocks, mid) <= max_payload_bytes {
+
+    let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
+    let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
+
+    // Bracket: grow λ geometrically until the plan fits. λ = distortion
+    // per bit; the largest useful price is bounded by the largest
+    // single-coefficient distortion (≤ (2048)² — the DCT magnitude
+    // bound — over ≥ 2 bits), so the ×8 ladder from 1 reaches a fitting
+    // λ within ~8 steps on any input; the DC-only floor (which fits,
+    // checked above) is the safety net.
+    let mut plan = Vec::with_capacity(blocks.len());
+    let mut best: Option<Vec<[i32; 64]>> = None;
+    let mut lo = 0.0f64;
+    let mut hi = 1.0f64;
+    for _ in 0..24 {
+        rd_plan_blocks(blocks, &ac_luma, &ac_chroma, hi, &mut plan);
+        if entropy_encoded_size(&plan) <= max_payload_bytes {
+            best = Some(plan.clone());
+            break;
+        }
+        lo = hi;
+        hi *= 8.0;
+    }
+    let mut best = best.unwrap_or(floor);
+
+    // Bisect λ down to the lightest plan that still fits. Invariant:
+    // `hi` produced `best` (measured to fit), `lo` did not fit.
+    for _ in 0..16 {
+        let mid = 0.5 * (lo + hi);
+        rd_plan_blocks(blocks, &ac_luma, &ac_chroma, mid, &mut plan);
+        if entropy_encoded_size(&plan) <= max_payload_bytes {
             hi = mid;
+            std::mem::swap(&mut best, &mut plan);
         } else {
             lo = mid;
         }
     }
-    let payload = entropy_encode_blocks(blocks, mcus_x, mcus_y, hi);
+
+    let payload = entropy_encode_blocks(&best, mcus_x, mcus_y);
     debug_assert!(payload.len() <= max_payload_bytes);
     BudgetedFrame {
         payload,
@@ -656,13 +798,15 @@ fn entropy_encode_with_budget(
 /// player, so an AMV encoder cannot trade quality for bits by scaling
 /// quantization the way a generic JPEG encoder would. The only lever
 /// that keeps the payload decodable by the fixed tables is choosing
-/// which quantized coefficients to spend bits on: this encode drops
-/// low-magnitude, high-frequency coefficients first (a zig-zag-ramped
-/// dead-zone with nested drop-sets — see the module's rate-control
-/// notes) and binary-searches the lightest trim that fits the budget.
-/// The DCT + quantization run once; each search probe is an
-/// allocation-free exact-size counting walk of the entropy stage (≤ 12
-/// probes), and only the winning trim is materialized to bytes.
+/// which quantized coefficients to spend bits on. This encode makes
+/// that choice by exact per-block Lagrangian rate–distortion
+/// optimization ([`rd_optimize_block`]): each block keeps the
+/// coefficient subset minimizing `MSE + λ·bits` under the true Annex K
+/// entropy cost (run/size codes, ZRL splits, EOB), and the price `λ` is
+/// bisected to the lightest plan that fits the budget. The DCT +
+/// quantization run once; each `λ` probe re-plans the blocks and runs
+/// an allocation-free exact-size counting walk of the entropy stage,
+/// and only the winning plan is materialized to bytes.
 ///
 /// A budget at or above the unconstrained encode size returns the
 /// byte-identical unconstrained payload. A budget below the frame's
@@ -733,7 +877,6 @@ pub fn encode_frame_yuv420p(
         &quantize_mcu_blocks(&planes),
         planes.mcus_x,
         planes.mcus_y,
-        0,
     ))
 }
 
@@ -1140,25 +1283,93 @@ mod tests {
     fn counting_size_probe_equals_materialized_length() {
         // The budget search trusts the counting walk as an *exact* size
         // oracle (stuffing + final-pad included); pin it to the
-        // materializing walk across trim levels, geometries and
-        // contents (flat content exercises the EOB-heavy path,
-        // textured content the stuffing path).
+        // materializing walk across RD plans, geometries and contents
+        // (flat content exercises the EOB-heavy path, textured content
+        // the stuffing path).
+        let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
+        let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
         for (w, h) in [(64u32, 48u32), (17, 17), (16, 16)] {
             let planes_t = prepare_planes_rgb(w, h, &textured_rgb(w, h)).expect("planes");
             let flat = vec![200u8; (w * h * 3) as usize];
             let planes_f = prepare_planes_rgb(w, h, &flat).expect("planes");
             for planes in [&planes_t, &planes_f] {
                 let blocks = quantize_mcu_blocks(planes);
-                for trim in [0u32, 1, 7, 64, 300, TRIM_MAX] {
-                    let bytes = entropy_encode_blocks(&blocks, planes.mcus_x, planes.mcus_y, trim);
+                let mut candidates = vec![blocks.clone(), dc_only_blocks(&blocks)];
+                for lambda in [0.5f64, 8.0, 200.0, 1e6] {
+                    let mut plan = Vec::new();
+                    rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, lambda, &mut plan);
+                    candidates.push(plan);
+                }
+                for (ci, cand) in candidates.iter().enumerate() {
+                    let bytes = entropy_encode_blocks(cand, planes.mcus_x, planes.mcus_y);
                     assert_eq!(
-                        entropy_encoded_size(&blocks, trim),
+                        entropy_encoded_size(cand),
                         bytes.len(),
-                        "counting probe diverged at {w}x{h} trim {trim}"
+                        "counting probe diverged at {w}x{h} candidate {ci}"
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn rd_plan_is_lambda_monotone_and_bounded_by_floor_and_full() {
+        // Larger λ must never spend more bits, λ→0 approaches the full
+        // encode, and a huge λ collapses to the DC-only floor.
+        let (w, h) = (64u32, 48u32);
+        let planes = prepare_planes_rgb(w, h, &textured_rgb(w, h)).expect("planes");
+        let blocks = quantize_mcu_blocks(&planes);
+        let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
+        let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
+
+        let full = entropy_encoded_size(&blocks);
+        let floor = entropy_encoded_size(&dc_only_blocks(&blocks));
+        let mut last = usize::MAX;
+        let mut plan = Vec::new();
+        for lambda in [0.0f64, 1.0, 10.0, 100.0, 1e3, 1e5, 1e9] {
+            rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, lambda, &mut plan);
+            let size = entropy_encoded_size(&plan);
+            assert!(size <= last, "λ={lambda}: size {size} grew past {last}");
+            assert!((floor..=full).contains(&size));
+            last = size;
+        }
+        // λ = 0 keeps everything; a huge λ is the DC-only floor.
+        rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, 0.0, &mut plan);
+        assert_eq!(plan, blocks);
+        rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, 1e12, &mut plan);
+        assert_eq!(plan, dc_only_blocks(&blocks));
+    }
+
+    #[test]
+    fn rd_plan_only_zeroes_ac_coefficients_and_keeps_dc() {
+        // The plan may only turn nonzero ACs into zeros — never alter a
+        // level, never touch DC (the §4a fixed tables decode whatever
+        // levels we emit; correctness of the plan is that it is a
+        // *subset*, so every planned payload stays a faithful, lighter
+        // encode of the same frame).
+        let (w, h) = (48u32, 48u32);
+        let planes = prepare_planes_rgb(w, h, &textured_rgb(w, h)).expect("planes");
+        let blocks = quantize_mcu_blocks(&planes);
+        let ac_luma = HuffEncTable::build(&AC_LUMA_BITS, &AC_LUMA_VALS);
+        let ac_chroma = HuffEncTable::build(&AC_CHROMA_BITS, &AC_CHROMA_VALS);
+        let mut plan = Vec::new();
+        rd_plan_blocks(&blocks, &ac_luma, &ac_chroma, 50.0, &mut plan);
+        let mut dropped = 0usize;
+        for (b, p) in blocks.iter().zip(&plan) {
+            assert_eq!(b[0], p[0], "DC must survive planning");
+            for k in 1..64 {
+                assert!(
+                    p[k] == b[k] || p[k] == 0,
+                    "planned level {} at {k} is neither original {} nor zero",
+                    p[k],
+                    b[k]
+                );
+                if p[k] == 0 && b[k] != 0 {
+                    dropped += 1;
+                }
+            }
+        }
+        assert!(dropped > 0, "a binding λ must actually drop coefficients");
     }
 
     #[test]
