@@ -408,7 +408,7 @@ fn rgb_mae(a: &[u8], b: &[u8]) -> f64 {
 /// geometry + IDCT + colour conversion implemented in-crate reproduce the
 /// reference image. The reference is the same opaque `djpeg` / `magick`
 /// binary used elsewhere in this file, fed the *reconstructed* conforming
-/// JPEG of the same frame; its source is never read. The reference's
+/// JPEG of the same frame. The reference's
 /// output is bottom-up (DIB) so it is vertically flipped to the upright
 /// orientation the in-crate decoder already applies (§4a) before
 /// comparison.

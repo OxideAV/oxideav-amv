@@ -21,8 +21,7 @@ cargo-fuzz = true
 # folds into a per-packet PTS.
 #
 # Workspace policy bars external multimedia-library source as a
-# cross-decode oracle (no `libavformat/amv*`, no third-party AMV
-# demuxer). The fuzz crate therefore covers an internal-only
+# cross-decode oracle. The fuzz crate therefore covers an internal-only
 # panic-free contract — every public byte parser, every payload-shape
 # validator, and the full `AmvDemuxer::open` + `next_packet` drain
 # path must return `Result<T, AmvDemuxerError>` (or, for the
