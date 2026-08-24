@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Cross-profile codec conformance (`tests/noel_codec.rs`).** The §4a
+  and §4b decodes established on `comedian.amv` hold unchanged on the
+  second device profile: all 2928 noel video frames decode in-crate at
+  96 × 64 under the identical Annex K tables (≥ 90 % coherent-content
+  oracle), sampled frames track the black-box reference JPEG decoder
+  within the comedian error envelope for both chroma filters, and the
+  audio track decodes to the trace's exact totals — 4 035 189 mono
+  samples = 183.00 s, **completely clip-free** (the reset-rule
+  signature; honouring the preamble step-index field rails at 0.11 %
+  per the trace's three-rule table), std tracking the recorded 5619 —
+  with an independent `ffprobe` read-back of the wrapped WAV agreeing
+  on 22 050 Hz / mono / ≈ 183.0 s.
+
 - **Graded §2 duration cross-check + noel-profile container
   conformance.** `AmvDuration::consistency_with_frame_count` and
   `AmvDemuxer::duration_consistency_with_drained_frames` return the new
