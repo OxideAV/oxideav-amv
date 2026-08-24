@@ -8,6 +8,19 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Device-profile matrix (`tests/device_profile_matrix.rs`).** The
+  trace's corpus survey records the published 28-file corpus spanning
+  96 × 64 / 128 × 96 / 128 × 128 / 160 × 120 at 8 / 10 / 12 / 16 fps;
+  every cell of that observed parameter space now round-trips
+  synthetically through encode → mux → strict open → demux → decode,
+  checking the §2 fps wiring (`1e6 / fps`), the §4b per-block sample
+  budget, interleave balance, the `Exact` duration grade and media
+  fidelity (video MAE < 6 on gradient content, audio byte fixed point
+  in every cell). The corpus's only non-mod-16 geometry (160 × 120,
+  7.5 MCU rows) gets a dedicated bottom-band test proving the
+  encoder's 16 × 16 edge-replication pad and the decoder's crop leak
+  nothing into the half-covered MCU row.
+
 - **Cross-profile registry-path test** — the `RuntimeContext`-resolved
   `amv_video` / `adpcm_amv` decoders match the direct free-function
   decode byte-for-byte on sampled real noel frames and blocks at the
