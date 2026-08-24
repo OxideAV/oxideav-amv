@@ -307,3 +307,78 @@ fn noel_sampled_frames_match_black_box_reference_decoder() {
         }
     }
 }
+
+/// Registry-resolved cross-profile decode: the `amv_video` decoder takes
+/// its geometry from `CodecParameters` (the `00dc` bitstream carries
+/// none), so the second profile is the test that the registry path is
+/// not silently hardcoded to the comedian geometry — sampled noel frames
+/// and blocks decoded through the `RuntimeContext`-resolved factories
+/// must equal the direct free-function decode byte-for-byte at 96 × 64.
+#[test]
+fn noel_registry_decoders_match_direct_decode() {
+    use oxideav_amv::{
+        decode_frame_yuv420p, register, AmvVideoFrame, AUDIO_CODEC_ID, VIDEO_DIRECT_CODEC_ID,
+    };
+    use oxideav_core::{
+        CodecId, CodecParameters, Frame, Packet, PixelFormat, RuntimeContext, SampleFormat,
+        TimeBase,
+    };
+
+    let Some(path) = noel_fixture() else {
+        eprintln!("skipping noel registry path: noel-son-lumiere.amv not staged");
+        return;
+    };
+    let (header, video, audio) = split_payloads(&path);
+
+    let mut ctx = RuntimeContext::new();
+    register(&mut ctx);
+
+    // Video: registry decode == direct YUV decode at the noel geometry.
+    let mut vparams = CodecParameters::video(CodecId::new(VIDEO_DIRECT_CODEC_ID));
+    vparams.width = Some(header.width);
+    vparams.height = Some(header.height);
+    vparams.pixel_format = Some(PixelFormat::Yuv420P);
+    for &i in &[0usize, 5, 500, 2927] {
+        let mut dec = ctx
+            .codecs
+            .first_decoder(&vparams)
+            .expect("registry resolves amv_video decoder");
+        let pkt = Packet::new(0, TimeBase::new(1, header.fps as i64), video[i].clone());
+        dec.send_packet(&pkt).expect("send video packet");
+        let Frame::Video(frame) = dec.receive_frame().expect("receive video frame") else {
+            panic!("expected a video frame for frame {i}");
+        };
+        let bound = AmvVideoFrame::bind_strict(&header, &video[i]).expect("bind frame");
+        let yuv = decode_frame_yuv420p(&bound).expect("direct yuv decode");
+        assert_eq!(frame.planes[0].stride, 96, "frame {i}: noel Y stride");
+        assert_eq!(frame.planes[0].data, yuv.y, "frame {i}: Y plane");
+        assert_eq!(frame.planes[1].data, yuv.cb, "frame {i}: Cb plane");
+        assert_eq!(frame.planes[2].data, yuv.cr, "frame {i}: Cr plane");
+    }
+
+    // Audio: registry decode == direct decode on real noel blocks
+    // (including their 0xAA device byte and populated step-index field).
+    let mut aparams = CodecParameters::audio(CodecId::new(AUDIO_CODEC_ID));
+    aparams.channels = Some(1);
+    aparams.sample_rate = Some(22_050);
+    aparams.sample_format = Some(SampleFormat::S16);
+    for &i in &[0usize, 50, 1500, 2927] {
+        let mut dec = ctx
+            .codecs
+            .first_decoder(&aparams)
+            .expect("registry resolves adpcm_amv decoder");
+        let pkt = Packet::new(1, TimeBase::new(1, 22_050), audio[i].clone());
+        dec.send_packet(&pkt).expect("send audio packet");
+        let Frame::Audio(frame) = dec.receive_frame().expect("receive audio frame") else {
+            panic!("expected an audio frame for block {i}");
+        };
+        let direct = decode_audio_payload(&audio[i]).expect("direct decode");
+        assert_eq!(frame.samples as usize, direct.len(), "block {i}: count");
+        assert_eq!(frame.data.len(), 1, "block {i}: mono, one plane");
+        let got: Vec<i16> = frame.data[0]
+            .chunks_exact(2)
+            .map(|c| i16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(got, direct, "block {i}: registry == direct PCM");
+    }
+}

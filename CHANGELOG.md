@@ -8,6 +8,16 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Cross-profile registry-path test** — the `RuntimeContext`-resolved
+  `amv_video` / `adpcm_amv` decoders match the direct free-function
+  decode byte-for-byte on sampled real noel frames and blocks at the
+  96 × 64 geometry, proving the registry path takes its geometry from
+  `CodecParameters` rather than being silently comedian-shaped. README
+  gains a cross-profile conformance section and records the third fuzz
+  finding; the synthetic-geometry paragraph now cites the trace's
+  real-bytes 160 × 120 confirmation instead of the closed "untested
+  here" gap.
+
 - **Noel-profile encoder round-trip
   (`tests/noel_encode_roundtrip.rs`).** The full decode → encode → mux →
   demux → decode loop closes on the second device profile: 2928/2928

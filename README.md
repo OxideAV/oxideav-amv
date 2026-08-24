@@ -69,7 +69,15 @@ decode.
 - **Consistency checks** — `video_frames_emitted()` and
   `duration_consistent_with_drained_frames()` tie the `movi` walk back
   to the `amvh` packed-byte duration via the trace invariant
-  (frames ÷ fps = duration). `audio_blocks_emitted()` and
+  (frames ÷ fps = duration). Because the §4b closing observation records
+  that the noel-profile device writes that header **truncated by one
+  second** (3:02 against a derived 2928 ÷ 16 = 3:03 — "should not be
+  used as an authoritative duration"), the graded
+  `duration_consistency_with_drained_frames()` returns a
+  `DurationConsistency` (`Exact` / `TruncatedByOneSecond` / `Mismatch`,
+  with `is_device_conformant()`) so a validator accepts both observed
+  device shapes while still catching real header↔payload disagreements.
+  `audio_blocks_emitted()` and
   `movi_interleave_balanced()` add the §4 strict 1:1 video:audio pairing
   cross-check at the demuxer level: after a clean trailer-bounded drain
   the `01wb`-block count equals the `00dc`-frame count ("1116 / 1116,
@@ -158,8 +166,10 @@ fade frame is accepted only when near-perfectly uniform, never noisy).
 The reference tests skip when no decoder binary is on `PATH`; no decoder
 *source* is ever read — the validator is an opaque process.
 
-A **synthetic-geometry** unit harness hardens the trace §4a *"behaviour
-for non-multiple-of-16 dimensions is untested here"* gap without any
+A **synthetic-geometry** unit harness covers non-multiple-of-16
+dimensions (the trace's cross-profile table closes the same question on
+real bytes: a 160 × 120 corpus sample — 7.5 MCU rows — decodes clean
+under the ordinary JPEG padding rule) without any
 external fixture or JPEG encoder: it hand-builds a bare `00dc` entropy
 stream from the public Annex K Huffman codes the decoder already uses
 (MSB-first bit writer with `FF`→`FF 00` re-stuffing) and decodes it back
@@ -306,6 +316,28 @@ source decode at MAE < 3/channel (globally stable — the float DCT is not
 bit-exact on real high-frequency content), audio re-decode is byte-exact,
 and the loop converges across generations.
 
+### Cross-profile conformance (second staged fixture)
+
+Every subsystem above is validated against **both** staged device
+profiles — `comedian.amv` (128 × 96 @ 12 fps, 1116 pairs) and
+`noel-son-lumiere.amv` (96 × 64 @ 16 fps, 2928 pairs) — so the §4a/§4b
+device tables are pinned as properties of the *format*, not of one
+file. The noel suites cover: strict-sentinel open + full 2928/2928
+trailer-bounded drain under the §4 interleave; the §4b preamble survey
+byte-for-byte against the trace's table (`+0x03 = 0xAA` in all 2928
+blocks — the value that settles the one-byte step-index field width —
+step index spanning 0…80, non-zero in 2914 blocks); in-crate decode of
+**all 2928 frames** plus black-box reference cross-checks (video MAE
+within the comedian envelope for both chroma filters, `ffprobe` reading
+the decoded WAV back as 22 050 Hz mono ≈ 183.0 s); the §4b audio decode
+landing the trace's exact totals (4 035 189 samples, **clip-free** —
+the reset-rule signature); indexed-vs-linear seek equality; the
+registry-resolved decoders matching the direct decode at the second
+geometry; and the full decode → encode → mux → demux → decode loop
+(audio byte-idempotent at the 1378/1379-sample block sizing, muxer
+writing the exact 3:03 derivation where the device wrote its truncated
+3:02).
+
 ### Standalone byte parsers
 
 The byte-level types are usable without the framework: `AmvHeader`,
@@ -339,8 +371,11 @@ byte parser, the full `open` + drain path, and the codec-level §4a/§4b
 decode (both chroma-upsampling filters) + budgeted-encode round-trip
 for panic-free behaviour on arbitrary input. The sweep has real teeth:
 it caught (and the crate then fixed, with regression tests) a hostile
-`decoded_sample_count` dword driving a multi-GiB preallocation and a
-divide-by-zero on hostile fps / sample-rate dwords above 10⁶. A
+`decoded_sample_count` dword driving a multi-GiB preallocation, a
+divide-by-zero on hostile fps / sample-rate dwords above 10⁶, and a
+hostile `00dc`/`01wb` chunk-size dword driving a ~1 GiB demuxer
+body preallocation (chunk bodies now grow only as real bytes arrive,
+so the claim degenerates to the ordinary truncation path). A
 Criterion suite under [`benches/`](./benches/) A/Bs the demux drain,
 index build, indexed-vs-linear seek, mux write, and rate-controlled
 encode hot paths, synthesising all inputs through the public API (no
