@@ -6,6 +6,25 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Graded §2 duration cross-check + noel-profile container
+  conformance.** `AmvDuration::consistency_with_frame_count` and
+  `AmvDemuxer::duration_consistency_with_drained_frames` return the new
+  `DurationConsistency` grade (`Exact` / `TruncatedByOneSecond` /
+  `Mismatch`, with `is_device_conformant()`): the trace's §4b closing
+  observation records that the noel profile's device writes its `amvh`
+  duration truncated by one second (3:02 against a derived
+  2928 ÷ 16 = 183 s = 3:03) — a genuine device-written shape the
+  byte-exact boolean check rejects. The new `tests/noel_profile.rs`
+  suite validates the full container surface against the second staged
+  fixture: strict-sentinel open, 2928/2928 drain under the §4 1:1
+  interleave to a trailer-bounded EOF, the §4b preamble survey pinned
+  to the trace's table (`+0x03 = 0xAA` in all 2928 blocks, step index
+  0…80 and in IMA range everywhere, non-zero in 2914 blocks, first
+  block 0), §4a shape validation of all 2928 video payloads, and an
+  indexed mid-stream seek matching the linear walk byte-for-byte.
+
 ### Changed
 
 - **§4b preamble step-index field width settled — `initial_step_index()`

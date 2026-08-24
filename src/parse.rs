@@ -332,6 +332,81 @@ impl AmvDuration {
     pub fn is_consistent_with_frame_count(&self, frame_count: u64, fps: u32) -> bool {
         *self == Self::from_frame_count(frame_count, fps)
     }
+
+    /// Graded version of [`Self::is_consistent_with_frame_count`] that
+    /// recognises the device's **one-second header truncation** as its
+    /// own state, per the trace's §4b closing observation: "the `amvh`
+    /// duration bytes for `noel-son-lumiere.amv` read 3:02 (182 s)
+    /// against an audio length of exactly 183.00 s; the header's
+    /// second/minute fields appear to be truncated rather than rounded,
+    /// and should not be used as an authoritative duration."
+    ///
+    /// Returns:
+    ///
+    /// * [`DurationConsistency::Exact`] — the triple equals
+    ///   [`Self::from_frame_count`] exactly (the comedian profile:
+    ///   `1116 ÷ 12 = 93 s = 1:33`, matching the header byte-for-byte).
+    /// * [`DurationConsistency::TruncatedByOneSecond`] — the header
+    ///   reads exactly one second **less** than the frame-count
+    ///   derivation (the noel profile: `2928 ÷ 16 = 183 s = 3:03`
+    ///   derived vs `3:02` written). This is a device-written,
+    ///   trace-recorded shape, not corruption — a validator should
+    ///   accept it while preferring the frame-count derivation as the
+    ///   authoritative duration.
+    /// * [`DurationConsistency::Mismatch`] — anything else (including
+    ///   the truncated-file case where the header records the intended
+    ///   full duration but the walk drained far fewer chunks).
+    ///
+    /// `fps == 0` follows [`Self::from_frame_count`]'s guard: the
+    /// derivation is the all-zero duration, so an all-zero `self` grades
+    /// `Exact` and everything else `Mismatch`.
+    pub fn consistency_with_frame_count(&self, frame_count: u64, fps: u32) -> DurationConsistency {
+        let derived = Self::from_frame_count(frame_count, fps);
+        if *self == derived {
+            return DurationConsistency::Exact;
+        }
+        let header_secs = self.total_seconds() as u64;
+        let derived_secs = derived.total_seconds() as u64;
+        if header_secs + 1 == derived_secs {
+            return DurationConsistency::TruncatedByOneSecond;
+        }
+        DurationConsistency::Mismatch
+    }
+}
+
+/// Grade returned by [`AmvDuration::consistency_with_frame_count`] (and
+/// [`AmvDemuxer::duration_consistency_with_drained_frames`](crate::AmvDemuxer::duration_consistency_with_drained_frames)):
+/// how a §2 `amvh` packed-byte duration relates to the duration derived
+/// from an observed video-chunk count.
+///
+/// Both non-`Mismatch` grades are trace-recorded device-written shapes:
+/// the comedian profile writes the exact derivation, the noel profile
+/// writes one second less (truncated, per §4b's closing observation "the
+/// header's second/minute fields appear to be truncated rather than
+/// rounded, and should not be used as an authoritative duration"). A
+/// strict validator should accept both and treat the frame-count
+/// derivation as authoritative.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurationConsistency {
+    /// Header equals the frame-count derivation byte-for-byte.
+    Exact,
+    /// Header reads exactly one second less than the derivation — the
+    /// device's truncation, observed on the noel profile (3:02 written
+    /// vs 3:03 derived).
+    TruncatedByOneSecond,
+    /// Any other disagreement — e.g. a power-cut-truncated file whose
+    /// header still records the intended full duration.
+    Mismatch,
+}
+
+impl DurationConsistency {
+    /// Whether this grade is a trace-recorded device-written shape —
+    /// `true` for [`Self::Exact`] and [`Self::TruncatedByOneSecond`],
+    /// `false` for [`Self::Mismatch`]. The predicate a validator that
+    /// accepts both observed device profiles should use.
+    pub fn is_device_conformant(&self) -> bool {
+        matches!(self, Self::Exact | Self::TruncatedByOneSecond)
+    }
 }
 
 /// Decoded view of the audio `WAVEFORMATEX` (§3b). All multi-byte
@@ -2307,6 +2382,84 @@ pub(crate) mod tests {
     fn duration_is_consistent_rejects_noel_header_vs_chunk_count_mismatch() {
         let parsed = AmvDuration::from_packed(0x0000_0302);
         assert!(!parsed.is_consistent_with_frame_count(2928, 16));
+    }
+
+    /// The graded check recognises the §4b-recorded device truncation:
+    /// noel's header 3:02 against the derived 2928 ÷ 16 = 183 s = 3:03
+    /// grades `TruncatedByOneSecond` — a device-conformant shape, not a
+    /// mismatch.
+    #[test]
+    fn duration_consistency_grades_noel_header_as_truncated_by_one() {
+        let parsed = AmvDuration::from_packed(0x0000_0302);
+        let grade = parsed.consistency_with_frame_count(2928, 16);
+        assert_eq!(grade, DurationConsistency::TruncatedByOneSecond);
+        assert!(grade.is_device_conformant());
+    }
+
+    /// The graded check reports the comedian worked-example pair as
+    /// `Exact` (also device-conformant).
+    #[test]
+    fn duration_consistency_grades_comedian_header_as_exact() {
+        let parsed = AmvDuration::from_packed(0x0000_0121);
+        let grade = parsed.consistency_with_frame_count(1116, 12);
+        assert_eq!(grade, DurationConsistency::Exact);
+        assert!(grade.is_device_conformant());
+    }
+
+    /// The graded check still calls a real disagreement `Mismatch`: a
+    /// power-cut file whose header records the intended 1:33 but whose
+    /// walk only drained half the chunks (558 ÷ 12 = 46 s), and the
+    /// opposite direction where the header reads one second *more* than
+    /// the derivation (truncation only ever loses time, per §4b).
+    #[test]
+    fn duration_consistency_grades_real_disagreements_as_mismatch() {
+        let parsed = AmvDuration::from_packed(0x0000_0121);
+        let grade = parsed.consistency_with_frame_count(558, 12);
+        assert_eq!(grade, DurationConsistency::Mismatch);
+        assert!(!grade.is_device_conformant());
+        // Header one second AHEAD of the derivation is not truncation.
+        let ahead = AmvDuration::from_packed(0x0000_0122); // 1:34
+        assert_eq!(
+            ahead.consistency_with_frame_count(1116, 12),
+            DurationConsistency::Mismatch
+        );
+    }
+
+    /// Minute-boundary truncation: a header written as 0:59 against a
+    /// derived 60 s (= 1:00) is still the one-second truncation shape —
+    /// the grade compares total seconds, not per-component deltas.
+    #[test]
+    fn duration_consistency_truncation_crosses_minute_boundary() {
+        let parsed = AmvDuration {
+            seconds: 59,
+            minutes: 0,
+            hours: 0,
+        };
+        assert_eq!(
+            parsed.consistency_with_frame_count(720, 12), // 60 s
+            DurationConsistency::TruncatedByOneSecond
+        );
+    }
+
+    /// Zero-fps guard propagates: all-zero header grades `Exact`, any
+    /// non-zero header grades `Mismatch` (never `TruncatedByOneSecond`,
+    /// since the derivation is 0 s and the header cannot be −1 s).
+    #[test]
+    fn duration_consistency_zero_fps_guard() {
+        let zero = AmvDuration {
+            seconds: 0,
+            minutes: 0,
+            hours: 0,
+        };
+        assert_eq!(
+            zero.consistency_with_frame_count(1116, 0),
+            DurationConsistency::Exact
+        );
+        let nonzero = AmvDuration::from_packed(0x0000_0121);
+        assert_eq!(
+            nonzero.consistency_with_frame_count(1116, 0),
+            DurationConsistency::Mismatch
+        );
     }
 
     /// `is_consistent_with_frame_count` rejects the comedian profile

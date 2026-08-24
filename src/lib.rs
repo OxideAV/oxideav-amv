@@ -128,9 +128,9 @@ pub use muxer::AmvMuxer;
 pub use parse::{
     validate_movi_interleave, validate_video_payload_no_internal_markers,
     validate_video_payload_shape, AmvAudioPreamble, AmvDuration, AmvHeader, AmvWaveFormat,
-    ChunkHeader, ChunkKind, MoviPayload, MoviPayloadIter, AMVH_BODY_LEN, AMV_AUDIO_PREAMBLE_LEN,
-    AMV_END_TRAILER, AMV_FORM_TYPE, AUDIO_CHUNK_TAG, IMA_STEP_INDEX_MAX, JPEG_EOI, JPEG_SOI,
-    VIDEO_CHUNK_TAG,
+    ChunkHeader, ChunkKind, DurationConsistency, MoviPayload, MoviPayloadIter, AMVH_BODY_LEN,
+    AMV_AUDIO_PREAMBLE_LEN, AMV_END_TRAILER, AMV_FORM_TYPE, AUDIO_CHUNK_TAG, IMA_STEP_INDEX_MAX,
+    JPEG_EOI, JPEG_SOI, VIDEO_CHUNK_TAG,
 };
 pub use rate::AmvRateController;
 pub use video::{flip_rows_vertical, AmvVideoFrame};

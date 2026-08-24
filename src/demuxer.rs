@@ -690,6 +690,35 @@ impl AmvDemuxer {
             .is_consistent_with_frame_count(self.video_frames_emitted(), self.header.fps)
     }
 
+    /// Graded version of
+    /// [`Self::duration_consistent_with_drained_frames`], recognising
+    /// the device's one-second header truncation as its own state.
+    ///
+    /// The boolean cross-check above demands byte-exact agreement with
+    /// the frame-count derivation — which the comedian profile satisfies
+    /// (`1116 ÷ 12 = 93 s = 1:33`, written verbatim) but the noel
+    /// profile does **not**: its device wrote `3:02` against a derived
+    /// `2928 ÷ 16 = 183 s = 3:03`. Per the trace's §4b closing
+    /// observation the header's second/minute fields "appear to be
+    /// truncated rather than rounded, and should not be used as an
+    /// authoritative duration", so a validator that rejects that file
+    /// on the boolean check is rejecting a genuine device-written
+    /// stream. This method returns
+    /// [`DurationConsistency`](crate::DurationConsistency) instead:
+    /// `Exact` for the comedian shape, `TruncatedByOneSecond` for the
+    /// noel shape (both `is_device_conformant()`), `Mismatch` for a
+    /// real header↔payload disagreement such as a power-cut-truncated
+    /// file.
+    ///
+    /// Like the boolean form, read this **only after a complete forward
+    /// drain to EOF** — mid-walk the drained count reflects the cursor,
+    /// not the stream total.
+    pub fn duration_consistency_with_drained_frames(&self) -> crate::DurationConsistency {
+        self.header
+            .duration()
+            .consistency_with_frame_count(self.video_frames_emitted(), self.header.fps)
+    }
+
     /// Absolute file offset at which the §4c [`AMV_END_TRAILER`] literal
     /// (`AMV_END_`) was observed, or `None` if the walk has not yet
     /// reached a clean trailer-bounded EOF.
@@ -1357,6 +1386,39 @@ mod tests {
         assert!(
             !d.duration_consistent_with_drained_frames(),
             "header's 1:33 must not agree with only 3 drained frames"
+        );
+        assert_eq!(
+            d.duration_consistency_with_drained_frames(),
+            crate::DurationConsistency::Mismatch,
+            "3 drained frames vs a 1:33 header is a real mismatch, not truncation"
+        );
+    }
+
+    #[test]
+    fn duration_cross_check_grades_device_truncated_header() {
+        // The noel-profile device shape at synthetic scale: the header
+        // writes one second LESS than the frame-count derivation (§4b:
+        // "truncated rather than rounded"). 720 frames / 12 fps = 60 s
+        // = 1:00 derived, header written as 0:59 (packed 0x0000_003B).
+        let buf = build_synthetic_file_with_duration(720, 0x0000_003B);
+        let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+        loop {
+            match d.next_packet() {
+                Ok(_) => {}
+                Err(Error::Eof) => break,
+                Err(e) => panic!("walk error: {e:?}"),
+            }
+        }
+        assert_eq!(d.video_frames_emitted(), 720);
+        assert!(
+            !d.duration_consistent_with_drained_frames(),
+            "the boolean check is byte-exact and rejects the truncated header"
+        );
+        let grade = d.duration_consistency_with_drained_frames();
+        assert_eq!(grade, crate::DurationConsistency::TruncatedByOneSecond);
+        assert!(
+            grade.is_device_conformant(),
+            "a one-second-truncated header is a trace-recorded device shape"
         );
     }
 
