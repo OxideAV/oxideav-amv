@@ -8,6 +8,18 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Noel-profile encoder round-trip
+  (`tests/noel_encode_roundtrip.rs`).** The full decode → encode → mux →
+  demux → decode loop closes on the second device profile: 2928/2928
+  pairs re-encoded and re-muxed to a strict-open-valid AMV, video
+  re-decode tracking the source below MAE 3/channel, audio byte-
+  idempotent at the 16 fps block sizing (1378/1379-sample blocks).
+  Profile-specific pins: the muxer's §2 duration patch writes the exact
+  `2928 ÷ 16 = 3:03` derivation (grading `Exact` on re-demux) rather
+  than reproducing the device's truncated `3:02`, and the re-encoded
+  §4b headers carry the canonical `+0x02 = 0` / `+0x03 = 0` bytes — the
+  decode is invariant to noel's `0xAA` device byte by construction.
+
 - **Cross-profile codec conformance (`tests/noel_codec.rs`).** The §4a
   and §4b decodes established on `comedian.amv` hold unchanged on the
   second device profile: all 2928 noel video frames decode in-crate at
