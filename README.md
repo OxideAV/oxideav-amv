@@ -319,13 +319,18 @@ frame header — resolution comes from `amvh`), exposing the entropy-coded
 window between SOI and EOI for a future decoder. AMV's per-block audio
 preamble (`state`, `decoded_sample_count`) is surfaced verbatim, with
 nibble-budget / sample-interval cross-checks for recovery tooling. The §4b
-"refined" split re-reads the raw `state` dword as the two packed signed-16-bit
-fields it actually carries — `initial_predictor()` (the per-block ADPCM seed at
-`+0x00`) and `initial_step_index()` (`+0x02`, always 0 in both fixtures) — with
-`step_index_in_ima_range()` range-checking the step index against the canonical
-IMA `[0, 88]` table bound (`IMA_STEP_INDEX_MAX`). The nibble-to-PCM decode
-itself is the in-crate `adpcm_amv` codec (`decode_audio_payload` /
-`AmvAudioDecoder`).
+"refined" split re-reads the raw `state` dword as the packed fields it actually
+carries — `initial_predictor()` (the signed-16-bit per-block ADPCM seed at
+`+0x00`), `initial_step_index()` (the **one-byte** field at `+0x02` — emitted by
+the device encoder in nearly every block after the first, always inside
+`[0, 88]`, but never honoured by any valid decode per the settled §4b ruling)
+and `device_constant_byte()` (`+0x03`, a per-file encoder-identifying constant:
+`0x00` in `comedian.amv`, `0xAA` in every `noel-son-lumiere.amv` block — the
+value that settles the field width, since a 16-bit read at `+0x02` would put
+every noel block outside the IMA domain). `step_index_in_ima_range()`
+range-checks the step index against the canonical IMA `[0, 88]` table bound
+(`IMA_STEP_INDEX_MAX`). The nibble-to-PCM decode itself is the in-crate
+`adpcm_amv` codec (`decode_audio_payload` / `AmvAudioDecoder`).
 
 ### Fuzz + bench
 

@@ -30,11 +30,14 @@
 //! Per §4b the block is **self-contained**: the predictor is seeded from
 //! the header `int16` and the step index is reset to `0` at block start.
 //! The encoder writes the first sample as the predictor seed (so the
-//! decoder's re-seed reproduces it exactly) and emits the `+0x02`
-//! `initialStepIndex` field as `0` — the decode-verified always-reset
-//! value (the §4b gap note records that seeding a non-zero step index
-//! "made the output worse"; the encoder emits the value the decoder
-//! honours).
+//! decoder's re-seed reproduces it exactly) and emits the one-byte
+//! `+0x02` `initialStepIndex` field as `0` — per the settled §4b ruling
+//! the field is "emitted but must not be honoured" (device encoders
+//! populate it after the first block, but no decode consistent with the
+//! observed audio honours it, and its meaning to the device encoder is
+//! an open trace gap), so this encoder emits the one value every
+//! decoder agrees on. The `+0x03` per-file device-constant byte is
+//! emitted as `0` (the comedian profile's value).
 //!
 //! No ADPCM **encoder** source was read; the standard IMA step / index
 //! tables are public (the IMA/DVI ADPCM recommendation) and are the same

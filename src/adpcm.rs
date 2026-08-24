@@ -61,8 +61,8 @@ const IMA_STEP_TABLE: [i32; 89] = [
 const IMA_INDEX_TABLE: [i32; 8] = [-1, -1, -1, -1, 2, 4, 6, 8];
 
 /// Maximum valid step index — the 89-entry [`IMA_STEP_TABLE`] is indexed
-/// `[0, 88]`. (Mirrors the `i16`-typed [`crate::IMA_STEP_INDEX_MAX`]
-/// preamble-range bound, here as the table's `usize` upper index.)
+/// `[0, 88]`. (Mirrors the `u8`-typed [`crate::IMA_STEP_INDEX_MAX`]
+/// preamble-range bound, here as the table's `i32` upper index.)
 const STEP_INDEX_MAX: i32 = (IMA_STEP_TABLE.len() - 1) as i32;
 
 /// Decode one 4-bit ADPCM nibble against a running `(predictor, index)`
@@ -117,13 +117,14 @@ fn decode_nibble(nibble: u8, predictor: &mut i32, index: &mut i32) -> i16 {
 ///   the header `int16` ([`AmvAudioPreamble::initial_predictor`]) and
 ///   the step index is **reset to 0** at the start of every block (no
 ///   state carries across blocks). The step index is *not* taken from
-///   the preamble `+0x02` field. The trace's §4b "refined header layout"
-///   reports that field as "always `00 00`", but it is in fact non-zero
-///   in some blocks of the staged fixture (e.g. `30` at audio block 50);
-///   the §4b gap note records that "treating header +2 as the step index
-///   made the output worse", and only an index-0 reset reproduces the
-///   decode-verified sanity numbers below. The validated decode therefore
-///   ignores `+0x02`.
+///   the preamble's one-byte `+0x02` field: the trace's settled §4b
+///   ruling ("`initialStepIndex` is emitted but must not be honoured")
+///   measures that seeding from the field inflates the comedian clip
+///   rate 27.8× and takes noel-son-lumiere from a completely clip-free
+///   decode to 0.11 % railing, while resetting to 0 is the only rule
+///   that decodes both staged fixtures cleanly. The `+0x03` byte
+///   ([`AmvAudioPreamble::device_constant_byte`]) is likewise ignored —
+///   it is a per-file device constant, not a codec field.
 /// * Nibbles are unpacked **low-nibble-first** (the standard IMA byte
 ///   order): byte `b` yields nibble `b & 0x0F` then `b >> 4`.
 /// * Exactly `decoded_sample_count` outputs are kept (the trace's
@@ -149,12 +150,11 @@ pub fn decode_audio_block(preamble: &AmvAudioPreamble, compressed_body: &[u8]) -
     // and the step index is **reset to 0** at block start — the trace's
     // decode-verified recipe ("seeding each block's predictor from its
     // header int16 and resetting the step index to 0"). The step index is
-    // *not* seeded from the preamble `+0x02` field: the trace's §4b gap
-    // note records that "treating header +2 as the step index made the
-    // output worse", and decoding with index 0 is what reproduces the
-    // 0.024 % clip rate / 93.0 s sanity result. (The on-disk `+0x02`
-    // field is not in fact always zero across all blocks — see
-    // `decode_audio_block` doc — but the validated decode ignores it.)
+    // *not* seeded from the preamble's one-byte `+0x02` field: the
+    // settled §4b ruling measures 27.8× clip-rate inflation on comedian
+    // (and 0 % → 0.11 % railing on noel) when the field is honoured;
+    // index 0 is the only rule that reproduces the 0.024 % clip / 93.0 s
+    // sanity result on comedian and the clip-free 183.0 s on noel.
     let mut predictor = preamble.initial_predictor() as i32;
     let mut index = 0i32;
 

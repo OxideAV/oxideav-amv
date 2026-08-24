@@ -8,6 +8,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **§4b preamble step-index field width settled — `initial_step_index()`
+  is now `u8`** (was `i16`), per the trace's updated "`+2` is one byte,
+  not the low half of an int16" ruling: `noel-son-lumiere.amv` carries
+  `0xAA` at preamble `+0x03` in every one of its 2928 blocks, so a
+  16-bit read at `+0x02` lands outside the IMA `[0, 88]` domain in
+  every block (−21936…−21856 as an i16) — the exact trap the old
+  accessor fell into. The new `AmvAudioPreamble::device_constant_byte()`
+  surfaces `+0x03` separately (a per-file encoder-identifying constant:
+  `0x00` comedian, `0xAA` noel), `step_index_in_ima_range()` now checks
+  the one-byte field, and `IMA_STEP_INDEX_MAX` is `u8` to match. Unit
+  tests pin the noel trap case (`state = 0xAA30_0005` splits to
+  predictor 5 / step 0x30 / device 0xAA, in IMA range). Decode paths
+  are unaffected — they already reset the step index to 0 per the
+  settled §4b "emitted but must not be honoured" ruling, whose measured
+  evidence (27.8× clip-rate inflation on comedian, clip-free → 0.11 %
+  railing on noel when the field is honoured) now backs the doc
+  comments in place of the older "gap" phrasing.
+
 - **λ warm start across frames in the `amv_video` registry encoder** —
   the rate-controlled encoder now carries the previous frame's fitted
   Lagrangian price into the next frame's budget search
