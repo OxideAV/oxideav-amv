@@ -84,6 +84,24 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Fuzz-found hostile-input hardening #3: demuxer chunk-body
+  preallocation.** A `00dc` / `01wb` chunk header claiming a multi-GiB
+  body the stream does not carry made `read_video_packet` /
+  `read_audio_packet` pre-allocate `vec![0u8; size]` before the first
+  body byte was read — a 419-byte hostile file asked malloc for
+  ~1 GiB (fuzz-found by this round's `demuxer_open` sweep after the
+  target gained post-drain accessor coverage; the demuxer-side sibling
+  of the earlier `decoded_sample_count` decode hardening). Chunk
+  bodies are now read through a capped-prealloc bounded `take(size)`
+  that grows only as real bytes arrive, so a hostile claim costs
+  memory proportional to the bytes that actually exist and degenerates
+  to the ordinary mid-body truncation path (graceful EOF + truncation
+  flag — regression-tested at the fuzz artifact's exact size claim and
+  at `u32::MAX`). Well-formed files take a single allocation, as
+  before. The `parse` / `demuxer_open` fuzz targets now also drive the
+  §4b refined-split accessors, the graded duration cross-check and the
+  post-drain counters, with noel-derived corpus seeds.
+
 - **Two fuzz-found hostile-input hardenings** (both pre-existing;
   surfaced by this round's bounded `cargo fuzz` sweep of all three
   targets):

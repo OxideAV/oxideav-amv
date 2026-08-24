@@ -35,8 +35,10 @@
 //!    [`oxideav_amv::AmvDuration::to_packed`] — the §2 `+0x34`
 //!    `[seconds, minutes, hours, 0]` round-trip.
 //! 7. [`oxideav_amv::AmvDuration::from_frame_count`] +
-//!    [`oxideav_amv::AmvDuration::is_consistent_with_frame_count`] —
-//!    the §2 `frame_count / fps` derivation and its cross-check.
+//!    [`oxideav_amv::AmvDuration::is_consistent_with_frame_count`] +
+//!    [`oxideav_amv::AmvDuration::consistency_with_frame_count`] —
+//!    the §2 `frame_count / fps` derivation, its boolean cross-check
+//!    and the graded (device-truncation-aware) cross-check.
 //! 8. [`oxideav_amv::ChunkHeader::parse`] — the §4 8-byte leaf
 //!    `[FOURCC, size]` header.
 //! 9. [`oxideav_amv::AmvAudioPreamble::parse`] +
@@ -44,7 +46,10 @@
 //!    [`oxideav_amv::AmvAudioPreamble::is_consistent_with_frame_interval`] +
 //!    [`oxideav_amv::AmvAudioPreamble::nibble_body_len`] +
 //!    [`oxideav_amv::AmvAudioPreamble::is_consistent_with_body_len`] +
-//!    [`oxideav_amv::AmvAudioPreamble::body_padding_slack`]
+//!    [`oxideav_amv::AmvAudioPreamble::body_padding_slack`] + the
+//!    refined-split accessors (`initial_predictor`,
+//!    `initial_step_index`, `device_constant_byte`,
+//!    `step_index_in_ima_range`)
 //!    — the §4b 8-byte preamble + its strict / cross-check helpers.
 //! 10. [`oxideav_amv::validate_video_payload_shape`] +
 //!     [`oxideav_amv::validate_video_payload_no_internal_markers`]
@@ -113,6 +118,14 @@ fuzz_target!(|data: &[u8]| {
         let derived = AmvDuration::from_frame_count(frame_count, fps);
         let _ = derived.to_packed();
         let _ = derived.is_consistent_with_frame_count(frame_count, fps);
+        // Graded §2 cross-check: the tri-state consistency (Exact /
+        // TruncatedByOneSecond / Mismatch) is infallible for any pair.
+        let parsed = AmvDuration::from_packed(u32::from_le_bytes([
+            data[0], data[1], data[2], data[3],
+        ]));
+        let _ = parsed
+            .consistency_with_frame_count(frame_count, fps)
+            .is_device_conformant();
     }
 
     // -----------------------------------------------------------------
@@ -131,6 +144,13 @@ fuzz_target!(|data: &[u8]| {
     // -----------------------------------------------------------------
     if let Ok(preamble) = AmvAudioPreamble::parse(data) {
         let _ = preamble.validate_sentinels();
+        // §4b refined split: the three packed-field accessors and the
+        // IMA range bound are pure bit extractions — infallible on any
+        // state dword (including the noel-profile 0xAA device byte).
+        let _ = preamble.initial_predictor();
+        let _ = preamble.initial_step_index();
+        let _ = preamble.device_constant_byte();
+        let _ = preamble.step_index_in_ima_range();
         // §4b nibble budget: the expected compressed-body byte count and
         // the full-payload cross-check must never overflow or panic on an
         // attacker-chosen decoded_sample_count.

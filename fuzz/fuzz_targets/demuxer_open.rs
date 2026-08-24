@@ -74,6 +74,17 @@ fuzz_target!(|data: &[u8]| {
                 Err(_e) => break,
             }
         }
+        // Post-drain cross-check accessors are infallible at any walk
+        // position (mid-drain, truncated, or clean EOF): the boolean
+        // and graded §2 duration checks, the §4 interleave balance and
+        // the chunk counters must never panic on hostile headers.
+        let _ = demux.video_frames_emitted();
+        let _ = demux.audio_blocks_emitted();
+        let _ = demux.movi_interleave_balanced();
+        let _ = demux.duration_consistent_with_drained_frames();
+        let _ = demux
+            .duration_consistency_with_drained_frames()
+            .is_device_conformant();
     }
 
     // -----------------------------------------------------------------

@@ -1111,9 +1111,33 @@ impl AmvDemuxer {
         }
     }
 
+    /// Read exactly `size` chunk-body bytes, or `None` if the stream
+    /// ends first (body truncation).
+    ///
+    /// The size dword is attacker-controlled in a hostile file: a
+    /// `00dc` / `01wb` header can claim a multi-GiB body the file does
+    /// not carry, and pre-allocating `vec![0u8; size]` up front hands
+    /// an 8-byte header a proportional allocation before the first
+    /// body byte is read (fuzz-found, `demuxer_open` target — the
+    /// demuxer-side sibling of the §4b `decoded_sample_count` decode
+    /// hardening). The pre-allocation is therefore capped and the
+    /// buffer grows only as real bytes arrive through a bounded
+    /// `take(size)` read, so a hostile claim costs memory proportional
+    /// to the bytes that actually exist. Real device chunks are a few
+    /// KiB (§4: 1633-byte frames, 927-byte blocks), far under the cap,
+    /// so well-formed files take the single-allocation path unchanged.
+    fn read_chunk_body(&mut self, size: u32) -> Option<Vec<u8>> {
+        const PREALLOC_CAP: usize = 1 << 20; // 1 MiB
+        let want = size as usize;
+        let mut data = Vec::with_capacity(want.min(PREALLOC_CAP));
+        match (&mut self.reader).take(size as u64).read_to_end(&mut data) {
+            Ok(n) if n == want => Some(data),
+            _ => None,
+        }
+    }
+
     fn read_video_packet(&mut self, chunk: ChunkHeader) -> Result<Packet> {
-        let mut data = vec![0u8; chunk.size as usize];
-        if self.reader.read_exact(&mut data).is_err() {
+        let Some(data) = self.read_chunk_body(chunk.size) else {
             // The 8-byte chunk header parsed cleanly but the body
             // didn't fit in the file — the device cut off mid-frame.
             // Drop the partial frame and surface a graceful EOF; the
@@ -1122,7 +1146,7 @@ impl AmvDemuxer {
             self.eof = true;
             self.truncated = true;
             return Err(Error::Eof);
-        }
+        };
         // Advance cursor by exactly 8 + size — NO padding (§4
         // "no-padding rule").
         self.cursor += chunk.advance_total();
@@ -1139,8 +1163,7 @@ impl AmvDemuxer {
     }
 
     fn read_audio_packet(&mut self, chunk: ChunkHeader) -> Result<Packet> {
-        let mut data = vec![0u8; chunk.size as usize];
-        if self.reader.read_exact(&mut data).is_err() {
+        let Some(data) = self.read_chunk_body(chunk.size) else {
             // Mirror the video-side body-truncation recovery: an
             // 8-byte header parsed cleanly but the body fell off the
             // end. Drop the partial block and surface a graceful EOF
@@ -1148,7 +1171,7 @@ impl AmvDemuxer {
             self.eof = true;
             self.truncated = true;
             return Err(Error::Eof);
-        }
+        };
         self.cursor += chunk.advance_total();
         // A complete `01wb` chunk landed — count it as one audio block
         // for the §4 1:1-pairing cross-check (see
@@ -2382,6 +2405,41 @@ mod tests {
         // 2 complete (V,A) pairs + 1 extra complete video chunk = 5.
         assert_eq!(got, 5);
         assert!(d.is_truncated());
+    }
+
+    /// Hostile-size chunk header (fuzz-found, `demuxer_open` target):
+    /// a `00dc` header claiming a multi-GiB body the stream does not
+    /// carry must NOT pre-allocate proportionally to the claim — the
+    /// chunk-body read grows only as real bytes arrive, so the hostile
+    /// header degenerates to the ordinary mid-body truncation path.
+    /// (The pre-fix code did `vec![0u8; size]` up front, handing a
+    /// 419-byte fuzz input a ~1 GiB zeroed allocation.) Behavioural
+    /// contract pinned here: graceful EOF + truncation flag, with only
+    /// the complete preceding pairs emitted; the allocation bound is
+    /// enforced by `read_chunk_body`'s capped-prealloc implementation.
+    #[test]
+    fn hostile_giant_chunk_size_is_truncation_not_preallocation() {
+        for (tag, huge) in [
+            (VIDEO_CHUNK_TAG, 0x4000_036Au32), // the fuzz artifact's claim
+            (AUDIO_CHUNK_TAG, u32::MAX),
+        ] {
+            let mut buf = build_synthetic_file(2);
+            buf.truncate(buf.len() - 8); // drop AMV_END_
+            buf.extend_from_slice(&tag);
+            buf.extend_from_slice(&huge.to_le_bytes());
+            buf.extend_from_slice(&[0x5A; 64]); // only 64 real bytes
+            let mut d = AmvDemuxer::open(Cursor::new(buf)).expect("open");
+            let mut got = 0;
+            loop {
+                match d.next_packet() {
+                    Ok(_) => got += 1,
+                    Err(Error::Eof) => break,
+                    Err(e) => panic!("walk error: {e:?}"),
+                }
+            }
+            assert_eq!(got, 4, "only the 2 complete (V+A) pairs are emitted");
+            assert!(d.is_truncated());
+        }
     }
 
     /// Truncation pattern #5: the file is cut after the very last
