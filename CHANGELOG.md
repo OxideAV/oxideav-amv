@@ -6,6 +6,68 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/OxideAV/oxideav-amv/compare/v0.0.9...v0.0.10) - 2026-08-24
+
+### Other
+
+- device-profile matrix - every corpus-observed geometry x fps cell round-trips
+- cross-profile registry-path equality + README cross-profile section
+- fuzz finding #3 - hostile chunk-size dword drove a 1 GiB demuxer preallocation
+- noel-profile encoder round-trip - full loop closes on the second device profile
+- cross-profile codec conformance - noel §4a/§4b decode pinned to the trace totals
+- graded duration cross-check + noel-son-lumiere container conformance suite
+- settle the §4b step-index field width - one byte at +2, device byte at +3
+- state the black-box-oracle contract without enumerated denials
+- README - warm-started steady-state encode cost
+- lambda warm start across frames in the rate-controlled encoder - 11x steady state
+- de-link private items from public rustdoc
+- README - RD rate-control planner, selectable chroma upsampling, fuzz findings
+- fix two fuzz-found hostile-input crashes; drive triangle decode from the fuzzer
+- selectable triangle chroma upsampling - 30x closer to the reference decode
+- budget-search perf pass - shared enc tables, wider bracket, budget-fill early exit
+- magnitude step-down candidates in the rate-distortion planner
+- exact Lagrangian rate-distortion coefficient planning for the budgeted encode
+- exact counting-sink size probe for the rate-control budget search
+- README — refresh budgeted-encode cost figures after the cosine-table DCT
+- precompute the DCT/IDCT cosine basis — 9x faster encode, byte-identical
+- end-to-end registry pipeline test for the rate-controlled write path
+- README — rate-control subsystem, muxer device-envelope validation, third fuzz target
+- codec_decode fuzz target — entropy-level §4a/§4b decode + budgeted-encode round-trip
+- rate_control_encode bench — budget search costs ~35% of a plain encode
+- muxer enforces the §2/§3b device-profile envelope at open
+- measured bitrate-vs-target fixture tests for the rate-controlled encode
+- §4a wire rate control into the amv_video registry encoder via CodecParameters::bit_rate
+- AmvRateController — stream-level bit-budget targeting for the video track
+- §4a rate-controlled frame encode — budgeted 00dc payloads under device-fixed tables
+- add CI / crates.io / docs.rs / MIT-license badges
+- amv_video encoder emits frame-rate-aware packet time base
+- demuxer declares amv_video so the pipeline auto-resolves the decoder
+- registry-driven end-to-end codec validation on real comedian.amv
+- §4a wire amv_video into the oxideav-core Decoder/Encoder registry
+- §4a native YUV420P plane decode + encode (no RGB round-trip)
+- §3b/§4b wire adpcm_amv into the oxideav-core Decoder/Encoder registry
+- document the encoder subsystem in README + CHANGELOG + lib docs
+- end-to-end encoder round-trip — decode→encode→mux→demux→decode on comedian.amv
+- §4a RGB→00dc baseline-JPEG video encoder (device-table-locked, fixed-point round-trip)
+- §4b PCM→01wb IMA-ADPCM audio encoder (decode-inverse, fixed-point round-trip)
+- §4a decoder truncated-entropy robustness test at non-mod-16
+- synthetic-entropy harness closes §4a non-mod-16 geometry gap
+- declare decoded audio sample format (S16 mono) on the audio stream params
+- §4b demux→PCM convenience AmvDemuxer::decode_audio_packet + end-to-end test
+- demux→pixels convenience AmvDemuxer::decode_video_packet + end-to-end test
+- §4a validate in-crate decoder vs black-box reference + all-frame sweep
+- §4a in-crate baseline-JPEG decode of 00dc frames to RGB pixels
+- §4b decode_audio_payload convenience + PCM end-to-end ffprobe validation
+- §4a bottom-up orientation helper flip_rows_vertical + real-raster orientation pin
+- §4a end-to-end decode-to-pixels validation via black-box JPEG decoder
+- §4b AMV-IMA-ADPCM audio decode (standard IMA tables) + step-index-0 erratum
+- §4b refined audio-preamble predictor/step-index split
+- §4a reconstruct device-stripped JPEG header segments
+- §4 demuxer-level 1:1 video:audio interleave cross-check
+- §2 amvh reserved-span strict validation
+- refresh to current status, drop per-round changelog cruft
+- §4b audio-block padding-slack accessor
+
 ### Added
 
 - **Device-profile matrix (`tests/device_profile_matrix.rs`).** The
