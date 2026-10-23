@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use oxideav_amv::{
-    decode_frame_from_payload, decode_frame_yuv420p_from_payload, encode_audio_payload,
-    encode_frame_yuv420p, encode_frame_yuv420p_with_budget, AmvDemuxer, AmvRateController,
+    AmvDemuxer, AmvRateController, decode_frame_from_payload, decode_frame_yuv420p_from_payload,
+    encode_audio_payload, encode_frame_yuv420p, encode_frame_yuv420p_with_budget,
 };
 use oxideav_core::{Demuxer, Error};
 

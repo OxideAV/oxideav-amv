@@ -63,8 +63,8 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_amv::{
-    validate_video_payload_no_internal_markers, validate_video_payload_shape, AmvAudioPreamble,
-    AmvDuration, AmvHeader, AmvWaveFormat, ChunkHeader,
+    AmvAudioPreamble, AmvDuration, AmvHeader, AmvWaveFormat, ChunkHeader,
+    validate_video_payload_no_internal_markers, validate_video_payload_shape,
 };
 
 fuzz_target!(|data: &[u8]| {
@@ -120,9 +120,8 @@ fuzz_target!(|data: &[u8]| {
         let _ = derived.is_consistent_with_frame_count(frame_count, fps);
         // Graded §2 cross-check: the tri-state consistency (Exact /
         // TruncatedByOneSecond / Mismatch) is infallible for any pair.
-        let parsed = AmvDuration::from_packed(u32::from_le_bytes([
-            data[0], data[1], data[2], data[3],
-        ]));
+        let parsed =
+            AmvDuration::from_packed(u32::from_le_bytes([data[0], data[1], data[2], data[3]]));
         let _ = parsed
             .consistency_with_frame_count(frame_count, fps)
             .is_device_conformant();

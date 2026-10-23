@@ -20,11 +20,11 @@
 //! on the hardcoded table contents, so anything past this structural
 //! binding is not yet groundable.
 
-use crate::parse::{
-    validate_video_payload_no_internal_markers, validate_video_payload_shape, AmvHeader, JPEG_EOI,
-    JPEG_SOI,
-};
 use crate::AmvDemuxerError;
+use crate::parse::{
+    AmvHeader, JPEG_EOI, JPEG_SOI, validate_video_payload_no_internal_markers,
+    validate_video_payload_shape,
+};
 
 /// A single AMV video frame: §2 stream geometry bound to a
 /// §4a-validated `00dc` payload.
@@ -284,7 +284,7 @@ mod tests {
     ///   begins `E6 49 A6 93` (§4a hexdump `FF D8 E6 49 A6 93 …`).
     #[test]
     fn comedian_fixture_strict_binds_all_1116_video_frames() {
-        use crate::parse::{MoviPayload, MoviPayloadIter, AMVH_BODY_LEN, AMV_END_TRAILER};
+        use crate::parse::{AMV_END_TRAILER, AMVH_BODY_LEN, MoviPayload, MoviPayloadIter};
 
         let crate_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");

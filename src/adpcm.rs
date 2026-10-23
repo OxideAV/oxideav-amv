@@ -427,7 +427,7 @@ mod tests {
     #[test]
     fn comedian_fixture_decodes_to_93s_low_clip() {
         use crate::parse::{
-            AmvAudioPreamble, MoviPayload, MoviPayloadIter, AMV_AUDIO_PREAMBLE_LEN, AMV_END_TRAILER,
+            AMV_AUDIO_PREAMBLE_LEN, AMV_END_TRAILER, AmvAudioPreamble, MoviPayload, MoviPayloadIter,
         };
 
         let crate_path =

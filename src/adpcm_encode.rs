@@ -89,11 +89,7 @@ fn nibble_delta(nibble: u8, step: i32) -> i32 {
     if nibble & 0x01 != 0 {
         diff += step >> 2;
     }
-    if nibble & 0x08 != 0 {
-        -diff
-    } else {
-        diff
-    }
+    if nibble & 0x08 != 0 { -diff } else { diff }
 }
 
 /// Choose the 4-bit nibble that best encodes `sample` given the running

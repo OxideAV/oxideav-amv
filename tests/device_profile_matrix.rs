@@ -20,8 +20,8 @@
 use std::io::Cursor;
 
 use oxideav_amv::{
-    decode_audio_payload, decode_frame_from_payload, encode_audio_payload, encode_frame_rgb,
-    AmvDemuxer, AmvMuxer, DurationConsistency,
+    AmvDemuxer, AmvMuxer, DurationConsistency, decode_audio_payload, decode_frame_from_payload,
+    encode_audio_payload, encode_frame_rgb,
 };
 use oxideav_core::{
     CodecId, CodecParameters, Demuxer, MediaType, Muxer, Packet, PixelFormat, Rational, StreamInfo,
@@ -123,8 +123,8 @@ fn mux_pairs(
     }
     mux.write_trailer().expect("write trailer");
     drop(mux);
-    let bytes = shared.0.lock().unwrap().get_ref().clone();
-    bytes
+
+    shared.0.lock().unwrap().get_ref().clone()
 }
 
 /// The full observed parameter space, one cell at a time: encode → mux

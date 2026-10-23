@@ -19,7 +19,7 @@
 //!
 //! Run with: `cargo bench -p oxideav-amv --bench rate_control_encode`
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use oxideav_amv::{encode_frame_rgb, encode_frame_rgb_with_budget};
 
 /// Deterministic textured RGB frame (gradients + LCG noise) with real
@@ -96,7 +96,7 @@ fn bench_rate_control_encode(c: &mut Criterion) {
     // probe or two instead of the full bracket + bisection).
     {
         use oxideav_amv::{
-            decode_frame_yuv420p_from_payload, encode_frame_yuv420p_with_budget_seeded, AmvHeader,
+            AmvHeader, decode_frame_yuv420p_from_payload, encode_frame_yuv420p_with_budget_seeded,
         };
         let header = AmvHeader {
             micros_per_frame: 83_333,

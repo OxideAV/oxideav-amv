@@ -47,7 +47,7 @@ pub const AMV_AUDIO_CHANNELS: u16 = 1;
 /// bytes — the [`AudioFrame`] plane layout for [`SampleFormat::S16`].
 fn samples_to_le_bytes(samples: &[i16]) -> Vec<u8> {
     let mut out = vec![0u8; samples.len() * 2];
-    for (s, dst) in samples.iter().zip(out.chunks_exact_mut(2)) {
+    for (s, dst) in samples.iter().zip(out.as_chunks_mut::<2>().0.iter_mut()) {
         dst.copy_from_slice(&s.to_le_bytes());
     }
     out
@@ -56,7 +56,9 @@ fn samples_to_le_bytes(samples: &[i16]) -> Vec<u8> {
 /// Parse interleaved little-endian S16 bytes back to mono `i16` samples.
 fn le_bytes_to_samples(bytes: &[u8]) -> Vec<i16> {
     bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|p| i16::from_le_bytes([p[0], p[1]]))
         .collect()
 }

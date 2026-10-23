@@ -7,7 +7,7 @@
 //!
 //! Run with: `cargo bench -p oxideav-amv --bench mux_write`
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 #[path = "common/mod.rs"]
 mod common;

@@ -193,7 +193,7 @@ fn push_sof0(out: &mut Vec<u8>, width: u16, height: u16) {
     push_be16(out, height); // Y (number of lines)
     push_be16(out, width); // X (samples per line)
     out.push(3); // Nf — component count
-                 // Component 1: Y, H=2 V=2, quant table 0.
+    // Component 1: Y, H=2 V=2, quant table 0.
     out.extend_from_slice(&[1, 0x22, 0]);
     // Component 2: Cb, H=1 V=1, quant table 1.
     out.extend_from_slice(&[2, 0x11, 1]);
@@ -238,7 +238,7 @@ fn push_sos(out: &mut Vec<u8>) {
     // Length: 6 fixed + 2 bytes per component × 3.
     push_be16(out, 6 + 2 * 3);
     out.push(3); // Ns — component count in scan
-                 // Cs1=Y: Td=0 (DC luma), Ta=0 (AC luma).
+    // Cs1=Y: Td=0 (DC luma), Ta=0 (AC luma).
     out.extend_from_slice(&[1, 0x00]);
     // Cs2=Cb: Td=1 (DC chroma), Ta=1 (AC chroma).
     out.extend_from_slice(&[2, 0x11]);
@@ -502,7 +502,7 @@ mod tests {
     /// canonical AMV header segments and the §4a first entropy bytes.
     #[test]
     fn comedian_first_frame_reconstructs_conforming_jpeg() {
-        use crate::parse::{MoviPayload, MoviPayloadIter, AMV_END_TRAILER};
+        use crate::parse::{AMV_END_TRAILER, MoviPayload, MoviPayloadIter};
 
         let crate_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");

@@ -39,8 +39,9 @@
 
 use libfuzzer_sys::fuzz_target;
 use oxideav_amv::{
-    decode_audio_payload, decode_frame_from_payload, decode_frame_from_payload_with,
-    decode_frame_yuv420p_from_payload, encode_frame_rgb_with_budget, AmvHeader, ChromaUpsample,
+    AmvHeader, ChromaUpsample, decode_audio_payload, decode_frame_from_payload,
+    decode_frame_from_payload_with, decode_frame_yuv420p_from_payload,
+    encode_frame_rgb_with_budget,
 };
 
 fuzz_target!(|data: &[u8]| {

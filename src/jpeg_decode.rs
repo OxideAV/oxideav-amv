@@ -40,13 +40,13 @@
 //! the public T.81 baseline algorithm and the public Annex K tables (the
 //! same table data already used by [`crate::reconstruct_jpeg`]).
 
+use crate::AmvDemuxerError;
 use crate::jpeg_reconstruct::{
     AC_CHROMA_BITS, AC_CHROMA_VALS, AC_LUMA_BITS, AC_LUMA_VALS, DC_CHROMA_BITS, DC_CHROMA_VALS,
     DC_LUMA_BITS, DC_LUMA_VALS, QUANT_CHROMA, QUANT_LUMA, ZIGZAG,
 };
 use crate::parse::AmvHeader;
-use crate::video::{flip_rows_vertical, AmvVideoFrame};
-use crate::AmvDemuxerError;
+use crate::video::{AmvVideoFrame, flip_rows_vertical};
 
 /// A decoded AMV video frame: an upright, 8-bit interleaved RGB raster at
 /// the §2 `amvh` resolution.
@@ -287,7 +287,7 @@ fn idct_8x8(block: &mut [f32; 64]) {
     let cos = dct_cos_table();
     // Rows, then columns (separable).
     let mut tmp = [0f32; 64];
-    for (y, row) in tmp.chunks_exact_mut(8).enumerate() {
+    for (y, row) in tmp.as_chunks_mut::<8>().0.iter_mut().enumerate() {
         for (x, out) in row.iter_mut().enumerate() {
             let mut s = 0f32;
             for u in 0..8usize {

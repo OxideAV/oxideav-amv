@@ -39,13 +39,13 @@
 //! duplicated). No JPEG/AMV **encoder** source was read — only the public
 //! T.81 baseline algorithm and the public Annex K tables.
 
-use crate::jpeg_decode::{dct_cos_table, DecodedFrame};
+use crate::AmvDemuxerError;
+use crate::jpeg_decode::{DecodedFrame, dct_cos_table};
 use crate::jpeg_reconstruct::{
     AC_CHROMA_BITS, AC_CHROMA_VALS, AC_LUMA_BITS, AC_LUMA_VALS, DC_CHROMA_BITS, DC_CHROMA_VALS,
     DC_LUMA_BITS, DC_LUMA_VALS, QUANT_CHROMA, QUANT_LUMA, ZIGZAG,
 };
 use crate::video::flip_rows_vertical;
-use crate::AmvDemuxerError;
 
 // ---------------------------------------------------------------------
 // Canonical Huffman ENCODE table (T.81 Annex C / K.2).
@@ -536,7 +536,7 @@ fn entropy_encode_into<S: EntropySink>(blocks: &[[i32; 64]], t: &EncTables, sink
     let mut pred_cb = 0i32;
     let mut pred_cr = 0i32;
 
-    for mcu in blocks.chunks_exact(6) {
+    for mcu in blocks.as_chunks::<6>().0.iter() {
         for luma in &mcu[..4] {
             encode_block(&mut bw, luma, dc_luma, ac_luma, &mut pred_y);
         }
@@ -1191,7 +1191,7 @@ mod tests {
         // Inverse via the same separable basis.
         use std::f32::consts::PI;
         let mut tmp = [0f32; 64];
-        for (y, row) in tmp.chunks_exact_mut(8).enumerate() {
+        for (y, row) in tmp.as_chunks_mut::<8>().0.iter_mut().enumerate() {
             for (x, out) in row.iter_mut().enumerate() {
                 let mut s = 0f32;
                 for u in 0..8usize {

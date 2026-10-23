@@ -1143,7 +1143,7 @@ pub fn validate_movi_interleave(chunks: &[ChunkKind]) -> Result<(), AmvDemuxerEr
     // §4 strict 1:1 pairing rule: every video must have a paired audio
     // block, so the total count is even — an odd-length sequence ending
     // on a video chunk has a missing trailing audio block.
-    if chunks.len() % 2 != 0 {
+    if !chunks.len().is_multiple_of(2) {
         return Err(AmvDemuxerError::InvalidData(format!(
             "movi chunk count must be even per §4 strict 1:1 pairing rule, \
              got {} chunks (missing trailing audio at #{})",

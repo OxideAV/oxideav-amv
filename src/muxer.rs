@@ -42,7 +42,7 @@ use std::io::{Seek, SeekFrom, Write};
 use oxideav_core::{Error, Muxer, Packet, Result, StreamInfo, WriteSeek};
 
 use crate::parse::{
-    AMVH_BODY_LEN, AMV_END_TRAILER, AMV_FORM_TYPE, AUDIO_CHUNK_TAG, VIDEO_CHUNK_TAG,
+    AMV_END_TRAILER, AMV_FORM_TYPE, AMVH_BODY_LEN, AUDIO_CHUNK_TAG, VIDEO_CHUNK_TAG,
 };
 
 /// File offset where the `amvh +0x34` packed-duration dword lives. Used

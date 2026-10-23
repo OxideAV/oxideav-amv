@@ -17,8 +17,8 @@
 use std::path::{Path, PathBuf};
 
 use oxideav_amv::{
-    decode_audio_payload, decode_frame_yuv420p, register, AmvHeader, AmvVideoFrame, MoviPayload,
-    MoviPayloadIter, AMVH_BODY_LEN, AMV_END_TRAILER, AUDIO_CODEC_ID, VIDEO_DIRECT_CODEC_ID,
+    AMV_END_TRAILER, AMVH_BODY_LEN, AUDIO_CODEC_ID, AmvHeader, AmvVideoFrame, MoviPayload,
+    MoviPayloadIter, VIDEO_DIRECT_CODEC_ID, decode_audio_payload, decode_frame_yuv420p, register,
 };
 use oxideav_core::{
     CodecId, CodecParameters, Frame, Packet, PixelFormat, RuntimeContext, SampleFormat, TimeBase,
@@ -149,7 +149,9 @@ fn registry_audio_decoder_matches_direct_decode_on_real_blocks() {
         );
         assert_eq!(frame.data.len(), 1, "block {i}: mono → one plane");
         let got: Vec<i16> = frame.data[0]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|p| i16::from_le_bytes([p[0], p[1]]))
             .collect();
         assert_eq!(got, direct, "block {i}: PCM mismatch vs direct decode");

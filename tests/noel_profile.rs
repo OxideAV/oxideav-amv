@@ -20,8 +20,8 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use oxideav_amv::{
-    validate_video_payload_shape, AmvAudioPreamble, AmvDemuxer, DurationConsistency, MoviPayload,
-    MoviPayloadIter, AMV_END_TRAILER, IMA_STEP_INDEX_MAX, JPEG_SOI,
+    AMV_END_TRAILER, AmvAudioPreamble, AmvDemuxer, DurationConsistency, IMA_STEP_INDEX_MAX,
+    JPEG_SOI, MoviPayload, MoviPayloadIter, validate_video_payload_shape,
 };
 use oxideav_core::{Demuxer, Error};
 

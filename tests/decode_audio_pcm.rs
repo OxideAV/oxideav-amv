@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use oxideav_amv::{
-    decode_audio_payload, AmvDemuxer, MoviPayload, MoviPayloadIter, AMV_END_TRAILER,
+    AMV_END_TRAILER, AmvDemuxer, MoviPayload, MoviPayloadIter, decode_audio_payload,
 };
 use std::fs::File;
 use std::io::BufReader;

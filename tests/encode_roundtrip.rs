@@ -25,8 +25,8 @@ use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
 use oxideav_amv::{
+    AMV_END_TRAILER, AMVH_BODY_LEN, AmvDemuxer, AmvHeader, AmvMuxer, MoviPayload, MoviPayloadIter,
     decode_audio_payload, decode_frame_from_payload, encode_audio_payload, encode_frame_rgb,
-    AmvDemuxer, AmvHeader, AmvMuxer, MoviPayload, MoviPayloadIter, AMVH_BODY_LEN, AMV_END_TRAILER,
 };
 use oxideav_core::{
     CodecId, CodecParameters, Demuxer, MediaType, Muxer, Packet, PixelFormat, Rational, StreamInfo,
@@ -168,8 +168,8 @@ fn mux_amv(
     }
     mux.write_trailer().expect("write trailer");
     drop(mux);
-    let bytes = shared.0.lock().unwrap().get_ref().clone();
-    bytes
+
+    shared.0.lock().unwrap().get_ref().clone()
 }
 
 #[test]

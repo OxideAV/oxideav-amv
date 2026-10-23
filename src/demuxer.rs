@@ -23,10 +23,10 @@ use oxideav_core::{
     Rational, ReadSeek, Result, SampleFormat, StreamInfo, TimeBase,
 };
 
-use crate::parse::{
-    AmvHeader, AmvPrelude, AmvWaveFormat, ChunkHeader, ChunkKind, AMV_END_TRAILER, PRELUDE_MIN_LEN,
-};
 use crate::AUDIO_CODEC_ID;
+use crate::parse::{
+    AMV_END_TRAILER, AmvHeader, AmvPrelude, AmvWaveFormat, ChunkHeader, ChunkKind, PRELUDE_MIN_LEN,
+};
 
 /// Stream indices used by the demuxer. Trace §3a (video) and §3b
 /// (audio) define the in-file order; we preserve it 1:1 so callers
@@ -2382,9 +2382,9 @@ mod tests {
     fn truncated_mid_audio_body_drains_then_graceful_eof() {
         let mut buf = build_synthetic_file(2);
         buf.truncate(buf.len() - 8); // drop AMV_END_
-                                     // Emit one more complete video chunk so the truncated last
-                                     // chunk is an audio chunk (matching the §4 V-then-A
-                                     // alternation pattern).
+        // Emit one more complete video chunk so the truncated last
+        // chunk is an audio chunk (matching the §4 V-then-A
+        // alternation pattern).
         let extra_video_body = 42u32.to_le_bytes().to_vec();
         buf.extend_from_slice(&VIDEO_CHUNK_TAG);
         buf.extend_from_slice(&(extra_video_body.len() as u32).to_le_bytes());
@@ -2692,7 +2692,7 @@ mod tests {
     /// error so a regression points directly at the contaminated chunk.
     #[test]
     fn comedian_fixture_all_chunks_pass_payload_shape_sentinels() {
-        use crate::parse::{validate_video_payload_shape, AmvAudioPreamble};
+        use crate::parse::{AmvAudioPreamble, validate_video_payload_shape};
 
         let crate_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");
@@ -2810,7 +2810,7 @@ mod tests {
     #[test]
     fn comedian_fixture_movi_payload_iter_walks_2232_chunks() {
         use crate::parse::{
-            validate_movi_interleave, MoviPayload, MoviPayloadIter, AMV_END_TRAILER,
+            AMV_END_TRAILER, MoviPayload, MoviPayloadIter, validate_movi_interleave,
         };
 
         let crate_path =
@@ -2903,7 +2903,7 @@ mod tests {
     /// explicitly notes.
     #[test]
     fn comedian_fixture_audio_blocks_nibble_budget() {
-        use crate::parse::{MoviPayload, MoviPayloadIter, AMV_END_TRAILER};
+        use crate::parse::{AMV_END_TRAILER, MoviPayload, MoviPayloadIter};
 
         let crate_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/comedian.amv");

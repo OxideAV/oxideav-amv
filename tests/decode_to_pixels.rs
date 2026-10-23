@@ -51,8 +51,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use oxideav_amv::{
-    decode_frame_from_payload, reconstruct_jpeg_from_payload, AmvHeader, MoviPayload,
-    MoviPayloadIter, AMVH_BODY_LEN, AMV_END_TRAILER,
+    AMV_END_TRAILER, AMVH_BODY_LEN, AmvHeader, MoviPayload, MoviPayloadIter,
+    decode_frame_from_payload, reconstruct_jpeg_from_payload,
 };
 
 /// Locate the staged `comedian.amv` fixture, mirroring the in-crate unit
@@ -202,11 +202,7 @@ fn vertical_total_variation(luma: &[f64], width: usize, height: usize) -> f64 {
             n += 1;
         }
     }
-    if n == 0 {
-        0.0
-    } else {
-        acc / n as f64
-    }
+    if n == 0 { 0.0 } else { acc / n as f64 }
 }
 
 // --- black-box JPEG decoder discovery ---------------------------------
@@ -467,7 +463,7 @@ fn in_crate_decoder_matches_blackbox_reference_on_real_frames() {
 /// (the two in-crate decodes may differ only where chroma varies).
 #[test]
 fn triangle_upsample_tracks_reference_closer_than_nearest() {
-    use oxideav_amv::{decode_frame_from_payload_with, ChromaUpsample};
+    use oxideav_amv::{ChromaUpsample, decode_frame_from_payload_with};
 
     let Some(path) = comedian_fixture() else {
         eprintln!("skipping triangle vs reference: comedian.amv not staged");

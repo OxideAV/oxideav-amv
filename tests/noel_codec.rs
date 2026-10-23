@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use oxideav_amv::{
+    AMV_END_TRAILER, AMVH_BODY_LEN, AmvHeader, ChromaUpsample, MoviPayload, MoviPayloadIter,
     decode_audio_payload, decode_frame_from_payload, decode_frame_from_payload_with,
-    reconstruct_jpeg_from_payload, AmvHeader, ChromaUpsample, MoviPayload, MoviPayloadIter,
-    AMVH_BODY_LEN, AMV_END_TRAILER,
+    reconstruct_jpeg_from_payload,
 };
 
 fn noel_fixture() -> Option<PathBuf> {
@@ -207,12 +207,12 @@ fn noel_all_2928_frames_decode_in_crate() {
         // content; fade/black frames are allowed but must be a small
         // minority across a 3-minute natural clip.
         let mut mean = 0.0f64;
-        for px in frame.rgb.chunks_exact(3) {
+        for px in frame.rgb.as_chunks::<3>().0 {
             mean += 0.299 * px[0] as f64 + 0.587 * px[1] as f64 + 0.114 * px[2] as f64;
         }
         mean /= (96 * 64) as f64;
         let mut var = 0.0f64;
-        for px in frame.rgb.chunks_exact(3) {
+        for px in frame.rgb.as_chunks::<3>().0 {
             let y = 0.299 * px[0] as f64 + 0.587 * px[1] as f64 + 0.114 * px[2] as f64;
             var += (y - mean) * (y - mean);
         }
@@ -317,7 +317,7 @@ fn noel_sampled_frames_match_black_box_reference_decoder() {
 #[test]
 fn noel_registry_decoders_match_direct_decode() {
     use oxideav_amv::{
-        decode_frame_yuv420p, register, AmvVideoFrame, AUDIO_CODEC_ID, VIDEO_DIRECT_CODEC_ID,
+        AUDIO_CODEC_ID, AmvVideoFrame, VIDEO_DIRECT_CODEC_ID, decode_frame_yuv420p, register,
     };
     use oxideav_core::{
         CodecId, CodecParameters, Frame, Packet, PixelFormat, RuntimeContext, SampleFormat,
@@ -376,7 +376,9 @@ fn noel_registry_decoders_match_direct_decode() {
         assert_eq!(frame.samples as usize, direct.len(), "block {i}: count");
         assert_eq!(frame.data.len(), 1, "block {i}: mono, one plane");
         let got: Vec<i16> = frame.data[0]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| i16::from_le_bytes([c[0], c[1]]))
             .collect();
         assert_eq!(got, direct, "block {i}: registry == direct PCM");
