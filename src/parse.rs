@@ -100,6 +100,7 @@ const STRF_AUDIO_BODY_LEN: u32 = 0x14;
 /// integers are little-endian. The seven reserved dwords between
 /// `dwMicroSecPerFrame` and `width` are not exposed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AmvHeader {
     /// `dwMicroSecPerFrame` (offset 0x00 within the body). Equal to
     /// `1_000_000 / fps`; the two fixtures hold `83_333` (12 fps) and
@@ -122,6 +123,71 @@ pub struct AmvHeader {
     /// `[seconds, minutes, hours, 0]` little-endian — see
     /// [`AmvDuration::from_packed`].
     pub duration_packed: u32,
+}
+
+impl AmvHeader {
+    /// Build a [`AmvHeader`] from its mandatory fields; every other field
+    /// starts at its default and can be set with the `with_*` builders.
+    pub fn new(width: u32, height: u32) -> Self {
+        Self {
+            micros_per_frame: 0,
+            width,
+            height,
+            fps: 0,
+            flag_one: 1,
+            reserved_30: 0,
+            duration_packed: 0,
+        }
+    }
+
+    /// Set [`AmvHeader::micros_per_frame`].
+    #[must_use]
+    pub fn with_micros_per_frame(mut self, v: u32) -> Self {
+        self.micros_per_frame = v;
+        self
+    }
+
+    /// Set [`AmvHeader::width`].
+    #[must_use]
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set [`AmvHeader::height`].
+    #[must_use]
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set [`AmvHeader::fps`].
+    #[must_use]
+    pub fn with_fps(mut self, v: u32) -> Self {
+        self.fps = v;
+        self
+    }
+
+    /// Set [`AmvHeader::flag_one`].
+    #[must_use]
+    pub fn with_flag_one(mut self, v: u32) -> Self {
+        self.flag_one = v;
+        self
+    }
+
+    /// Set [`AmvHeader::reserved_30`].
+    #[must_use]
+    pub fn with_reserved_30(mut self, v: u32) -> Self {
+        self.reserved_30 = v;
+        self
+    }
+
+    /// Set [`AmvHeader::duration_packed`].
+    #[must_use]
+    pub fn with_duration_packed(mut self, v: u32) -> Self {
+        self.duration_packed = v;
+        self
+    }
 }
 
 impl AmvHeader {
@@ -387,6 +453,7 @@ impl AmvDuration {
 /// strict validator should accept both and treat the frame-count
 /// derivation as authoritative.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DurationConsistency {
     /// Header equals the frame-count derivation byte-for-byte.
     Exact,
@@ -415,6 +482,7 @@ impl DurationConsistency {
 /// stream — the [`AmvWaveFormat::format_tag`] field is exposed
 /// verbatim so callers can verify the discrepancy themselves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AmvWaveFormat {
     /// `wFormatTag`. Observed value: `1` (PCM declared; payload is
     /// actually ADPCM — header lies about the codec).
@@ -433,6 +501,71 @@ pub struct AmvWaveFormat {
     pub bits_per_sample: u16,
     /// `cbSize`. Observed value: 0.
     pub cb_size: u16,
+}
+
+impl AmvWaveFormat {
+    /// Build a [`AmvWaveFormat`] from its mandatory fields; every other field
+    /// starts at its default and can be set with the `with_*` builders.
+    pub fn new(samples_per_sec: u32) -> Self {
+        Self {
+            format_tag: 1,
+            channels: 1,
+            samples_per_sec,
+            avg_bytes_per_sec: samples_per_sec.saturating_mul(2),
+            block_align: 2,
+            bits_per_sample: 16,
+            cb_size: 0,
+        }
+    }
+
+    /// Set [`AmvWaveFormat::format_tag`].
+    #[must_use]
+    pub fn with_format_tag(mut self, v: u16) -> Self {
+        self.format_tag = v;
+        self
+    }
+
+    /// Set [`AmvWaveFormat::channels`].
+    #[must_use]
+    pub fn with_channels(mut self, v: u16) -> Self {
+        self.channels = v;
+        self
+    }
+
+    /// Set [`AmvWaveFormat::samples_per_sec`].
+    #[must_use]
+    pub fn with_samples_per_sec(mut self, v: u32) -> Self {
+        self.samples_per_sec = v;
+        self
+    }
+
+    /// Set [`AmvWaveFormat::avg_bytes_per_sec`].
+    #[must_use]
+    pub fn with_avg_bytes_per_sec(mut self, v: u32) -> Self {
+        self.avg_bytes_per_sec = v;
+        self
+    }
+
+    /// Set [`AmvWaveFormat::block_align`].
+    #[must_use]
+    pub fn with_block_align(mut self, v: u16) -> Self {
+        self.block_align = v;
+        self
+    }
+
+    /// Set [`AmvWaveFormat::bits_per_sample`].
+    #[must_use]
+    pub fn with_bits_per_sample(mut self, v: u16) -> Self {
+        self.bits_per_sample = v;
+        self
+    }
+
+    /// Set [`AmvWaveFormat::cb_size`].
+    #[must_use]
+    pub fn with_cb_size(mut self, v: u16) -> Self {
+        self.cb_size = v;
+        self
+    }
 }
 
 impl AmvWaveFormat {

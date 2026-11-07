@@ -785,6 +785,7 @@ fn rd_plan_blocks(blocks: &[[i32; 64]], t: &EncTables, lambda: f64, out: &mut Ve
 /// ([`encode_frame_rgb_with_budget`] /
 /// [`encode_frame_yuv420p_with_budget`]).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BudgetedFrame {
     /// The bare `00dc` payload (`FF D8` + stuffed entropy + `FF D9`),
     /// always a fully conforming §4a frame regardless of how hard the
@@ -796,6 +797,16 @@ pub struct BudgetedFrame {
     /// this content), so a stream-level rate controller can absorb the
     /// overshoot on later frames instead of failing the frame.
     pub within_budget: bool,
+}
+
+impl BudgetedFrame {
+    /// Build a [`BudgetedFrame`] from all of its fields.
+    pub fn new(payload: Vec<u8>, within_budget: bool) -> Self {
+        Self {
+            payload,
+            within_budget,
+        }
+    }
 }
 
 /// Bisect the Lagrangian price-per-bit `λ` to the cheapest

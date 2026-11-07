@@ -55,6 +55,7 @@ use crate::video::{AmvVideoFrame, flip_rows_vertical};
 /// already been corrected — see [`decode_frame`]); pixels are packed
 /// `R, G, B` left-to-right. `rgb.len() == width * height * 3`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedFrame {
     /// Frame width in pixels (§2 `amvh` +0x20).
     pub width: u32,
@@ -62,6 +63,13 @@ pub struct DecodedFrame {
     pub height: u32,
     /// Interleaved 8-bit `R, G, B` bytes, row-major top-to-bottom.
     pub rgb: Vec<u8>,
+}
+
+impl DecodedFrame {
+    /// Build a [`DecodedFrame`] from all of its fields.
+    pub fn new(width: u32, height: u32, rgb: Vec<u8>) -> Self {
+        Self { width, height, rgb }
+    }
 }
 
 impl DecodedFrame {
@@ -660,6 +668,7 @@ pub fn decode_frame_from_payload_with(
 /// directly avoids a lossy YCbCr→RGB round-trip when the consumer wants
 /// the native planes (e.g. building an `oxideav_core::VideoFrame`).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DecodedYuv420p {
     /// Displayed frame width in pixels (§2 `amvh` +0x20).
     pub width: u32,
@@ -677,6 +686,29 @@ pub struct DecodedYuv420p {
     pub chroma_width: u32,
     /// Number of chroma plane rows (`ceil(height/2)`).
     pub chroma_height: u32,
+}
+
+impl DecodedYuv420p {
+    /// Build a [`DecodedYuv420p`] from all of its fields.
+    pub fn new(
+        width: u32,
+        height: u32,
+        y: Vec<u8>,
+        cb: Vec<u8>,
+        cr: Vec<u8>,
+        chroma_width: u32,
+        chroma_height: u32,
+    ) -> Self {
+        Self {
+            width,
+            height,
+            y,
+            cb,
+            cr,
+            chroma_width,
+            chroma_height,
+        }
+    }
 }
 
 /// Decode a §4a-bound AMV video frame to native planar [`DecodedYuv420p`].

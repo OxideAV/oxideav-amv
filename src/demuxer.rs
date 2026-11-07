@@ -38,6 +38,7 @@ const STREAM_INDEX_AUDIO: u32 = 1;
 /// converted into [`Error`] for the framework wiring (see
 /// `crate::lib::From<AmvDemuxerError> for oxideav_core::Error`).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AmvDemuxerError {
     /// Underlying reader returned an `io::Error` or a short read.
     Io(String),
@@ -79,6 +80,7 @@ impl From<std::io::Error> for AmvDemuxerError {
 /// lazily by a single forward walk of the `movi` payload. Once built,
 /// subsequent seeks are binary-search lookups rather than O(N) walks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ChunkIndexEntry {
     /// Absolute file offset of the 8-byte chunk header.
     pub file_offset: u64,
@@ -100,6 +102,25 @@ pub struct ChunkIndexEntry {
     /// indexed position without re-walking, preserving the §4
     /// 1:1-pairing cross-check after an indexed seek.
     pub audio_blocks_before: u64,
+}
+
+impl ChunkIndexEntry {
+    /// Build a [`ChunkIndexEntry`] from all of its fields.
+    pub fn new(
+        file_offset: u64,
+        kind: ChunkKind,
+        video_pts_before: i64,
+        audio_pts_before: i64,
+        audio_blocks_before: u64,
+    ) -> Self {
+        Self {
+            file_offset,
+            kind,
+            video_pts_before,
+            audio_pts_before,
+            audio_blocks_before,
+        }
+    }
 }
 
 /// The pure-Rust AMV demuxer. Owns a seekable byte reader (anything

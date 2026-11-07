@@ -251,15 +251,9 @@ fn non_mod16_device_geometry_has_no_bottom_band_pad_leakage() {
     let (width, height) = (160u32, 120u32);
     let src = synth_rgb(width, height, 1);
     let payload = encode_frame_rgb(width, height, &src).expect("encode");
-    let header = oxideav_amv::AmvHeader {
-        micros_per_frame: 1_000_000 / 12,
-        width,
-        height,
-        fps: 12,
-        flag_one: 1,
-        reserved_30: 0,
-        duration_packed: 0,
-    };
+    let header = oxideav_amv::AmvHeader::new(width, height)
+        .with_micros_per_frame(1_000_000 / 12)
+        .with_fps(12);
     let dec = decode_frame_from_payload(&header, &payload).expect("decode");
     assert_eq!((dec.width, dec.height), (width, height));
 

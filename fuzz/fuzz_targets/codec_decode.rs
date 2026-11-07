@@ -55,15 +55,9 @@ fuzz_target!(|data: &[u8]| {
     let budget = u16::from_le_bytes([data[4], data[5]]) as usize;
     let body = &data[6..];
 
-    let header = AmvHeader {
-        micros_per_frame: 83_333,
-        width,
-        height,
-        fps: 12,
-        flag_one: 1,
-        reserved_30: 0,
-        duration_packed: 0,
-    };
+    let header = AmvHeader::new(width, height)
+        .with_micros_per_frame(83_333)
+        .with_fps(12);
 
     // 1 + 2: hostile bytes into both §4a decode front doors — the RGB
     // path under both chroma-upsampling filters (the triangle filter's
@@ -87,11 +81,7 @@ fuzz_target!(|data: &[u8]| {
     let frame = encode_frame_rgb_with_budget(w, h, &rgb, budget)
         .expect("budgeted encode of a valid raster is total");
     decode_frame_from_payload(
-        &AmvHeader {
-            width: w,
-            height: h,
-            ..header
-        },
+        &header.with_width(w).with_height(h),
         &frame.payload,
     )
     .expect("encoder output must always decode");

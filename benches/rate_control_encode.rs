@@ -98,15 +98,9 @@ fn bench_rate_control_encode(c: &mut Criterion) {
         use oxideav_amv::{
             AmvHeader, decode_frame_yuv420p_from_payload, encode_frame_yuv420p_with_budget_seeded,
         };
-        let header = AmvHeader {
-            micros_per_frame: 83_333,
-            width: W,
-            height: H,
-            fps: 12,
-            flag_one: 1,
-            reserved_30: 0,
-            duration_packed: 0,
-        };
+        let header = AmvHeader::new(W, H)
+            .with_micros_per_frame(83_333)
+            .with_fps(12);
         let full = encode_frame_rgb(W, H, &rgb).expect("encode");
         let yuv = decode_frame_yuv420p_from_payload(&header, &full).expect("planes");
         let budget = full_len / 2;

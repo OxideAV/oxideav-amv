@@ -6,9 +6,20 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `AmvHeader::new(width, height)` plus `with_*` setters for every field,
+  `AmvWaveFormat::new(samples_per_sec)` (observed device shape) plus
+  `with_*` setters, and all-field `new(..)` constructors for
+  `ChunkIndexEntry`, `DecodedFrame`, `DecodedYuv420p` and `BudgetedFrame`.
+
 ### Changed
 
 - edition 2024, MSRV 1.95.
+- `#[non_exhaustive]`: enums `AmvDemuxerError`, `DurationConsistency`;
+  structs `AmvHeader`, `AmvWaveFormat`, `ChunkIndexEntry`, `DecodedFrame`,
+  `DecodedYuv420p`, `BudgetedFrame`. Build them with the new constructors
+  instead of struct literals.
 
 ## [0.0.10](https://github.com/OxideAV/oxideav-amv/compare/v0.0.9...v0.0.10) - 2026-08-24
 
