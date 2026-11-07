@@ -6,6 +6,13 @@ to [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/OxideAV/oxideav-amv/compare/v0.0.10...v0.0.11) - 2026-11-07
+
+### Other
+
+- API hygiene: #[non_exhaustive] on growable records and enums, constructors + with_* builders
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - `AmvHeader::new(width, height)` plus `with_*` setters for every field,
